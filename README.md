@@ -8,11 +8,11 @@ Under active construction. This is a learning project — not for production use
 
 ## Roadmap
 
-- **Month 1** — Append-only KV store, write-ahead log, crash recovery
-- **Month 2** — SSTables, compaction, bloom filters
-- **Month 3** — MVCC, transactions, snapshot isolation
-- **Month 4** — Replication, leader election simulation (Raft)
-- **Month 5** — Visual debugger UI, event timeline, failure injection
+- **1** — Append-only KV store, write-ahead log, crash recovery
+- **2** — SSTables, compaction, bloom filters
+- **3** — MVCC, transactions, snapshot isolation
+- **4** — Replication, leader election simulation (Raft)
+- **5** — Visual debugger UI, event timeline, failure injection
 
 ## Design
 

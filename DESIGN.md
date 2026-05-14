@@ -13,7 +13,7 @@ past-me made a choice without re-deriving it.
 ## Non-goals
 
 - SQL support
-- Networked clients (single-process only, until Month 4)
+- Networked clients (single-process only)
 - Production-grade performance
 - Cross-platform file system quirks (Linux only)
 
