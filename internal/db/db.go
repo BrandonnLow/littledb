@@ -22,6 +22,17 @@ import (
 // test with errors.Is when distinguishing "missing" from other errors.
 var ErrKeyNotFound = errors.New("db: key not found")
 
+// Options configures a DB. The zero value is fine for most purposes:
+// see DefaultOptions for the safe defaults.
+type Options struct {
+	SyncOnWrite bool
+}
+
+// DefaultOptions returns the safe defaults for a DB.
+func DefaultOptions() Options {
+	return Options{SyncOnWrite: true}
+}
+
 // DB is a key-value store backed by a write-ahead log.
 type DB struct {
 	mu     sync.RWMutex
@@ -30,10 +41,16 @@ type DB struct {
 	closed bool
 }
 
-// Open creates or opens a DB rooted at dir. It recovers the WAL and
-// rebuilds the in-memory index by replaying the log.
+// Open creates or opens a DB rooted at dir with default options.
+// Equivalent to OpenWith(dir, DefaultOptions()).
 func Open(dir string) (*DB, error) {
-	w, err := wal.Open(dir)
+	return OpenWith(dir, DefaultOptions())
+}
+
+// OpenWith creates or opens a DB rooted at dir with the given options.
+// It recovers the WAL and rebuilds the in-memory index by replaying the log.
+func OpenWith(dir string, opts Options) (*DB, error) {
+	w, err := wal.OpenWith(dir, wal.Options{SyncOnWrite: opts.SyncOnWrite})
 	if err != nil {
 		return nil, fmt.Errorf("db: open wal: %w", err)
 	}
