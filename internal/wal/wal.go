@@ -24,19 +24,40 @@ import (
 
 const logFileName = "littledb.log"
 
-// WAL is a write-ahead log. Safe for concurrent use.
+type Options struct {
+	// SyncOnWrite controls whether Append fsyncs after each write.
+	// Default is true. Setting it to false makes writes much faster
+	// but exposes the trailing edge of the log to loss on power failure
+	// or kernel panic (a process crash alone won't lose data — the OS
+	// still flushes its page cache).
+	SyncOnWrite bool
+}
+
+// DefaultOptions returns the safe defaults for a WAL.
+func DefaultOptions() Options {
+	return Options{SyncOnWrite: true}
+}
+
 type WAL struct {
 	mu     sync.Mutex
 	f      *os.File
 	path   string
 	size   int64 // current logical size of the log in bytes
+	opts   Options
 	closed bool
 }
 
-// Open creates or opens a WAL in dir. If the log file exists and has a
-// corrupt or truncated tail, the file is truncated to the last good record
-// before Open returns. The returned WAL is ready for append.
+// Open creates or opens a WAL in dir with default options.
+// Equivalent to OpenWith(dir, DefaultOptions()).
 func Open(dir string) (*WAL, error) {
+	return OpenWith(dir, DefaultOptions())
+}
+
+// OpenWith creates or opens a WAL in dir with the given options.
+// If the log file exists and has a corrupt or truncated tail, the file
+// is truncated to the last good record before OpenWith returns.
+// The returned WAL is ready for append.
+func OpenWith(dir string, opts Options) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("wal: mkdir %q: %w", dir, err)
 	}
@@ -66,7 +87,7 @@ func Open(dir string) (*WAL, error) {
 		}
 	}
 
-	w := &WAL{f: f, path: path}
+	w := &WAL{f: f, path: path, opts: opts}
 
 	if err := w.recover(); err != nil {
 		f.Close()
@@ -161,10 +182,11 @@ func (w *WAL) Append(rec *record.Record) (int64, error) {
 	if _, err := w.f.Write(encoded); err != nil {
 		return 0, fmt.Errorf("wal: write: %w", err)
 	}
-	if err := w.f.Sync(); err != nil {
-		return 0, fmt.Errorf("wal: sync: %w", err)
+	if w.opts.SyncOnWrite {
+		if err := w.f.Sync(); err != nil {
+			return 0, fmt.Errorf("wal: sync: %w", err)
+		}
 	}
-
 	w.size += int64(len(encoded))
 	return offset, nil
 }
