@@ -20,8 +20,32 @@ See [DESIGN.md](./DESIGN.md) for architecture decisions and notes.
 
 ## Building
 
+Verify the build and tests:
+
 ```sh
 go build ./...
+go vet ./...
+go test ./... -race
+```
+
+## Usage
+
+```sh
+go build -o littledb ./cmd/littledb
+./littledb -dir ./data
+```
+
+You'll see the prompt. Try:
+
+```
+> HELP
+> PUT name John
+> PUT lang go
+> GET name
+> GET lang
+> DELETE name
+> GET name
+> EXIT
 ```
 
 ## License
