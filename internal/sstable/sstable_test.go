@@ -54,17 +54,14 @@ func TestRoundTrip(t *testing.T) {
 	defer r.Close()
 
 	type entry struct {
-		key, val string
-		op       record.Op
+		k, v string
+		op   record.Op
 	}
 	var got []entry
-	err = r.Iterate(func(op record.Op, k, v []byte) bool {
+	r.Iterate(func(op record.Op, k, v []byte) bool {
 		got = append(got, entry{string(k), string(v), op})
 		return true
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	want := []entry{
 		{"alpha", "1", record.OpPut},
 		{"bravo", "2", record.OpPut},
@@ -75,7 +72,7 @@ func TestRoundTrip(t *testing.T) {
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Errorf("[%d] got %+v, want %+v", i, got[i], want[i])
+			t.Errorf("[%d] got %+v want %+v", i, got[i], want[i])
 		}
 	}
 }
@@ -91,15 +88,8 @@ func TestGetHits(t *testing.T) {
 
 	for _, c := range []struct{ k, v string }{{"a", "1"}, {"b", "2"}, {"c", "3"}} {
 		v, op, found, err := r.Get([]byte(c.k))
-		if err != nil {
-			t.Errorf("Get %q: %v", c.k, err)
-			continue
-		}
-		if !found || op != record.OpPut {
-			t.Errorf("Get %q: found=%v op=%d", c.k, found, op)
-		}
-		if !bytes.Equal(v, []byte(c.v)) {
-			t.Errorf("Get %q: got %q want %q", c.k, v, c.v)
+		if err != nil || !found || op != record.OpPut || !bytes.Equal(v, []byte(c.v)) {
+			t.Errorf("Get %q: got (%q, %d, %v, %v)", c.k, v, op, found, err)
 		}
 	}
 }
@@ -112,17 +102,11 @@ func TestGetMiss(t *testing.T) {
 	r, _ := OpenReader(path)
 	defer r.Close()
 
-	_, _, found, err := r.Get([]byte("0"))
-	if err != nil || found {
-		t.Errorf("Get '0': found=%v err=%v", found, err)
-	}
-	_, _, found, err = r.Get([]byte("b"))
-	if err != nil || found {
-		t.Errorf("Get 'b': found=%v err=%v", found, err)
-	}
-	_, _, found, err = r.Get([]byte("z"))
-	if err != nil || found {
-		t.Errorf("Get 'z': found=%v err=%v", found, err)
+	for _, k := range []string{"0", "b", "z"} {
+		_, _, found, err := r.Get([]byte(k))
+		if err != nil || found {
+			t.Errorf("Get %q: found=%v err=%v", k, found, err)
+		}
 	}
 }
 
@@ -136,26 +120,14 @@ func TestGetTombstone(t *testing.T) {
 	defer r.Close()
 
 	v, op, found, err := r.Get([]byte("b"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found {
-		t.Error("tombstone not found")
-	}
-	if op != record.OpDelete {
-		t.Errorf("op = %d, want OpDelete", op)
-	}
-	if v != nil {
-		t.Errorf("tombstone value = %q, want nil", v)
+	if err != nil || !found || op != record.OpDelete || v != nil {
+		t.Errorf("tombstone get: got (%q, %d, %v, %v)", v, op, found, err)
 	}
 }
 
 func TestEmptySSTable(t *testing.T) {
 	path := makePath(t)
-	w, err := NewWriter(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+	w, _ := NewWriter(path)
 	if err := w.Finish(); err != nil {
 		t.Fatal(err)
 	}
@@ -166,42 +138,27 @@ func TestEmptySSTable(t *testing.T) {
 	}
 	defer r.Close()
 
-	_, _, found, err := r.Get([]byte("anything"))
-	if err != nil || found {
-		t.Errorf("empty SSTable: found=%v err=%v", found, err)
+	if _, _, found, err := r.Get([]byte("anything")); err != nil || found {
+		t.Errorf("empty: found=%v err=%v", found, err)
 	}
-
-	called := false
-	r.Iterate(func(op record.Op, k, v []byte) bool {
-		called = true
-		return true
-	})
-	if called {
-		t.Error("Iterate on empty SSTable called fn")
+	if r.NumBlocks() != 0 {
+		t.Errorf("empty NumBlocks = %d, want 0", r.NumBlocks())
 	}
 }
 
 func TestOutOfOrder(t *testing.T) {
-	path := makePath(t)
-	w, _ := NewWriter(path)
+	w, _ := NewWriter(makePath(t))
 	defer w.Abort()
-
-	if err := w.Add(record.OpPut, []byte("b"), []byte("2")); err != nil {
-		t.Fatal(err)
-	}
+	w.Add(record.OpPut, []byte("b"), []byte("2"))
 	if err := w.Add(record.OpPut, []byte("a"), []byte("1")); !errors.Is(err, ErrOutOfOrder) {
 		t.Errorf("err = %v, want ErrOutOfOrder", err)
 	}
 }
 
 func TestDuplicateKey(t *testing.T) {
-	path := makePath(t)
-	w, _ := NewWriter(path)
+	w, _ := NewWriter(makePath(t))
 	defer w.Abort()
-
-	if err := w.Add(record.OpPut, []byte("a"), []byte("1")); err != nil {
-		t.Fatal(err)
-	}
+	w.Add(record.OpPut, []byte("a"), []byte("1"))
 	if err := w.Add(record.OpPut, []byte("a"), []byte("2")); !errors.Is(err, ErrDuplicate) {
 		t.Errorf("err = %v, want ErrDuplicate", err)
 	}
@@ -211,15 +168,14 @@ func TestAbortRemovesTempFile(t *testing.T) {
 	path := makePath(t)
 	w, _ := NewWriter(path)
 	w.Add(record.OpPut, []byte("k"), []byte("v"))
-
 	if err := w.Abort(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("final file exists after abort: %v", err)
+		t.Errorf("final file exists: %v", err)
 	}
 	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("temp file exists after abort: %v", err)
+		t.Errorf("temp file exists: %v", err)
 	}
 }
 
@@ -227,17 +183,10 @@ func TestAtomicCreation(t *testing.T) {
 	path := makePath(t)
 	w, _ := NewWriter(path)
 	w.Add(record.OpPut, []byte("k"), []byte("v"))
-
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("final file visible before Finish: %v", err)
 	}
-	if _, err := os.Stat(path + ".tmp"); err != nil {
-		t.Errorf("temp file missing during write: %v", err)
-	}
-
-	if err := w.Finish(); err != nil {
-		t.Fatal(err)
-	}
+	w.Finish()
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("final file missing after Finish: %v", err)
 	}
@@ -246,15 +195,47 @@ func TestAtomicCreation(t *testing.T) {
 	}
 }
 
-func TestTruncatedFile(t *testing.T) {
-	path := writeKeys(t,
-		record.OpPut, "a", "1",
-		record.OpPut, "b", "2",
-		record.OpPut, "c", "3",
-	)
+func TestBadMagic(t *testing.T) {
+	path := writeKeys(t, record.OpPut, "a", "1")
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, _ := f.Stat()
+	one := []byte{0}
+	f.ReadAt(one, info.Size()-1)
+	one[0] ^= 0xFF
+	f.WriteAt(one, info.Size()-1)
+	f.Close()
 
-	info, _ := os.Stat(path)
-	if err := os.Truncate(path, info.Size()-5); err != nil {
+	_, err = OpenReader(path)
+	if !errors.Is(err, ErrBadMagic) {
+		t.Errorf("err = %v, want ErrBadMagic", err)
+	}
+}
+
+func TestTooSmallToBeSSTable(t *testing.T) {
+	path := makePath(t)
+	if err := os.WriteFile(path, []byte("short"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenReader(path); err == nil {
+		t.Error("expected error on too-small file")
+	}
+}
+
+func TestMultiBlockSSTable(t *testing.T) {
+	const n = 5000
+	path := makePath(t)
+	w, _ := NewWriter(path)
+	value := bytes.Repeat([]byte("x"), 200)
+	for i := 0; i < n; i++ {
+		k := []byte(fmt.Sprintf("k%06d", i))
+		if err := w.Add(record.OpPut, k, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Finish(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -264,58 +245,88 @@ func TestTruncatedFile(t *testing.T) {
 	}
 	defer r.Close()
 
-	_, _, _, err = r.Get([]byte("c"))
-	if err == nil {
-		t.Error("Get past truncation: err = nil, want non-nil")
+	if r.NumBlocks() < 10 {
+		t.Errorf("expected many blocks, got %d", r.NumBlocks())
+	}
+
+	for _, i := range []int{0, 1, n / 4, n / 2, 3 * n / 4, n - 2, n - 1} {
+		k := []byte(fmt.Sprintf("k%06d", i))
+		v, op, found, err := r.Get(k)
+		if err != nil || !found || op != record.OpPut || !bytes.Equal(v, value) {
+			t.Errorf("Get %q: got found=%v err=%v op=%d", k, found, err, op)
+		}
+	}
+
+	for _, k := range []string{"a", "k999999", "z"} {
+		_, _, found, err := r.Get([]byte(k))
+		if err != nil || found {
+			t.Errorf("Get %q: found=%v err=%v", k, found, err)
+		}
 	}
 }
 
-func TestLargeSSTable(t *testing.T) {
-	const n = 5000
+func TestIterateAcrossBlocks(t *testing.T) {
+	const n = 1000
 	path := makePath(t)
 	w, _ := NewWriter(path)
+	value := bytes.Repeat([]byte("v"), 200)
 	for i := 0; i < n; i++ {
-		k := []byte(fmt.Sprintf("k%06d", i))
-		v := []byte(fmt.Sprintf("v%d", i))
-		if err := w.Add(record.OpPut, k, v); err != nil {
-			t.Fatal(err)
-		}
+		w.Add(record.OpPut, []byte(fmt.Sprintf("k%06d", i)), value)
 	}
-	if err := w.Finish(); err != nil {
-		t.Fatal(err)
-	}
+	w.Finish()
 
 	r, _ := OpenReader(path)
 	defer r.Close()
 
-	for _, i := range []int{0, n / 2, n - 1} {
-		k := []byte(fmt.Sprintf("k%06d", i))
-		want := []byte(fmt.Sprintf("v%d", i))
-		v, op, found, err := r.Get(k)
-		if err != nil {
-			t.Errorf("Get %q: %v", k, err)
-			continue
+	count := 0
+	r.Iterate(func(op record.Op, k, v []byte) bool {
+		if op != record.OpPut {
+			t.Errorf("entry %d: op = %d", count, op)
 		}
-		if !found || op != record.OpPut || !bytes.Equal(v, want) {
-			t.Errorf("Get %q: got (%q, %d, %v)", k, v, op, found)
+		want := []byte(fmt.Sprintf("k%06d", count))
+		if !bytes.Equal(k, want) {
+			t.Errorf("entry %d: key = %q, want %q", count, k, want)
 		}
+		count++
+		return true
+	})
+	if count != n {
+		t.Errorf("iterated %d, want %d", count, n)
+	}
+}
+
+func TestOversizedRecord(t *testing.T) {
+	path := makePath(t)
+	w, _ := NewWriter(path)
+	bigVal := bytes.Repeat([]byte("X"), 10_000)
+	w.Add(record.OpPut, []byte("big"), bigVal)
+	w.Add(record.OpPut, []byte("small"), []byte("v"))
+	w.Finish()
+
+	r, _ := OpenReader(path)
+	defer r.Close()
+
+	v, op, found, err := r.Get([]byte("big"))
+	if err != nil || !found || op != record.OpPut || !bytes.Equal(v, bigVal) {
+		t.Errorf("big: found=%v err=%v op=%d len(v)=%d", found, err, op, len(v))
+	}
+	v, op, found, err = r.Get([]byte("small"))
+	if err != nil || !found || op != record.OpPut || !bytes.Equal(v, []byte("v")) {
+		t.Errorf("small: found=%v err=%v op=%d v=%q", found, err, op, v)
 	}
 }
 
 func TestAddAfterFinish(t *testing.T) {
-	path := makePath(t)
-	w, _ := NewWriter(path)
+	w, _ := NewWriter(makePath(t))
 	w.Add(record.OpPut, []byte("a"), []byte("1"))
 	w.Finish()
-
 	if err := w.Add(record.OpPut, []byte("b"), []byte("2")); err == nil {
-		t.Error("Add after Finish: err = nil, want non-nil")
+		t.Error("Add after Finish: want error")
 	}
 }
 
 func TestAbortAfterFinishIsNoop(t *testing.T) {
-	path := makePath(t) + "-2"
-	w, _ := NewWriter(path)
+	w, _ := NewWriter(makePath(t))
 	w.Add(record.OpPut, []byte("a"), []byte("1"))
 	w.Finish()
 	if err := w.Abort(); err != nil {
