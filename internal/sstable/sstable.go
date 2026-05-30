@@ -5,31 +5,29 @@
 //	┌─────────────────────────────────────────────────────────┐
 //	│  DATA SECTION                                           │
 //	│    Block 1: [record][record]...[record]                 │
-//	│    Block 2: [record][record]...[record]                 │
+//	│    Block 2: ...                                         │
 //	│    ...                                                  │
-//	│    Block N: [record][record]...[record]                 │
 //	├─────────────────────────────────────────────────────────┤
 //	│  INDEX SECTION                                          │
 //	│    One record per block: key = first key in block,      │
 //	│    value = [blockOffset:8][blockSize:8]                 │
 //	├─────────────────────────────────────────────────────────┤
-//	│  FOOTER (24 bytes, fixed)                               │
-//	│    indexOffset (uint64 LE) + indexSize (uint64 LE) +    │
-//	│    magic (uint64 LE)                                    │
+//	│  BLOOM SECTION                                          │
+//	│    Serialized bloom filter bytes (see bloom package).   │
+//	│    Used by Reader.Get to skip files that definitely     │
+//	│    do not contain the target key.                       │
+//	├─────────────────────────────────────────────────────────┤
+//	│  FOOTER (40 bytes, fixed)                               │
+//	│    indexOffset, indexSize,                              │
+//	│    bloomOffset, bloomSize,                              │
+//	│    magic                                                │
 //	└─────────────────────────────────────────────────────────┘
 //
-// Reads work as: read footer → load index into memory → binary-search
-// index for the right block → read that block → linear scan within it.
-//
-// Blocks target ~4 KB each but a single record never spans two blocks;
-// if a record would overflow, the current block is closed and the
-// record starts a fresh one (so blocks may exceed 4 KB by one large
-// record).
+// Reads work as: read footer → load index and bloom into memory → on
+// Get, check bloom first; if maybe-present, binary-search index for
+// the right block; read just that block; linear scan within it.
 //
 // SSTables are created atomically via "<path>.tmp" + rename + dir fsync.
-// Readers never observe a partial file. Unlike the WAL, corrupt or
-// truncated SSTables surface errors loudly — partial files should be
-// impossible by construction.
 package sstable
 
 import (
@@ -41,7 +39,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync/atomic"
 
+	"github.com/BrandonnLow/littledb/internal/bloom"
 	"github.com/BrandonnLow/littledb/internal/record"
 )
 
@@ -49,14 +49,13 @@ const (
 	// blockSize targets one OS page. Records do not split across blocks;
 	// a single oversized record produces a single oversized block.
 	blockSize = 4096
-
 	// footerSize is the fixed footer length at the end of every SSTable.
 	// Layout: indexOffset (8) + indexSize (8) + magic (8).
-	footerSize = 24
-
+	footerSize = 40
 	// magic identifies a valid SSTable file. "LILLEDB!" interpreted as a
 	// little-endian uint64.
-	magic = uint64(0x21424445_4C4C494C)
+	magic           = uint64(0x21424445_4C4C494C) // "LILLEDB!"
+	bloomBitsPerKey = 10                          // ~1% FPR, matches LevelDB
 )
 
 var (
@@ -88,13 +87,12 @@ type Writer struct {
 	f       *os.File
 	bw      *bufio.Writer
 
-	// Block accumulation state.
 	blockBuf      []byte
 	blockFirstKey []byte
 	blockOffset   int64
 
-	// Index entries accumulated as blocks complete.
-	index []indexEntry
+	index  []indexEntry
+	filter *bloom.Filter
 
 	lastKey []byte
 	written int64
@@ -103,9 +101,11 @@ type Writer struct {
 	closed bool
 }
 
-// NewWriter creates a writer that will eventually produce an SSTable
-// at path. The directory containing path must already exist.
-func NewWriter(path string) (*Writer, error) {
+// NewWriter creates a writer for path with a bloom filter sized for
+// expectedKeys. Estimating the count is fine — over-estimating wastes
+// a little bloom space, under-estimating raises the filter's false-
+// positive rate above target.
+func NewWriter(path string, expectedKeys int) (*Writer, error) {
 	dir := filepath.Dir(path)
 	tmpPath := path + ".tmp"
 
@@ -120,12 +120,12 @@ func NewWriter(path string) (*Writer, error) {
 		f:        f,
 		bw:       bufio.NewWriter(f),
 		blockBuf: make([]byte, 0, blockSize),
+		filter:   bloom.New(expectedKeys, bloomBitsPerKey),
 	}, nil
 }
 
 // Add appends one record. Keys must be strictly ascending; duplicates
-// and out-of-order keys return an error and leave the Writer unusable
-// (callers should Abort).
+// and out-of-order keys return an error.
 func (w *Writer) Add(op record.Op, key, value []byte) error {
 	if w.closed {
 		return errors.New("sstable: write on closed writer")
@@ -151,12 +151,12 @@ func (w *Writer) Add(op record.Op, key, value []byte) error {
 			return err
 		}
 	}
-
 	if len(w.blockBuf) == 0 {
 		w.blockFirstKey = append([]byte(nil), key...)
 	}
 	w.blockBuf = append(w.blockBuf, encoded...)
 
+	w.filter.Add(key)
 	w.lastKey = append(w.lastKey[:0], key...)
 	w.count++
 	return nil
@@ -183,8 +183,8 @@ func (w *Writer) flushBlock() error {
 	return nil
 }
 
-// Finish flushes the final block, writes the index, writes the footer,
-// fsyncs, and atomically renames the temp file to the final path.
+// Finish writes the index, the bloom filter, and the footer; fsyncs;
+// renames the temp file to the final path; fsyncs the directory.
 func (w *Writer) Finish() error {
 	if w.closed {
 		return errors.New("sstable: finish on closed writer")
@@ -211,11 +211,22 @@ func (w *Writer) Finish() error {
 	indexSize := int64(len(indexBytes))
 	w.written += indexSize
 
+	// Bloom section.
+	bloomOffset := w.written
+	bloomBytes := w.filter.Bytes()
+	if _, err := w.bw.Write(bloomBytes); err != nil {
+		return fmt.Errorf("sstable: write bloom: %w", err)
+	}
+	bloomSize := int64(len(bloomBytes))
+	w.written += bloomSize
+
 	// Footer.
 	footer := make([]byte, footerSize)
 	binary.LittleEndian.PutUint64(footer[0:8], uint64(indexOffset))
 	binary.LittleEndian.PutUint64(footer[8:16], uint64(indexSize))
-	binary.LittleEndian.PutUint64(footer[16:24], magic)
+	binary.LittleEndian.PutUint64(footer[16:24], uint64(bloomOffset))
+	binary.LittleEndian.PutUint64(footer[24:32], uint64(bloomSize))
+	binary.LittleEndian.PutUint64(footer[32:40], magic)
 	if _, err := w.bw.Write(footer); err != nil {
 		return fmt.Errorf("sstable: write footer: %w", err)
 	}
@@ -261,6 +272,13 @@ type Reader struct {
 	f      *os.File
 	size   int64
 	index  []indexEntry
+	filter *bloom.Filter
+
+	// blockReadCount counts block reads served by Get. Used by tests
+	// to verify the bloom filter is skipping reads. Atomic so concurrent
+	// Gets stay race-clean.
+	blockReadCount atomic.Int64
+
 	closed bool
 }
 
@@ -286,18 +304,24 @@ func OpenReader(path string) (*Reader, error) {
 		f.Close()
 		return nil, fmt.Errorf("sstable: read footer: %w", err)
 	}
-	gotMagic := binary.LittleEndian.Uint64(footer[16:24])
+	gotMagic := binary.LittleEndian.Uint64(footer[32:40])
 	if gotMagic != magic {
 		f.Close()
 		return nil, fmt.Errorf("%w: got %#x", ErrBadMagic, gotMagic)
 	}
 	indexOffset := int64(binary.LittleEndian.Uint64(footer[0:8]))
 	indexSize := int64(binary.LittleEndian.Uint64(footer[8:16]))
-	if indexOffset < 0 || indexSize < 0 || indexOffset+indexSize > size-footerSize {
+	bloomOffset := int64(binary.LittleEndian.Uint64(footer[16:24]))
+	bloomSize := int64(binary.LittleEndian.Uint64(footer[24:32]))
+
+	limit := size - footerSize
+	if indexOffset < 0 || indexSize < 0 || indexOffset+indexSize > limit ||
+		bloomOffset < 0 || bloomSize < 0 || bloomOffset+bloomSize > limit {
 		f.Close()
-		return nil, fmt.Errorf("sstable %s: footer offsets out of range (off=%d size=%d file=%d)", path, indexOffset, indexSize, size)
+		return nil, fmt.Errorf("sstable %s: footer offsets out of range", path)
 	}
 
+	// Index.
 	indexBuf := make([]byte, indexSize)
 	if indexSize > 0 {
 		if _, err := f.ReadAt(indexBuf, indexOffset); err != nil {
@@ -325,19 +349,39 @@ func OpenReader(path string) (*Reader, error) {
 		offset += n
 	}
 
-	return &Reader{path: path, f: f, size: size, index: idx}, nil
+	// Bloom.
+	var filter *bloom.Filter
+	if bloomSize > 0 {
+		bloomBuf := make([]byte, bloomSize)
+		if _, err := f.ReadAt(bloomBuf, bloomOffset); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("sstable: read bloom: %w", err)
+		}
+		filter, err = bloom.Load(bloomBuf)
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("sstable: load bloom: %w", err)
+		}
+	}
+
+	return &Reader{path: path, f: f, size: size, index: idx, filter: filter}, nil
 }
 
 // Get returns the value for key.
 //
 // found=false        → key is not in this SSTable
-// op=OpDelete, found → tombstone (key is deleted at this SSTable)
-// op=OpPut,   found  → value is returned
+// op=OpDelete, found → tombstone
+// op=OpPut,   found  → live value
 func (r *Reader) Get(key []byte) (value []byte, op record.Op, found bool, err error) {
 	if r.closed {
 		return nil, 0, false, errors.New("sstable: read on closed reader")
 	}
 	if len(r.index) == 0 {
+		return nil, 0, false, nil
+	}
+
+	// Bloom check: if the filter says no, skip the block read entirely.
+	if r.filter != nil && !r.filter.MayContain(key) {
 		return nil, 0, false, nil
 	}
 
@@ -353,6 +397,7 @@ func (r *Reader) Get(key []byte) (value []byte, op record.Op, found bool, err er
 	if _, err := r.f.ReadAt(buf, blk.blockOffset); err != nil {
 		return nil, 0, false, fmt.Errorf("sstable: read block: %w", err)
 	}
+	r.blockReadCount.Add(1)
 
 	offset := int64(0)
 	for offset < blk.blockSize {
@@ -417,6 +462,10 @@ func (r *Reader) Close() error {
 // NumBlocks returns the number of data blocks in this SSTable. Useful
 // for tests and debugging.
 func (r *Reader) NumBlocks() int { return len(r.index) }
+
+// BlockReadsForTesting returns the number of block reads served by Get
+// so far. Used by tests to verify the bloom filter is doing its job.
+func (r *Reader) BlockReadsForTesting() int64 { return r.blockReadCount.Load() }
 
 func syncDir(dir string) error {
 	d, err := os.Open(dir)

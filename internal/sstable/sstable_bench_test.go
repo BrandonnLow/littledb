@@ -16,7 +16,7 @@ import (
 func Benchmark_Get(b *testing.B) {
 	const n = 50_000
 	path := filepath.Join(b.TempDir(), "bench.sst")
-	w, err := NewWriter(path)
+	w, err := NewWriter(path, n)
 	if err != nil {
 		b.Fatal(err)
 	}
