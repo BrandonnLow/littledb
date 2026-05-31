@@ -11,7 +11,7 @@ import (
 type Op byte
 
 const (
-	OpPut Op = 1
+	OpPut    Op = 1
 	OpDelete Op = 2
 )
 
@@ -32,8 +32,8 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 // Record is the in-memory representation of one durable write.
 type Record struct {
-	Op Op
-	Key []byte
+	Op    Op
+	Key   []byte
 	Value []byte
 }
 
@@ -72,9 +72,8 @@ func Decode(b []byte) (*Record, int, error) {
 		return nil, 0, io.ErrUnexpectedEOF
 	}
 
-
 	storedCRC := binary.LittleEndian.Uint32(b[0:4])
-	
+
 	op := Op(b[4])
 	keyLen := binary.LittleEndian.Uint32(b[5:9])
 	valueLen := binary.LittleEndian.Uint32(b[9:13])
@@ -98,8 +97,8 @@ func Decode(b []byte) (*Record, int, error) {
 	// Copy key and value so the returned Record does not alias the caller's buffer.
 	// This matters because the WAL will reuse its read buffer across decode calls.
 	rec := &Record{
-		Op: op,
-		Key: append([]byte(nil), b[HeaderSize:HeaderSize+keyLen]...),
+		Op:    op,
+		Key:   append([]byte(nil), b[HeaderSize:HeaderSize+keyLen]...),
 		Value: append([]byte(nil), b[HeaderSize+keyLen:total]...),
 	}
 	return rec, total, nil
