@@ -1,12 +1,13 @@
 // Package db is the top-level littledb storage engine.
 //
-// Architecture: an LSM tree. Writes go through a write-ahead log
+// LSM tree architecture. Writes go through a write-ahead log
 // for durability, then into an in-memory memtable. When the memtable
 // crosses a size threshold it's frozen and flushed to an immutable
-// SSTable file; reads consult the memtable first, then SSTables newest
-// to oldest. The first hit wins.
+// SSTable file. A background goroutine compacts SSTables once they
+// accumulate, merging old ones into a single larger one and dropping
+// superseded keys and resolved tombstones.
 //
-// Public API: Open / Put / Get / Delete / Close
+// Public API: Open / Put / Get / Delete / Close.
 package db
 
 import (
@@ -26,8 +27,9 @@ import (
 )
 
 const (
-	walFilename            = "littledb.log"
-	defaultMemtableSizeMax = 4 * 1024 * 1024 // 4 MB
+	walFilename              = "littledb.log"
+	defaultMemtableSizeMax   = 4 * 1024 * 1024 // 4 MB
+	defaultCompactionTrigger = 4
 )
 
 var (
@@ -42,42 +44,54 @@ var (
 
 // Options configures a DB.
 type Options struct {
-	// SyncOnWrite controls whether each Put/Delete fsyncs the WAL.
-	// Default true.
-	SyncOnWrite bool
+	SyncOnWrite       bool
+	MemtableSizeMax   int64
+	CompactionTrigger int // min SSTable count before compaction fires; default 4
 
-	// MemtableSizeMax is the approximate byte threshold at which the
-	// memtable is frozen and flushed. Default 4 MB.
-	MemtableSizeMax int64
+	// DisableBackgroundCompaction skips the background compactor goroutine.
+	// Intended for tests that need deterministic state; production code
+	// should leave this false.
+	DisableBackgroundCompaction bool
 }
 
 // DefaultOptions returns the safe defaults.
 func DefaultOptions() Options {
-	return Options{SyncOnWrite: true, MemtableSizeMax: defaultMemtableSizeMax}
+	return Options{
+		SyncOnWrite:       true,
+		MemtableSizeMax:   defaultMemtableSizeMax,
+		CompactionTrigger: defaultCompactionTrigger,
+	}
 }
 
 // DB is an LSM-tree key-value store.
 type DB struct {
-	mu       sync.RWMutex
-	dir      string
-	opts     Options
-	wal      *wal.WAL
-	memtable *memtable.Memtable
-	frozen   *memtable.Memtable // non-nil only during a flush
-	sstables []*sstable.Reader  // newest first
-	nextID   int
-	closed   bool
+	mu         sync.RWMutex
+	dir        string
+	opts       Options
+	wal        *wal.WAL
+	memtable   *memtable.Memtable
+	frozen     *memtable.Memtable
+	sstables   []*sstable.Reader // newest first
+	sstableIDs []int             // parallel to sstables
+	nextID     int
+	closed     bool
+
+	// Compaction lifecycle.
+	compactMu     sync.Mutex
+	compactCh     chan struct{}
+	compactDoneCh chan struct{}
 }
 
 // Open creates or opens a DB rooted at dir with default options.
-func Open(dir string) (*DB, error) {
-	return OpenWith(dir, DefaultOptions())
-}
+func Open(dir string) (*DB, error) { return OpenWith(dir, DefaultOptions()) }
 
 // OpenWith creates or opens a DB rooted at dir with the given options.
 func OpenWith(dir string, opts Options) (*DB, error) {
 	if opts.MemtableSizeMax <= 0 {
 		opts.MemtableSizeMax = defaultMemtableSizeMax
+	}
+	if opts.CompactionTrigger < 2 {
+		opts.CompactionTrigger = defaultCompactionTrigger
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -90,8 +104,10 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	}
 
 	var ssts []*sstable.Reader
+	var sstIDsRev []int
 	for i := len(sstIDs) - 1; i >= 0; i-- {
-		path := filepath.Join(dir, sstableFilename(sstIDs[i]))
+		id := sstIDs[i]
+		path := filepath.Join(dir, sstableFilename(id))
 		r, err := sstable.OpenReader(path)
 		if err != nil {
 			for _, opened := range ssts {
@@ -100,6 +116,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 			return nil, fmt.Errorf("db: open sstable %s: %w", path, err)
 		}
 		ssts = append(ssts, r)
+		sstIDsRev = append(sstIDsRev, id)
 	}
 
 	w, err := wal.OpenWith(dir, wal.Options{SyncOnWrite: opts.SyncOnWrite})
@@ -134,14 +151,25 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		nextID = sstIDs[len(sstIDs)-1] + 1
 	}
 
-	return &DB{
-		dir:      dir,
-		opts:     opts,
-		wal:      w,
-		memtable: mt,
-		sstables: ssts,
-		nextID:   nextID,
-	}, nil
+	db := &DB{
+		dir:           dir,
+		opts:          opts,
+		wal:           w,
+		memtable:      mt,
+		sstables:      ssts,
+		sstableIDs:    sstIDsRev,
+		nextID:        nextID,
+		compactCh:     make(chan struct{}, 1),
+		compactDoneCh: make(chan struct{}),
+	}
+
+	if !opts.DisableBackgroundCompaction {
+		go db.compactLoop()
+		db.signalCompact()
+	} else {
+		close(db.compactDoneCh)
+	}
+	return db, nil
 }
 
 // Put writes a key/value pair durably.
@@ -164,6 +192,7 @@ func (db *DB) Put(key, value []byte) error {
 		if err := db.flushLocked(); err != nil {
 			return fmt.Errorf("db: flush after put: %w", err)
 		}
+		db.signalCompact()
 	}
 	return nil
 }
@@ -188,6 +217,7 @@ func (db *DB) Delete(key []byte) error {
 		if err := db.flushLocked(); err != nil {
 			return fmt.Errorf("db: flush after delete: %w", err)
 		}
+		db.signalCompact()
 	}
 	return nil
 }
@@ -300,20 +330,40 @@ func (db *DB) flushLocked() error {
 	// old slice header sees a consistent snapshot.
 	db.wal = newWAL
 	db.sstables = append([]*sstable.Reader{r}, db.sstables...)
+	db.sstableIDs = append([]int{id}, db.sstableIDs...)
 	db.frozen = nil
 	db.nextID++
 	return nil
 }
 
+// signalCompact non-blockingly nudges the compactor goroutine. Must be
+// called while holding db.mu so Close cannot have closed compactCh yet.
+func (db *DB) signalCompact() {
+	if db.closed || db.opts.DisableBackgroundCompaction {
+		return
+	}
+	select {
+	case db.compactCh <- struct{}{}:
+	default:
+	}
+}
+
 // Close flushes and closes the DB. Safe to call more than once.
 func (db *DB) Close() error {
 	db.mu.Lock()
-	defer db.mu.Unlock()
 	if db.closed {
+		db.mu.Unlock()
 		return nil
 	}
 	db.closed = true
+	db.mu.Unlock()
 
+	// Stop the compactor and wait for it to drain.
+	close(db.compactCh)
+	<-db.compactDoneCh
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	var firstErr error
 	if err := db.wal.Close(); err != nil && firstErr == nil {
 		firstErr = err
@@ -341,12 +391,14 @@ func (db *DB) FlushForTesting() error {
 	if db.closed {
 		return errClosed
 	}
-	return db.flushLocked()
+	if err := db.flushLocked(); err != nil {
+		return err
+	}
+	db.signalCompact()
+	return nil
 }
 
-func sstableFilename(id int) string {
-	return fmt.Sprintf("%06d.sst", id)
-}
+func sstableFilename(id int) string { return fmt.Sprintf("%06d.sst", id) }
 
 func discoverSSTables(dir string) ([]int, error) {
 	entries, err := os.ReadDir(dir)
