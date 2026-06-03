@@ -1,3 +1,15 @@
+// Package record is the on-disk record format used by the WAL and
+// SSTable layers.
+//
+// Layout:
+//
+//	CRC32 (4) | Op (1) | Timestamp (8) | KeyLen (4) | ValueLen (4) | Key | Value
+//
+// The CRC covers everything after itself (op + timestamp + lengths +
+// key + value). All multi-byte integers are little-endian. CRC is
+// CRC-32C (Castagnoli).
+//
+// The MVCC layer uses Timestamp field to version individual writes.
 package record
 
 import (
@@ -17,7 +29,18 @@ const (
 
 // HeaderSize is the fixed size of a record's header in bytes:
 // CRC32(4) + Op(1) + KeyLen(4) + ValueLen(4).
-const HeaderSize = 13
+const HeaderSize = 21
+
+// Header field offsets within the encoded bytes. Useful for code that
+// needs to peek at lengths before allocating the full record buffer
+// (the WAL does this in ReadAt).
+const (
+	OffsetCRC       = 0
+	OffsetOp        = 4
+	OffsetTimestamp = 5
+	OffsetKeyLen    = 13
+	OffsetValueLen  = 17
+)
 
 var (
 	// ErrCorrupt is returned by Decode when a record's CRC does not match.
@@ -32,38 +55,42 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 // Record is the in-memory representation of one durable write.
 type Record struct {
-	Op    Op
-	Key   []byte
-	Value []byte
+	Op        Op
+	Timestamp uint64
+	Key       []byte
+	Value     []byte
 }
 
-// Encode returns the binary encoding of r.
-// The output is HeaderSize + len(r.Key) + len(r.Value) bytes.
+// Encode serializes r to a fresh byte slice.
 func Encode(r *Record) []byte {
 	buf := make([]byte, HeaderSize+len(r.Key)+len(r.Value))
 
 	// Write body first so we can checksum it before writing the CRC.
-	buf[4] = byte(r.Op)
-	binary.LittleEndian.PutUint32(buf[5:9], uint32(len(r.Key)))
-	binary.LittleEndian.PutUint32(buf[9:13], uint32(len(r.Value)))
+	buf[OffsetOp] = byte(r.Op)
+	binary.LittleEndian.PutUint64(buf[OffsetTimestamp:OffsetTimestamp+8], r.Timestamp)
+	binary.LittleEndian.PutUint32(buf[OffsetKeyLen:OffsetKeyLen+4], uint32(len(r.Key)))
+	binary.LittleEndian.PutUint32(buf[OffsetValueLen:OffsetValueLen+4], uint32(len(r.Value)))
 	copy(buf[HeaderSize:], r.Key)
 	copy(buf[HeaderSize+len(r.Key):], r.Value)
 
 	// Compute CRC over everything after the CRC field itself.
-	crc := crc32.Checksum(buf[4:], crcTable)
-	binary.LittleEndian.PutUint32(buf[0:4], crc)
+	crc := crc32.Checksum(buf[OffsetOp:], crcTable)
+	binary.LittleEndian.PutUint32(buf[OffsetCRC:OffsetCRC+4], crc)
 
 	return buf
 }
 
-// Decode parses a single record from the start of b.
-// It returns the record, the number of bytes consumed, and any error.
+// Decode parses one record from the start of b. Returns the record,
+// the number of bytes consumed, and an error.
 //
-// Errors are layered for crash recovery:
-//   - io.EOF              — b is empty; caller is at clean end-of-stream.
-//   - io.ErrUnexpectedEOF — b is non-empty but does not contain a full record.
-//   - ErrCorrupt          — a full record was read but its CRC does not match.
-//   - ErrInvalidOp        — the op byte is not a known operation.
+// Error semantics drive WAL crash recovery:
+//   - io.EOF: b is empty (clean end of log).
+//   - io.ErrUnexpectedEOF: b is shorter than the declared record size
+//     (a torn write that was interrupted mid-flush).
+//   - ErrCorrupt: the full record's bytes are present but the CRC
+//     does not match (bit rot or wild write).
+//   - ErrInvalidOp: CRC matched but the op byte is unrecognized;
+//     refuse to start rather than silently drop data.
 func Decode(b []byte) (*Record, int, error) {
 	if len(b) == 0 {
 		return nil, 0, io.EOF
@@ -71,21 +98,18 @@ func Decode(b []byte) (*Record, int, error) {
 	if len(b) < HeaderSize {
 		return nil, 0, io.ErrUnexpectedEOF
 	}
-
-	storedCRC := binary.LittleEndian.Uint32(b[0:4])
-
-	op := Op(b[4])
-	keyLen := binary.LittleEndian.Uint32(b[5:9])
-	valueLen := binary.LittleEndian.Uint32(b[9:13])
-
+	storedCRC := binary.LittleEndian.Uint32(b[OffsetCRC : OffsetCRC+4])
+	op := Op(b[OffsetOp])
+	timestamp := binary.LittleEndian.Uint64(b[OffsetTimestamp : OffsetTimestamp+8])
+	keyLen := binary.LittleEndian.Uint32(b[OffsetKeyLen : OffsetKeyLen+4])
+	valueLen := binary.LittleEndian.Uint32(b[OffsetValueLen : OffsetValueLen+4])
 	total := HeaderSize + int(keyLen) + int(valueLen)
 	if len(b) < total {
 		return nil, 0, io.ErrUnexpectedEOF
 	}
 
 	// Verify CRC over body before trusting any contents.
-	actualCRC := crc32.Checksum(b[4:total], crcTable)
-
+	actualCRC := crc32.Checksum(b[OffsetOp:total], crcTable)
 	if actualCRC != storedCRC {
 		return nil, 0, ErrCorrupt
 	}
@@ -94,13 +118,23 @@ func Decode(b []byte) (*Record, int, error) {
 		return nil, 0, ErrInvalidOp
 	}
 
-	// Copy key and value so the returned Record does not alias the caller's buffer.
-	// This matters because the WAL will reuse its read buffer across decode calls.
-	rec := &Record{
-		Op:    op,
-		Key:   append([]byte(nil), b[HeaderSize:HeaderSize+keyLen]...),
-		Value: append([]byte(nil), b[HeaderSize+keyLen:total]...),
-	}
-	return rec, total, nil
+	return &Record{
+		Op:        op,
+		Timestamp: timestamp,
+		Key:       append([]byte(nil), b[HeaderSize:HeaderSize+keyLen]...),
+		Value:     append([]byte(nil), b[HeaderSize+keyLen:total]...),
+	}, total, nil
+}
 
+// HeaderLengths returns (keyLen, valueLen) declared in the first
+// HeaderSize bytes of hdr. Used by callers that need to size a full
+// record buffer before calling Decode (the WAL reads the fixed-size
+// header first, then the body of the indicated size).
+func HeaderLengths(hdr []byte) (keyLen, valueLen uint32, err error) {
+	if len(hdr) < HeaderSize {
+		return 0, 0, io.ErrUnexpectedEOF
+	}
+	keyLen = binary.LittleEndian.Uint32(hdr[OffsetKeyLen : OffsetKeyLen+4])
+	valueLen = binary.LittleEndian.Uint32(hdr[OffsetValueLen : OffsetValueLen+4])
+	return keyLen, valueLen, nil
 }

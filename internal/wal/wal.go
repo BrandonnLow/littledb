@@ -11,7 +11,6 @@
 package wal
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -209,8 +208,10 @@ func (w *WAL) ReadAt(offset int64) (*record.Record, error) {
 		return nil, fmt.Errorf("wal: read header at %d: %w", offset, err)
 	}
 
-	keyLen := binary.LittleEndian.Uint32(hdr[5:9])
-	valueLen := binary.LittleEndian.Uint32(hdr[9:13])
+	keyLen, valueLen, err := record.HeaderLengths(hdr)
+	if err != nil {
+		return nil, fmt.Errorf("wal: header at %d: %w", offset, err)
+	}
 	total := record.HeaderSize + int(keyLen) + int(valueLen)
 
 	buf := make([]byte, total)
