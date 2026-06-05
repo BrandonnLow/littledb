@@ -1,13 +1,12 @@
 // Package db is the top-level littledb storage engine.
 //
-// LSM tree architecture. Writes go through a write-ahead log
-// for durability, then into an in-memory memtable. When the memtable
-// crosses a size threshold it's frozen and flushed to an immutable
-// SSTable file. A background goroutine compacts SSTables once they
-// accumulate, merging old ones into a single larger one and dropping
-// superseded keys and resolved tombstones.
+// MVCC reads. Each Put/Delete is assigned a logical timestamp from a monotonic counter;
+// multiple versions of a userKey coexist; reads ask for "the version as of snapshot T."
 //
-// Public API: Open / Put / Get / Delete / Close.
+// The single-version Get(k) internally reads as-of the current write-counter value,
+// so it sees the latest committed version of k. Transactions will
+// introduce explicit Begin() returning a Txn that captures its own
+// snapshot timestamp.
 package db
 
 import (
@@ -28,33 +27,23 @@ import (
 
 const (
 	walFilename              = "littledb.log"
-	defaultMemtableSizeMax   = 4 * 1024 * 1024 // 4 MB
+	defaultMemtableSizeMax   = 4 * 1024 * 1024
 	defaultCompactionTrigger = 4
 )
 
 var (
-	// ErrKeyNotFound is returned by Get when the key is absent or has
-	// been deleted.
 	ErrKeyNotFound = errors.New("db: key not found")
-
-	errClosed = errors.New("db: closed")
-
-	sstableNameRE = regexp.MustCompile(`^(\d{6})\.sst$`)
+	errClosed      = errors.New("db: closed")
+	sstableNameRE  = regexp.MustCompile(`^(\d{6})\.sst$`)
 )
 
-// Options configures a DB.
 type Options struct {
-	SyncOnWrite       bool
-	MemtableSizeMax   int64
-	CompactionTrigger int // min SSTable count before compaction fires; default 4
-
-	// DisableBackgroundCompaction skips the background compactor goroutine.
-	// Intended for tests that need deterministic state; production code
-	// should leave this false.
+	SyncOnWrite                 bool
+	MemtableSizeMax             int64
+	CompactionTrigger           int
 	DisableBackgroundCompaction bool
 }
 
-// DefaultOptions returns the safe defaults.
 func DefaultOptions() Options {
 	return Options{
 		SyncOnWrite:       true,
@@ -63,7 +52,7 @@ func DefaultOptions() Options {
 	}
 }
 
-// DB is an LSM-tree key-value store.
+// DB is an MVCC LSM-tree key-value store.
 type DB struct {
 	mu         sync.RWMutex
 	dir        string
@@ -71,21 +60,27 @@ type DB struct {
 	wal        *wal.WAL
 	memtable   *memtable.Memtable
 	frozen     *memtable.Memtable
-	sstables   []*sstable.Reader // newest first
-	sstableIDs []int             // parallel to sstables
+	sstables   []*sstable.Reader
+	sstableIDs []int
 	nextID     int
-	closed     bool
 
-	// Compaction lifecycle.
+	// nextTimestamp is the next logical timestamp to assign on a write.
+	// Reads use its current value as their snapshot. Bumped on every
+	// Put/Delete while holding the write lock; readers capture it
+	// under the read lock alongside memtable/sstable pointers, which
+	// ensures a Get can never see a counter value > any
+	// not-yet-applied write.
+	nextTimestamp uint64
+
+	closed bool
+
 	compactMu     sync.Mutex
 	compactCh     chan struct{}
 	compactDoneCh chan struct{}
 }
 
-// Open creates or opens a DB rooted at dir with default options.
 func Open(dir string) (*DB, error) { return OpenWith(dir, DefaultOptions()) }
 
-// OpenWith creates or opens a DB rooted at dir with the given options.
 func OpenWith(dir string, opts Options) (*DB, error) {
 	if opts.MemtableSizeMax <= 0 {
 		opts.MemtableSizeMax = defaultMemtableSizeMax
@@ -93,7 +88,6 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	if opts.CompactionTrigger < 2 {
 		opts.CompactionTrigger = defaultCompactionTrigger
 	}
-
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("db: mkdir: %w", err)
 	}
@@ -105,6 +99,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 
 	var ssts []*sstable.Reader
 	var sstIDsRev []int
+	var maxTS uint64
 	for i := len(sstIDs) - 1; i >= 0; i-- {
 		id := sstIDs[i]
 		path := filepath.Join(dir, sstableFilename(id))
@@ -117,6 +112,9 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		}
 		ssts = append(ssts, r)
 		sstIDsRev = append(sstIDsRev, id)
+		if r.MaxTimestamp() > maxTS {
+			maxTS = r.MaxTimestamp()
+		}
 	}
 
 	w, err := wal.OpenWith(dir, wal.Options{SyncOnWrite: opts.SyncOnWrite})
@@ -129,11 +127,14 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 
 	mt := memtable.New()
 	err = w.Scan(func(offset int64, rec *record.Record) error {
+		if rec.Timestamp > maxTS {
+			maxTS = rec.Timestamp
+		}
 		switch rec.Op {
 		case record.OpPut:
-			return mt.Put(rec.Key, rec.Value)
+			return mt.Put(rec.Key, rec.Value, rec.Timestamp)
 		case record.OpDelete:
-			return mt.Delete(rec.Key)
+			return mt.Delete(rec.Key, rec.Timestamp)
 		default:
 			return fmt.Errorf("db: unknown op %d in wal", rec.Op)
 		}
@@ -159,6 +160,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		sstables:      ssts,
 		sstableIDs:    sstIDsRev,
 		nextID:        nextID,
+		nextTimestamp: maxTS + 1, // first write gets at least 1
 		compactCh:     make(chan struct{}, 1),
 		compactDoneCh: make(chan struct{}),
 	}
@@ -169,10 +171,11 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	} else {
 		close(db.compactDoneCh)
 	}
+
 	return db, nil
 }
 
-// Put writes a key/value pair durably.
+// Put writes (key, value) at a freshly-allocated timestamp.
 func (db *DB) Put(key, value []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -180,11 +183,19 @@ func (db *DB) Put(key, value []byte) error {
 		return errClosed
 	}
 
-	rec := &record.Record{Op: record.OpPut, Key: key, Value: value}
+	// Allocate the timestamp BEFORE the WAL append, and inside the
+	// write lock. This is the ordering invariant: any reader that sees
+	// counter value T has also seen every Put/Delete with ts < T
+	// applied to the memtable, because both happened under the same
+	// lock acquisition.
+	ts := db.nextTimestamp
+	db.nextTimestamp++
+
+	rec := &record.Record{Op: record.OpPut, Timestamp: ts, Key: key, Value: value}
 	if _, err := db.wal.Append(rec); err != nil {
 		return fmt.Errorf("db: put wal: %w", err)
 	}
-	if err := db.memtable.Put(key, value); err != nil {
+	if err := db.memtable.Put(key, value, ts); err != nil {
 		return fmt.Errorf("db: put memtable: %w", err)
 	}
 
@@ -197,7 +208,7 @@ func (db *DB) Put(key, value []byte) error {
 	return nil
 }
 
-// Delete writes a tombstone for key. Idempotent.
+// Delete writes a tombstone at a freshly-allocated timestamp.
 func (db *DB) Delete(key []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -205,11 +216,14 @@ func (db *DB) Delete(key []byte) error {
 		return errClosed
 	}
 
-	rec := &record.Record{Op: record.OpDelete, Key: key}
+	ts := db.nextTimestamp
+	db.nextTimestamp++
+
+	rec := &record.Record{Op: record.OpDelete, Timestamp: ts, Key: key}
 	if _, err := db.wal.Append(rec); err != nil {
 		return fmt.Errorf("db: delete wal: %w", err)
 	}
-	if err := db.memtable.Delete(key); err != nil {
+	if err := db.memtable.Delete(key, ts); err != nil {
 		return fmt.Errorf("db: delete memtable: %w", err)
 	}
 
@@ -222,10 +236,27 @@ func (db *DB) Delete(key []byte) error {
 	return nil
 }
 
-// Get returns the value for key. Searches the active memtable, the
-// frozen memtable (if any), then SSTables newest to oldest. The first
-// hit wins; a tombstone hit returns ErrKeyNotFound.
+// Get returns the latest committed version of key. Equivalent to
+// GetAsOf(key, current write counter).
 func (db *DB) Get(key []byte) ([]byte, error) {
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return nil, errClosed
+	}
+	// Capture counter + state under the lock atomically.
+	snapshot := db.nextTimestamp
+	activeMT := db.memtable
+	frozenMT := db.frozen
+	ssts := db.sstables
+	db.mu.RUnlock()
+
+	return db.getAsOfSnapshot(key, snapshot, activeMT, frozenMT, ssts)
+}
+
+// GetAsOf returns the version of key visible at snapshot. Exposed for
+// future transaction support and for testing MVCC semantics directly.
+func (db *DB) GetAsOf(key []byte, snapshot uint64) ([]byte, error) {
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
@@ -236,24 +267,31 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	ssts := db.sstables
 	db.mu.RUnlock()
 
-	if v, op, found := activeMT.Get(key); found {
+	return db.getAsOfSnapshot(key, snapshot, activeMT, frozenMT, ssts)
+}
+
+func (db *DB) getAsOfSnapshot(
+	key []byte,
+	snapshot uint64,
+	activeMT, frozenMT *memtable.Memtable,
+	ssts []*sstable.Reader,
+) ([]byte, error) {
+	if v, op, found := activeMT.GetAsOf(key, snapshot); found {
 		if op == memtable.OpDelete {
 			return nil, ErrKeyNotFound
 		}
 		return v, nil
 	}
-
 	if frozenMT != nil {
-		if v, op, found := frozenMT.Get(key); found {
+		if v, op, found := frozenMT.GetAsOf(key, snapshot); found {
 			if op == memtable.OpDelete {
 				return nil, ErrKeyNotFound
 			}
 			return v, nil
 		}
 	}
-
 	for _, r := range ssts {
-		v, op, found, err := r.Get(key)
+		v, op, found, err := r.GetAsOf(key, snapshot)
 		if err != nil {
 			return nil, fmt.Errorf("db: get sstable: %w", err)
 		}
@@ -264,12 +302,9 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 			return v, nil
 		}
 	}
-
 	return nil, ErrKeyNotFound
 }
 
-// flushLocked freezes the active memtable, writes it as an SSTable,
-// truncates the WAL, and commits. Must be called with db.mu held.
 func (db *DB) flushLocked() error {
 	if db.memtable.Len() == 0 {
 		return nil
@@ -288,9 +323,9 @@ func (db *DB) flushLocked() error {
 	}
 
 	var iterErr error
-	db.frozen.Iterate(func(k, v []byte, op memtable.Op) bool {
-		// memtable.Op and record.Op share byte values (1=Put, 2=Delete).
-		if err := w.Add(record.Op(op), k, v); err != nil {
+	db.frozen.Iterate(func(userKey, value []byte, op memtable.Op, ts uint64) bool {
+		// memtable.Op and record.Op share byte values; the cast is safe.
+		if err := w.Add(record.Op(op), userKey, value, ts); err != nil {
 			iterErr = err
 			return false
 		}
@@ -304,13 +339,17 @@ func (db *DB) flushLocked() error {
 		return err
 	}
 
+	// At this point the SSTable (including its MaxTimestamp footer) is
+	// fully durable on disk via Finish's fsync + rename + syncDir.
+	// Only NOW is it safe to touch the WAL — if a crash had happened
+	// before Finish returned, the WAL would still hold the records
+	// and a subsequent Open would re-derive them.
+
 	r, err := sstable.OpenReader(path)
 	if err != nil {
 		return err
 	}
 
-	// Truncate the WAL: close, remove, reopen. We hold the DB lock so
-	// no Append can race with this.
 	if err := db.wal.Close(); err != nil {
 		r.Close()
 		return err
@@ -326,8 +365,6 @@ func (db *DB) flushLocked() error {
 		return err
 	}
 
-	// Commit. Allocate a new slice so any concurrent Get holding the
-	// old slice header sees a consistent snapshot.
 	db.wal = newWAL
 	db.sstables = append([]*sstable.Reader{r}, db.sstables...)
 	db.sstableIDs = append([]int{id}, db.sstableIDs...)
@@ -336,8 +373,6 @@ func (db *DB) flushLocked() error {
 	return nil
 }
 
-// signalCompact non-blockingly nudges the compactor goroutine. Must be
-// called while holding db.mu so Close cannot have closed compactCh yet.
 func (db *DB) signalCompact() {
 	if db.closed || db.opts.DisableBackgroundCompaction {
 		return
@@ -348,7 +383,6 @@ func (db *DB) signalCompact() {
 	}
 }
 
-// Close flushes and closes the DB. Safe to call more than once.
 func (db *DB) Close() error {
 	db.mu.Lock()
 	if db.closed {
@@ -358,7 +392,6 @@ func (db *DB) Close() error {
 	db.closed = true
 	db.mu.Unlock()
 
-	// Stop the compactor and wait for it to drain.
 	close(db.compactCh)
 	<-db.compactDoneCh
 
@@ -376,15 +409,12 @@ func (db *DB) Close() error {
 	return firstErr
 }
 
-// NumSSTablesForTesting returns the number of open SSTable readers.
 func (db *DB) NumSSTablesForTesting() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return len(db.sstables)
 }
 
-// FlushForTesting forces a flush of the current memtable, regardless
-// of size. Used by tests to exercise the flush path deterministically.
 func (db *DB) FlushForTesting() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -396,6 +426,15 @@ func (db *DB) FlushForTesting() error {
 	}
 	db.signalCompact()
 	return nil
+}
+
+// NextTimestampForTesting returns the current value of the timestamp
+// counter (next-to-assign). Used by tests to capture a snapshot point
+// between writes.
+func (db *DB) NextTimestampForTesting() uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.nextTimestamp
 }
 
 func sstableFilename(id int) string { return fmt.Sprintf("%06d.sst", id) }

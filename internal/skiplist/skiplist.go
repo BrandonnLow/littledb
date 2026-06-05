@@ -164,3 +164,25 @@ func (s *Skiplist) Iterate(fn func(key, value []byte) bool) {
 		}
 	}
 }
+
+// SeekGE returns the first node whose key is >= target, or nil if no
+// such node exists. The returned node may be followed via Next() to
+// walk forward in sorted order.
+func (s *Skiplist) SeekGE(target []byte) *Node {
+	cur := s.head
+	for i := s.height - 1; i >= 0; i-- {
+		for cur.next[i] != nil && bytes.Compare(cur.next[i].key, target) < 0 {
+			cur = cur.next[i]
+		}
+	}
+	return cur.next[0]
+}
+
+// Next returns the next node in sorted order, or nil at the end.
+// Calling Next on a nil receiver is safe and returns nil.
+func (n *Node) Next() *Node {
+	if n == nil {
+		return nil
+	}
+	return n.next[0]
+}

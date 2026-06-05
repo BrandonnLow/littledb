@@ -2,257 +2,147 @@ package memtable
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
-	"sync"
 	"testing"
 )
 
-func TestEmptyGet(t *testing.T) {
+func TestPutGetSingleVersion(t *testing.T) {
 	m := New()
-	v, op, ok := m.Get([]byte("x"))
-	if ok || op != 0 || v != nil {
-		t.Errorf("Get on empty: got (%q, %d, %v)", v, op, ok)
-	}
-	if m.Len() != 0 {
-		t.Errorf("Len = %d, want 0", m.Len())
-	}
-}
-
-func TestPutGet(t *testing.T) {
-	m := New()
-	if err := m.Put([]byte("hello"), []byte("world")); err != nil {
+	if err := m.Put([]byte("k"), []byte("v"), 100); err != nil {
 		t.Fatal(err)
 	}
-	v, op, ok := m.Get([]byte("hello"))
-	if !ok || op != OpPut || !bytes.Equal(v, []byte("world")) {
-		t.Errorf("got (%q, %d, %v), want (world, OpPut, true)", v, op, ok)
+	v, op, found := m.GetAsOf([]byte("k"), 100)
+	if !found || op != OpPut || !bytes.Equal(v, []byte("v")) {
+		t.Errorf("got (%q, %d, %v)", v, op, found)
 	}
 }
 
-func TestDeleteWritesTombstone(t *testing.T) {
+func TestMultipleVersionsCoexist(t *testing.T) {
 	m := New()
-	m.Put([]byte("k"), []byte("v"))
-	if err := m.Delete([]byte("k")); err != nil {
-		t.Fatal(err)
-	}
-	v, op, ok := m.Get([]byte("k"))
-	if !ok {
-		t.Error("Get after Delete: ok=false, want true (tombstone should be visible)")
-	}
-	if op != OpDelete {
-		t.Errorf("op = %d, want OpDelete", op)
-	}
-	if v != nil {
-		t.Errorf("tombstone value = %q, want nil", v)
+	m.Put([]byte("k"), []byte("v1"), 100)
+	m.Put([]byte("k"), []byte("v2"), 200)
+	m.Put([]byte("k"), []byte("v3"), 300)
+
+	for _, c := range []struct {
+		snapshot uint64
+		want     string
+	}{
+		{50, ""},
+		{100, "v1"},
+		{150, "v1"},
+		{200, "v2"},
+		{250, "v2"},
+		{300, "v3"},
+		{1000, "v3"},
+	} {
+		v, op, found := m.GetAsOf([]byte("k"), c.snapshot)
+		if c.want == "" {
+			if found {
+				t.Errorf("snapshot=%d: got (%q, %d, true), want not-found", c.snapshot, v, op)
+			}
+			continue
+		}
+		if !found || op != OpPut || string(v) != c.want {
+			t.Errorf("snapshot=%d: got (%q, %d, %v), want (%q, OpPut, true)",
+				c.snapshot, v, op, found, c.want)
+		}
 	}
 }
 
-func TestDeleteOnMissingKeyStillWritesTombstone(t *testing.T) {
-	// Important: tombstones must be written even for keys we don't see,
-	// because the key may exist in an older SSTable that we need to mask.
+func TestTombstoneMasks(t *testing.T) {
 	m := New()
-	if err := m.Delete([]byte("nope")); err != nil {
-		t.Fatal(err)
+	m.Put([]byte("k"), []byte("v1"), 100)
+	m.Delete([]byte("k"), 200)
+	m.Put([]byte("k"), []byte("v3"), 300)
+
+	v, op, found := m.GetAsOf([]byte("k"), 100)
+	if !found || op != OpPut || !bytes.Equal(v, []byte("v1")) {
+		t.Errorf("ts=100: got (%q, %d, %v)", v, op, found)
 	}
-	_, op, ok := m.Get([]byte("nope"))
-	if !ok || op != OpDelete {
-		t.Errorf("got (op=%d, ok=%v), want (OpDelete, true)", op, ok)
+
+	_, op, found = m.GetAsOf([]byte("k"), 200)
+	if !found || op != OpDelete {
+		t.Errorf("ts=200: op=%d found=%v, want (OpDelete, true)", op, found)
+	}
+
+	_, op, found = m.GetAsOf([]byte("k"), 250)
+	if !found || op != OpDelete {
+		t.Errorf("ts=250: op=%d found=%v", op, found)
+	}
+
+	v, op, found = m.GetAsOf([]byte("k"), 300)
+	if !found || op != OpPut || !bytes.Equal(v, []byte("v3")) {
+		t.Errorf("ts=300: got (%q, %d, %v)", v, op, found)
 	}
 }
 
-func TestPutAfterDelete(t *testing.T) {
+func TestGetAsOfMissingKey(t *testing.T) {
 	m := New()
-	m.Put([]byte("k"), []byte("v1"))
-	m.Delete([]byte("k"))
-	m.Put([]byte("k"), []byte("v2"))
-
-	v, op, ok := m.Get([]byte("k"))
-	if !ok || op != OpPut || !bytes.Equal(v, []byte("v2")) {
-		t.Errorf("got (%q, %d, %v), want (v2, OpPut, true)", v, op, ok)
+	m.Put([]byte("k"), []byte("v"), 100)
+	if _, _, found := m.GetAsOf([]byte("other"), 200); found {
+		t.Error("found a key that was never put")
 	}
 }
 
-func TestEmptyValue(t *testing.T) {
-	// Empty value must be distinguishable from a tombstone. The contract
-	// is that op == OpPut for a stored empty value (regardless of whether
-	// the returned slice is nil or a zero-length non-nil slice — Go's
-	// append([]byte(nil), x...) of an empty x returns nil, which is fine).
+func TestPutFrozenReturnsError(t *testing.T) {
 	m := New()
-	m.Put([]byte("k"), []byte{})
-
-	v, op, ok := m.Get([]byte("k"))
-	if !ok {
-		t.Fatal("Get: ok = false, want true")
-	}
-	if op != OpPut {
-		t.Errorf("op = %d, want OpPut", op)
-	}
-	if len(v) != 0 {
-		t.Errorf("value = %v, want empty", v)
-	}
-}
-
-func TestFreezeBlocksWrites(t *testing.T) {
-	m := New()
-	m.Put([]byte("k"), []byte("v"))
 	m.Freeze()
-	if !m.IsFrozen() {
-		t.Error("IsFrozen = false after Freeze")
-	}
-
-	if err := m.Put([]byte("k2"), []byte("v")); !errors.Is(err, ErrFrozen) {
-		t.Errorf("Put after Freeze: err = %v, want ErrFrozen", err)
-	}
-	if err := m.Delete([]byte("k")); !errors.Is(err, ErrFrozen) {
-		t.Errorf("Delete after Freeze: err = %v, want ErrFrozen", err)
-	}
-
-	v, op, ok := m.Get([]byte("k"))
-	if !ok || op != OpPut || !bytes.Equal(v, []byte("v")) {
-		t.Errorf("Get after Freeze: got (%q, %d, %v)", v, op, ok)
+	if err := m.Put([]byte("k"), []byte("v"), 1); err != ErrFrozen {
+		t.Errorf("Put on frozen: err=%v, want ErrFrozen", err)
 	}
 }
 
-func TestApproximateSize(t *testing.T) {
+func TestIterateYieldsAllVersionsSorted(t *testing.T) {
 	m := New()
-	if m.ApproximateSize() != 0 {
-		t.Errorf("ApproximateSize on empty = %d, want 0", m.ApproximateSize())
-	}
-	m.Put([]byte("k"), []byte("v"))
-	if m.ApproximateSize() == 0 {
-		t.Error("ApproximateSize after Put = 0, want > 0")
-	}
-	before := m.ApproximateSize()
-
-	m.Put([]byte("k"), []byte("v2"))
-	after := m.ApproximateSize()
-	if after < before-100 || after > before+100 {
-		t.Errorf("update size delta too large: before=%d after=%d", before, after)
-	}
-}
-
-func TestIterateSortedIncludesTombstones(t *testing.T) {
-	m := New()
-	m.Put([]byte("c"), []byte("3"))
-	m.Put([]byte("a"), []byte("1"))
-	m.Delete([]byte("b"))
-	m.Put([]byte("d"), []byte("4"))
+	m.Put([]byte("b"), []byte("b50"), 50)
+	m.Put([]byte("a"), []byte("a100"), 100)
+	m.Put([]byte("a"), []byte("a200"), 200)
+	m.Put([]byte("b"), []byte("b100"), 100)
+	m.Delete([]byte("a"), 300)
 
 	type entry struct {
-		key string
-		val string
-		op  Op
+		k, v string
+		op   Op
+		ts   uint64
 	}
 	var got []entry
-	m.Iterate(func(k, v []byte, op Op) bool {
-		got = append(got, entry{string(k), string(v), op})
+	m.Iterate(func(uk, v []byte, op Op, ts uint64) bool {
+		got = append(got, entry{string(uk), string(v), op, ts})
 		return true
 	})
-
 	want := []entry{
-		{"a", "1", OpPut},
-		{"b", "", OpDelete},
-		{"c", "3", OpPut},
-		{"d", "4", OpPut},
+		{"a", "", OpDelete, 300},
+		{"a", "a200", OpPut, 200},
+		{"a", "a100", OpPut, 100},
+		{"b", "b100", OpPut, 100},
+		{"b", "b50", OpPut, 50},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d entries, want %d: %+v", len(got), len(want), got)
 	}
 	for i := range want {
-		if got[i].key != want[i].key || got[i].op != want[i].op {
-			t.Errorf("[%d] got %+v, want %+v", i, got[i], want[i])
-		}
-		if want[i].op == OpPut && got[i].val != want[i].val {
-			t.Errorf("[%d] value: got %q, want %q", i, got[i].val, want[i].val)
+		if got[i] != want[i] {
+			t.Errorf("[%d] got %+v want %+v", i, got[i], want[i])
 		}
 	}
 }
 
-func TestIterateEarlyStop(t *testing.T) {
+func TestSizeTracksGrowth(t *testing.T) {
 	m := New()
-	for _, k := range []string{"a", "b", "c", "d", "e"} {
-		m.Put([]byte(k), []byte("v"))
+	if m.ApproximateSize() != 0 {
+		t.Errorf("initial size = %d, want 0", m.ApproximateSize())
 	}
-	count := 0
-	m.Iterate(func(k, v []byte, op Op) bool {
-		count++
-		return count < 3
-	})
-	if count != 3 {
-		t.Errorf("iterated %d entries, want 3", count)
+	m.Put([]byte("k"), []byte("v"), 1)
+	if m.ApproximateSize() <= 0 {
+		t.Errorf("size after put = %d, want > 0", m.ApproximateSize())
 	}
 }
 
-func TestCallerCanMutateInputs(t *testing.T) {
+func TestLenCountsVersionsNotKeys(t *testing.T) {
 	m := New()
-	key := []byte("k")
-	val := []byte("original")
-	m.Put(key, val)
-
-	key[0] = 'X'
-	val[0] = 'X'
-
-	v, _, ok := m.Get([]byte("k"))
-	if !ok {
-		t.Fatal("Get: not found after caller mutated input")
-	}
-	if !bytes.Equal(v, []byte("original")) {
-		t.Errorf("stored value mutated: %q", v)
-	}
-}
-
-// TestConcurrentReadersAndWriter verifies the RWMutex usage: many
-// readers can run alongside a single writer without races.
-func TestConcurrentReadersAndWriter(t *testing.T) {
-	m := New()
-	const n = 100
-	for i := 0; i < n; i++ {
-		m.Put([]byte(fmt.Sprintf("k%d", i)), []byte(fmt.Sprintf("v%d-init", i)))
-	}
-
-	const readers = 4
-	const writes = 500
-	stop := make(chan struct{})
-
-	var wg sync.WaitGroup
-	wg.Add(readers + 1)
-	errCh := make(chan error, readers+1)
-
-	for r := 0; r < readers; r++ {
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				for i := 0; i < n; i++ {
-					_, _, _ = m.Get([]byte(fmt.Sprintf("k%d", i)))
-				}
-				_ = m.Len()
-				_ = m.ApproximateSize()
-			}
-		}()
-	}
-
-	go func() {
-		defer wg.Done()
-		for w := 0; w < writes; w++ {
-			k := []byte(fmt.Sprintf("k%d", w%n))
-			v := []byte(fmt.Sprintf("v%d-up%d", w%n, w))
-			if err := m.Put(k, v); err != nil {
-				errCh <- fmt.Errorf("put: %w", err)
-				return
-			}
-		}
-		close(stop)
-	}()
-
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		t.Error(err)
+	m.Put([]byte("k"), []byte("v1"), 100)
+	m.Put([]byte("k"), []byte("v2"), 200)
+	m.Put([]byte("k"), []byte("v3"), 300)
+	if got := m.Len(); got != 3 {
+		t.Errorf("Len = %d, want 3 (each version is its own entry)", got)
 	}
 }

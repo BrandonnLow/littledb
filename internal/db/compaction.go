@@ -8,27 +8,28 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/BrandonnLow/littledb/internal/mvcckey"
 	"github.com/BrandonnLow/littledb/internal/record"
 	"github.com/BrandonnLow/littledb/internal/sstable"
 )
 
-// mergeEntry is one record from one of the input SSTables, queued on
-// the merge heap.
+// mergeEntry is one record from one of the input SSTables on the
+// merge heap. encKey is the MVCC-encoded key (userKey + ^timestamp),
+// which is what defines sort order.
 type mergeEntry struct {
-	key       []byte
+	encKey    []byte
 	value     []byte
 	op        record.Op
-	sourceIdx int // index in the inputs slice; lower = newer
+	sourceIdx int // lower = newer source
 }
 
-// mergeHeap is a min-heap ordering by (key ascending, sourceIdx
-// ascending). Since inputs are passed newest-first, the smallest
-// sourceIdx wins on duplicate keys.
+// mergeHeap orders by encKey ascending, ties broken by sourceIdx
+// ascending (newer source wins).
 type mergeHeap []mergeEntry
 
 func (h mergeHeap) Len() int { return len(h) }
 func (h mergeHeap) Less(i, j int) bool {
-	if c := bytes.Compare(h[i].key, h[j].key); c != 0 {
+	if c := bytes.Compare(h[i].encKey, h[j].encKey); c != 0 {
 		return c < 0
 	}
 	return h[i].sourceIdx < h[j].sourceIdx
@@ -43,23 +44,30 @@ func (h *mergeHeap) Pop() any {
 	return x
 }
 
-// compactSSTables merges inputs (newest-first) into one new SSTable at
-// outputPath. If dropTombstones is true, OpDelete records produce no
-// output entry; otherwise they're kept so older overlapping SSTables
-// can still be masked.
+// compactSSTables merges inputs (newest-first) into one new SSTable
+// at outputPath.
 //
-// Memory: this implementation buffers every record from every input
-// before merging. Fine for the SSTable sizes. A streaming version
-// using pull-based iterators would be the production approach.
-func compactSSTables(inputs []*sstable.Reader, outputPath string, dropTombstones bool) error {
+// Records carry MVCC timestamps in the ncoded key, and we DO NOT drop
+// tombstones here. Tombstones at any timestamp may still be needed to
+// mask older versions visible to active transactions. TODO: introduce a
+// "low watermark" — the  oldest read timestamp held by any active transaction
+// — and drop tombstones/versions older than that.
+//
+// Identical encoded keys (same userKey AND same timestamp) shouldn't
+// occur in normal operation, but if they do across SSTables being
+// merged we keep the first popped (newer source) and silently drop
+// the rest. Letting sstable.Writer's ErrDuplicate bubble up here
+// would crash compaction; a soft handling lets the system keep
+// running and surface the bigger upstream bug later.
+func compactSSTables(inputs []*sstable.Reader, outputPath string) error {
 	sources := make([][]mergeEntry, len(inputs))
 	totalRecords := 0
 	for i, r := range inputs {
 		var src []mergeEntry
-		err := r.Iterate(func(op record.Op, k, v []byte) bool {
+		err := r.Iterate(func(op record.Op, encKey, value []byte) bool {
 			src = append(src, mergeEntry{
-				key:       append([]byte(nil), k...),
-				value:     append([]byte(nil), v...),
+				encKey:    append([]byte(nil), encKey...),
+				value:     append([]byte(nil), value...),
 				op:        op,
 				sourceIdx: i,
 			})
@@ -86,8 +94,8 @@ func compactSSTables(inputs []*sstable.Reader, outputPath string, dropTombstones
 		return err
 	}
 
-	var lastKey []byte
-	var lastKeyValid bool
+	var lastEncKey []byte
+	var lastValid bool
 
 	for h.Len() > 0 {
 		e := heap.Pop(h).(mergeEntry)
@@ -97,17 +105,25 @@ func compactSSTables(inputs []*sstable.Reader, outputPath string, dropTombstones
 			positions[e.sourceIdx]++
 		}
 
-		if lastKeyValid && bytes.Equal(e.key, lastKey) {
+		// Dedup: same encoded key (= same userKey + same timestamp)
+		// means a duplicate version. Keep the first popped (newer
+		// source) and skip subsequent matches.
+		if lastValid && bytes.Equal(e.encKey, lastEncKey) {
 			continue
 		}
-		lastKey = e.key
-		lastKeyValid = true
+		lastEncKey = e.encKey
+		lastValid = true
 
-		if dropTombstones && e.op == record.OpDelete {
-			continue
+		// Decode the encoded key back into userKey + ts so the Writer
+		// can re-encode internally. The double encode/decode is a
+		// small cost; we accept it for API cleanliness (the Writer's
+		// public interface takes userKey + ts, not encoded keys).
+		userKey, ts, ok := mvcckey.Decode(e.encKey)
+		if !ok {
+			w.Abort()
+			return fmt.Errorf("compaction: malformed encoded key (len=%d)", len(e.encKey))
 		}
-
-		if err := w.Add(e.op, e.key, e.value); err != nil {
+		if err := w.Add(e.op, userKey, e.value, ts); err != nil {
 			w.Abort()
 			return fmt.Errorf("compaction: write: %w", err)
 		}
@@ -116,17 +132,12 @@ func compactSSTables(inputs []*sstable.Reader, outputPath string, dropTombstones
 	return w.Finish()
 }
 
-// compactLoop runs in a goroutine. Reads signals from db.compactCh and
-// runs compactions until no more work is pending. Exits when the
-// channel is closed.
 func (db *DB) compactLoop() {
 	defer close(db.compactDoneCh)
 	for range db.compactCh {
 		for {
 			ran, err := db.tryCompactOnce()
 			if err != nil {
-				// Background path swallows errors silently. Tests use
-				// CompactForTesting which returns errors directly.
 				break
 			}
 			if !ran {
@@ -136,8 +147,6 @@ func (db *DB) compactLoop() {
 	}
 }
 
-// CompactForTesting runs compactions until no more work is pending,
-// returning the first error encountered.
 func (db *DB) CompactForTesting() error {
 	for {
 		ran, err := db.tryCompactOnce()
@@ -150,12 +159,6 @@ func (db *DB) CompactForTesting() error {
 	}
 }
 
-// tryCompactOnce attempts one compaction cycle. Returns (true, nil) if
-// it ran a compaction, (false, nil) if there was no work to do, and
-// (false, err) on any failure.
-//
-// compactMu serializes calls so the background goroutine and
-// CompactForTesting don't step on each other.
 func (db *DB) tryCompactOnce() (bool, error) {
 	db.compactMu.Lock()
 	defer db.compactMu.Unlock()
@@ -177,30 +180,14 @@ func (db *DB) tryCompactOnce() (bool, error) {
 	copy(inputs, db.sstables[start:])
 	copy(inputIDs, db.sstableIDs[start:])
 
-	// inputs is newest-first within the oldest-N tail: inputs[0] is the
-	// newest of the four, inputs[n-1] is the absolute oldest. This
-	// matches mergeHeap's "smallest sourceIdx wins on duplicates".
-	//
-	// The merged file inherits the MAX input ID, not a fresh one from
-	// nextID. Why: filename order must match recency order so that
-	// reopening (which sorts filenames by ID ascending and treats the
-	// largest as newest) agrees with the in-memory ordering (where the
-	// merged file sits at the OLDER end of the slice). If we used a
-	// fresh higher ID, the on-disk recency would flip on reopen and
-	// stale data would shadow newer SSTables. The reused ID belongs to
-	// one of the inputs; sstable.Writer renames its .tmp file over that
-	// input, which on Linux atomically detaches the old inode (any
-	// still-open reader keeps a valid FD until GC). The delete loop
-	// below skips that reused ID.
-	outputID := inputIDs[0] // max because inputs are newest-first
+	// Output reuses max(inputIDs) so on-disk ID order matches recency
+	// order. See the compaction ID/recency bug fix in DESIGN.md.
+	outputID := inputIDs[0]
 	db.mu.Unlock()
 
 	outputPath := filepath.Join(db.dir, sstableFilename(outputID))
 
-	// Slow merge happens without the DB lock so reads continue normally.
-	// Since we're compacting the oldest tail, no older SSTable exists
-	// for tombstones to mask — drop them.
-	if err := compactSSTables(inputs, outputPath, true); err != nil {
+	if err := compactSSTables(inputs, outputPath); err != nil {
 		os.Remove(outputPath)
 		os.Remove(outputPath + ".tmp")
 		return false, err
@@ -247,14 +234,6 @@ func (db *DB) tryCompactOnce() (bool, error) {
 	db.sstableIDs = newIDs
 	db.mu.Unlock()
 
-	// Unlink the input files. We do NOT explicitly close the input
-	// Readers — in-flight Gets that captured the old slice may still
-	// be reading from them. The unlink removes the directory entry
-	// immediately; the underlying file descriptors will be closed by
-	// GC finalizers on *os.File once no references remain.
-	//
-	// This is a simplification. Production systems use
-	// refcounting per reader.
 	for _, id := range inputIDs {
 		if id == outputID {
 			continue

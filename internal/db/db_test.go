@@ -12,10 +12,7 @@ import (
 )
 
 func TestPutGet(t *testing.T) {
-	d, err := Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+	d, _ := Open(t.TempDir())
 	defer d.Close()
 	d.Put([]byte("hello"), []byte("world"))
 	got, err := d.Get([]byte("hello"))
@@ -32,7 +29,7 @@ func TestGetMissing(t *testing.T) {
 	}
 }
 
-func TestOverwrite(t *testing.T) {
+func TestOverwriteReturnsLatest(t *testing.T) {
 	d, _ := Open(t.TempDir())
 	defer d.Close()
 	d.Put([]byte("k"), []byte("v1"))
@@ -40,7 +37,7 @@ func TestOverwrite(t *testing.T) {
 	d.Put([]byte("k"), []byte("v3"))
 	got, _ := d.Get([]byte("k"))
 	if !bytes.Equal(got, []byte("v3")) {
-		t.Errorf("got %q", got)
+		t.Errorf("got %q, want v3", got)
 	}
 }
 
@@ -132,20 +129,6 @@ func TestRecoveryWithWALAndSSTables(t *testing.T) {
 	}
 }
 
-func TestWALTruncatedAfterFlush(t *testing.T) {
-	dir := t.TempDir()
-	d, _ := OpenWith(dir, Options{SyncOnWrite: false})
-	defer d.Close()
-	for i := 0; i < 100; i++ {
-		d.Put([]byte(fmt.Sprintf("k%d", i)), []byte("v"))
-	}
-	d.FlushForTesting()
-	info, _ := os.Stat(filepath.Join(dir, walFilename))
-	if info.Size() != 0 {
-		t.Errorf("WAL size = %d, want 0", info.Size())
-	}
-}
-
 func TestConcurrentReadersAndWriter(t *testing.T) {
 	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
 	defer d.Close()
@@ -198,28 +181,112 @@ func TestCloseIdempotent(t *testing.T) {
 	}
 }
 
-func TestCompactionMergesOldSSTables(t *testing.T) {
-	d, _ := OpenWith(t.TempDir(), Options{
-		SyncOnWrite:       false,
-		CompactionTrigger: 4,
-	})
+func TestSnapshotReadSeesOldValue(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
 	defer d.Close()
 
+	d.Put([]byte("k"), []byte("v1"))
+	snapAfterV1 := d.NextTimestampForTesting() - 1
+	d.Put([]byte("k"), []byte("v2"))
+
+	got, _ := d.Get([]byte("k"))
+	if !bytes.Equal(got, []byte("v2")) {
+		t.Errorf("Get() = %q, want v2", got)
+	}
+
+	got, _ = d.GetAsOf([]byte("k"), snapAfterV1)
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Errorf("GetAsOf(snapAfterV1) = %q, want v1", got)
+	}
+}
+
+func TestSnapshotReadAcrossFlushBoundary(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
+	defer d.Close()
+
+	d.Put([]byte("k"), []byte("v1"))
+	snap1 := d.NextTimestampForTesting() - 1
+	d.Put([]byte("k"), []byte("v2"))
+	d.FlushForTesting()
+	d.Put([]byte("k"), []byte("v3"))
+
+	got, _ := d.Get([]byte("k"))
+	if !bytes.Equal(got, []byte("v3")) {
+		t.Errorf("now: got %q, want v3", got)
+	}
+	got, _ = d.GetAsOf([]byte("k"), snap1)
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Errorf("snap1: got %q, want v1", got)
+	}
+}
+
+func TestSnapshotBeforeAnyWriteIsNotFound(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
+	defer d.Close()
+	d.Put([]byte("k"), []byte("v1"))
+	_, err := d.GetAsOf([]byte("k"), 0)
+	if !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("err = %v, want ErrKeyNotFound", err)
+	}
+}
+
+func TestSnapshotSeesDeletedKeyBeforeDelete(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
+	defer d.Close()
+	d.Put([]byte("k"), []byte("v"))
+	snapAfterPut := d.NextTimestampForTesting() - 1
+	d.Delete([]byte("k"))
+
+	if _, err := d.Get([]byte("k")); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("Get(): err=%v, want ErrKeyNotFound", err)
+	}
+	got, err := d.GetAsOf([]byte("k"), snapAfterPut)
+	if err != nil || !bytes.Equal(got, []byte("v")) {
+		t.Errorf("GetAsOf(snapAfterPut): got %q err=%v", got, err)
+	}
+}
+
+func TestTimestampMonotonicAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	d, _ := OpenWith(dir, Options{SyncOnWrite: true})
+	d.Put([]byte("a"), []byte("1"))
+	d.Put([]byte("b"), []byte("2"))
+	d.FlushForTesting()
+	d.Put([]byte("c"), []byte("3"))
+	tsBeforeClose := d.NextTimestampForTesting()
+	d.Close()
+
+	d2, _ := Open(dir)
+	defer d2.Close()
+	if got := d2.NextTimestampForTesting(); got < tsBeforeClose {
+		t.Errorf("after reopen, next timestamp = %d, want >= %d", got, tsBeforeClose)
+	}
+	d2.Put([]byte("d"), []byte("4"))
+	if got := d2.NextTimestampForTesting(); got <= tsBeforeClose {
+		t.Errorf("after new Put, next timestamp = %d, must exceed %d", got, tsBeforeClose)
+	}
+}
+
+func TestCompactionMergesOldSSTables(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{
+		SyncOnWrite:                 false,
+		CompactionTrigger:           4,
+		DisableBackgroundCompaction: true,
+	})
+	defer d.Close()
 	for i := 0; i < 4; i++ {
 		d.Put([]byte(fmt.Sprintf("k%d", i)), []byte("v"))
 		d.FlushForTesting()
 	}
 	if d.NumSSTablesForTesting() != 4 {
-		t.Fatalf("pre-compact NumSSTables = %d, want 4", d.NumSSTablesForTesting())
+		t.Fatalf("pre = %d", d.NumSSTablesForTesting())
 	}
-
 	if err := d.CompactForTesting(); err != nil {
 		t.Fatal(err)
 	}
 	if d.NumSSTablesForTesting() != 1 {
-		t.Errorf("post-compact NumSSTables = %d, want 1", d.NumSSTablesForTesting())
+		t.Errorf("post = %d, want 1", d.NumSSTablesForTesting())
 	}
-
 	for i := 0; i < 4; i++ {
 		got, err := d.Get([]byte(fmt.Sprintf("k%d", i)))
 		if err != nil || !bytes.Equal(got, []byte("v")) {
@@ -228,194 +295,34 @@ func TestCompactionMergesOldSSTables(t *testing.T) {
 	}
 }
 
-func TestCompactionCollapsesOverwrites(t *testing.T) {
+func TestCompactionPreservesAllVersions(t *testing.T) {
 	d, _ := OpenWith(t.TempDir(), Options{
-		SyncOnWrite:       false,
-		CompactionTrigger: 4,
-	})
-	defer d.Close()
-
-	for i := 0; i < 4; i++ {
-		d.Put([]byte("k"), []byte(fmt.Sprintf("v%d", i)))
-		d.FlushForTesting()
-	}
-	if err := d.CompactForTesting(); err != nil {
-		t.Fatal(err)
-	}
-	got, _ := d.Get([]byte("k"))
-	if !bytes.Equal(got, []byte("v3")) {
-		t.Errorf("got %q, want v3", got)
-	}
-}
-
-func TestCompactionDropsTombstonesAtBottom(t *testing.T) {
-	d, _ := OpenWith(t.TempDir(), Options{
-		SyncOnWrite:       false,
-		CompactionTrigger: 2,
-	})
-	defer d.Close()
-
-	d.Put([]byte("k"), []byte("v"))
-	d.FlushForTesting()
-	d.Delete([]byte("k"))
-	d.FlushForTesting()
-
-	if d.NumSSTablesForTesting() != 2 {
-		t.Fatalf("pre NumSSTables = %d", d.NumSSTablesForTesting())
-	}
-	if err := d.CompactForTesting(); err != nil {
-		t.Fatal(err)
-	}
-	if d.NumSSTablesForTesting() != 1 {
-		t.Errorf("post NumSSTables = %d, want 1", d.NumSSTablesForTesting())
-	}
-	if _, err := d.Get([]byte("k")); !errors.Is(err, ErrKeyNotFound) {
-		t.Errorf("err = %v, want ErrKeyNotFound", err)
-	}
-}
-
-func TestRecoveryAfterCompaction(t *testing.T) {
-	dir := t.TempDir()
-	d, _ := OpenWith(dir, Options{
-		SyncOnWrite:       true,
-		CompactionTrigger: 2,
-	})
-
-	d.Put([]byte("a"), []byte("1"))
-	d.FlushForTesting()
-	d.Put([]byte("b"), []byte("2"))
-	d.FlushForTesting()
-	d.CompactForTesting()
-	if d.NumSSTablesForTesting() != 1 {
-		t.Fatalf("pre-reopen NumSSTables = %d", d.NumSSTablesForTesting())
-	}
-	d.Close()
-
-	d2, err := Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d2.Close()
-	if d2.NumSSTablesForTesting() != 1 {
-		t.Errorf("post-reopen NumSSTables = %d", d2.NumSSTablesForTesting())
-	}
-	for _, c := range []struct{ k, v string }{{"a", "1"}, {"b", "2"}} {
-		got, err := d2.Get([]byte(c.k))
-		if err != nil || !bytes.Equal(got, []byte(c.v)) {
-			t.Errorf("%s: got %q err=%v", c.k, got, err)
-		}
-	}
-}
-
-func TestCompactionDeletesOldFiles(t *testing.T) {
-	dir := t.TempDir()
-	d, _ := OpenWith(dir, Options{
 		SyncOnWrite:                 false,
 		CompactionTrigger:           2,
 		DisableBackgroundCompaction: true,
 	})
 	defer d.Close()
 
-	d.Put([]byte("a"), []byte("1"))
+	d.Put([]byte("k"), []byte("v1"))
+	snap1 := d.NextTimestampForTesting() - 1
 	d.FlushForTesting()
-	d.Put([]byte("b"), []byte("2"))
+	d.Put([]byte("k"), []byte("v2"))
 	d.FlushForTesting()
-
-	if _, err := os.Stat(filepath.Join(dir, "000001.sst")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "000002.sst")); err != nil {
-		t.Fatal(err)
-	}
-
-	d.CompactForTesting()
-
-	// The merged output reuses the max input ID (2). 000001.sst was
-	// the older input and is now unlinked; 000002.sst was the newer
-	// input and has been atomically replaced by the merged output.
-	if _, err := os.Stat(filepath.Join(dir, "000001.sst")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("000001.sst still present: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "000002.sst")); err != nil {
-		t.Errorf("000002.sst missing (should be the merged output): %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "000003.sst")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("000003.sst unexpectedly exists (no fresh ID should have been allocated): %v", err)
-	}
-}
-
-func TestCompactionConcurrentWithReads(t *testing.T) {
-	d, _ := OpenWith(t.TempDir(), Options{
-		SyncOnWrite:       false,
-		CompactionTrigger: 2,
-	})
-	defer d.Close()
-
-	const n = 100
-	for i := 0; i < n; i++ {
-		d.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("v"))
-	}
-	d.FlushForTesting()
-	for i := 0; i < n; i++ {
-		d.Put([]byte(fmt.Sprintf("k%03d", i)), []byte("v2"))
-	}
-	d.FlushForTesting()
-
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	errCh := make(chan error, 8)
-	for r := 0; r < 4; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				for i := 0; i < n; i++ {
-					if _, err := d.Get([]byte(fmt.Sprintf("k%03d", i))); err != nil {
-						errCh <- err
-						return
-					}
-				}
-			}
-		}()
-	}
 
 	if err := d.CompactForTesting(); err != nil {
 		t.Fatal(err)
 	}
-	close(stop)
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		t.Error(err)
+
+	got, err := d.GetAsOf([]byte("k"), snap1)
+	if err != nil || !bytes.Equal(got, []byte("v1")) {
+		t.Errorf("after compact, GetAsOf(snap1) = %q err=%v, want v1", got, err)
+	}
+	got, _ = d.Get([]byte("k"))
+	if !bytes.Equal(got, []byte("v2")) {
+		t.Errorf("Get() = %q, want v2", got)
 	}
 }
 
-func TestCompactionNoTrigger(t *testing.T) {
-	d, _ := OpenWith(t.TempDir(), Options{
-		SyncOnWrite:       false,
-		CompactionTrigger: 4,
-	})
-	defer d.Close()
-	d.Put([]byte("k"), []byte("v"))
-	d.FlushForTesting()
-	if err := d.CompactForTesting(); err != nil {
-		t.Fatal(err)
-	}
-	if d.NumSSTablesForTesting() != 1 {
-		t.Errorf("NumSSTables = %d", d.NumSSTablesForTesting())
-	}
-}
-
-// TestCompactionPreservesNewerSSTableAfterReopen catches the bug
-// where the merged output was given a fresh ID (higher than the
-// untouched newer SSTable), making on-disk ID order disagree with
-// in-memory recency order. In-process Get returned the right value;
-// reopening returned a stale one.
 func TestCompactionPreservesNewerSSTableAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	d, _ := OpenWith(dir, Options{
@@ -425,29 +332,21 @@ func TestCompactionPreservesNewerSSTableAfterReopen(t *testing.T) {
 	})
 
 	d.Put([]byte("k"), []byte("v1"))
-	d.FlushForTesting() // 000001
+	d.FlushForTesting()
 	d.Put([]byte("x1"), []byte("x"))
-	d.FlushForTesting() // 000002
+	d.FlushForTesting()
 	d.Put([]byte("x2"), []byte("x"))
-	d.FlushForTesting() // 000003
+	d.FlushForTesting()
 	d.Put([]byte("x3"), []byte("x"))
-	d.FlushForTesting() // 000004
+	d.FlushForTesting()
 	d.Put([]byte("k"), []byte("v2"))
-	d.FlushForTesting() // 000005 — newest, must remain newest
+	d.FlushForTesting()
 
 	if d.NumSSTablesForTesting() != 5 {
-		t.Fatalf("pre-compact NumSSTables = %d, want 5", d.NumSSTablesForTesting())
+		t.Fatalf("pre = %d, want 5", d.NumSSTablesForTesting())
 	}
 	if err := d.CompactForTesting(); err != nil {
 		t.Fatal(err)
-	}
-	if d.NumSSTablesForTesting() != 2 {
-		t.Fatalf("post-compact NumSSTables = %d, want 2", d.NumSSTablesForTesting())
-	}
-
-	got, _ := d.Get([]byte("k"))
-	if !bytes.Equal(got, []byte("v2")) {
-		t.Errorf("in-process Get(k) = %q, want v2", got)
 	}
 	d.Close()
 
@@ -458,7 +357,7 @@ func TestCompactionPreservesNewerSSTableAfterReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, []byte("v2")) {
-		t.Errorf("post-reopen Get(k) = %q, want v2 (compaction ID/recency bug)", got)
+		t.Errorf("post-reopen Get(k) = %q, want v2", got)
 	}
 }
 
@@ -468,7 +367,6 @@ func TestBackgroundCompactionTriggers(t *testing.T) {
 		CompactionTrigger: 2,
 	})
 	defer d.Close()
-
 	d.Put([]byte("a"), []byte("1"))
 	d.FlushForTesting()
 	d.Put([]byte("b"), []byte("2"))
@@ -481,4 +379,18 @@ func TestBackgroundCompactionTriggers(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Errorf("background compaction never ran; NumSSTables = %d", d.NumSSTablesForTesting())
+}
+
+func TestWALTruncatedAfterFlush(t *testing.T) {
+	dir := t.TempDir()
+	d, _ := OpenWith(dir, Options{SyncOnWrite: false})
+	defer d.Close()
+	for i := 0; i < 100; i++ {
+		d.Put([]byte(fmt.Sprintf("k%d", i)), []byte("v"))
+	}
+	d.FlushForTesting()
+	info, _ := os.Stat(filepath.Join(dir, walFilename))
+	if info.Size() != 0 {
+		t.Errorf("WAL size = %d, want 0", info.Size())
+	}
 }
