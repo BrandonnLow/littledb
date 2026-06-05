@@ -1,37 +1,34 @@
 // Package sstable implements immutable sorted-string tables on disk.
+// MVCC: each record's key is MVCC-encoded (userKey + descending timestamp)
+// so multiple versions of a userKey coexist.
 //
 // File layout:
 //
 //	┌─────────────────────────────────────────────────────────┐
 //	│  DATA SECTION                                           │
-//	│    Block 1: [record][record]...[record]                 │
-//	│    Block 2: ...                                         │
-//	│    ...                                                  │
+//	│    ~4 KB blocks of records with MVCC-encoded keys       │
 //	├─────────────────────────────────────────────────────────┤
 //	│  INDEX SECTION                                          │
-//	│    One record per block: key = first key in block,      │
-//	│    value = [blockOffset:8][blockSize:8]                 │
+//	│    One record per block: firstKey + offset + size       │
 //	├─────────────────────────────────────────────────────────┤
 //	│  BLOOM SECTION                                          │
-//	│    Serialized bloom filter bytes (see bloom package).   │
-//	│    Used by Reader.Get to skip files that definitely     │
-//	│    do not contain the target key.                       │
+//	│    Filter over userKeys (not encoded keys); a positive  │
+//	│    means "some version of userKey may be in this file." │
 //	├─────────────────────────────────────────────────────────┤
-//	│  FOOTER (40 bytes, fixed)                               │
-//	│    indexOffset, indexSize,                              │
-//	│    bloomOffset, bloomSize,                              │
-//	│    magic                                                │
+//	│  FOOTER (48 bytes, fixed)                               │
+//	│    indexOffset, indexSize, bloomOffset, bloomSize,      │
+//	│    maxTimestamp, magic                                  │
 //	└─────────────────────────────────────────────────────────┘
 //
-// Reads work as: read footer → load index and bloom into memory → on
-// Get, check bloom first; if maybe-present, binary-search index for
-// the right block; read just that block; linear scan within it.
-//
-// SSTables are created atomically via "<path>.tmp" + rename + dir fsync.
+// Reads work as: bloom check on userKey → binary-search index for the
+// block whose firstKey is the largest ≤ Encode(userKey, snapshot) →
+// scan that block for the first key ≥ target. The first match's
+// userKey tells us whether the file holds a visible version.
 package sstable
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -42,44 +39,32 @@ import (
 	"sync/atomic"
 
 	"github.com/BrandonnLow/littledb/internal/bloom"
+	"github.com/BrandonnLow/littledb/internal/mvcckey"
 	"github.com/BrandonnLow/littledb/internal/record"
 )
 
 const (
-	// blockSize targets one OS page. Records do not split across blocks;
-	// a single oversized record produces a single oversized block.
-	blockSize = 4096
-	// footerSize is the fixed footer length at the end of every SSTable.
-	// Layout: indexOffset (8) + indexSize (8) + magic (8).
-	footerSize = 40
-	// magic identifies a valid SSTable file. "LILLEDB!" interpreted as a
-	// little-endian uint64.
+	blockSize       = 4096
+	footerSize      = 48
 	magic           = uint64(0x21424445_4C4C494C) // "LILLEDB!"
-	bloomBitsPerKey = 10                          // ~1% FPR, matches LevelDB
+	bloomBitsPerKey = 10
 )
 
 var (
-	// ErrOutOfOrder is returned by Writer.Add if the caller provides
-	// keys that are not strictly ascending.
 	ErrOutOfOrder = errors.New("sstable: keys out of order")
-	// ErrDuplicate is returned by Writer.Add when the same key appears twice.
-	ErrDuplicate = errors.New("sstable: duplicate key")
-	// ErrBadMagic is returned by OpenReader when the footer's magic
-	// number does not match.
-	ErrBadMagic = errors.New("sstable: bad magic; not an sstable file")
+	ErrDuplicate  = errors.New("sstable: duplicate key")
+	ErrBadMagic   = errors.New("sstable: bad magic; not an sstable file")
 )
 
-// indexEntry describes one data block in the SSTable. Held in memory
-// after the index is loaded.
 type indexEntry struct {
 	firstKey    []byte
 	blockOffset int64
 	blockSize   int64
 }
 
-// Writer builds an SSTable. Keys must be Added in strictly ascending
-// order. Finish makes the file visible at its final path; Abort removes
-// the temp file without publishing it.
+// Writer builds an SSTable. Records must be added in strictly
+// ascending MVCC-encoded-key order — equivalently, ascending userKey
+// and within each userKey descending timestamp.
 type Writer struct {
 	path    string
 	tmpPath string
@@ -94,21 +79,20 @@ type Writer struct {
 	index  []indexEntry
 	filter *bloom.Filter
 
-	lastKey []byte
-	written int64
-	count   int
+	lastEncKey   []byte
+	maxTimestamp uint64
+	written      int64
+	count        int
 
 	closed bool
 }
 
-// NewWriter creates a writer for path with a bloom filter sized for
-// expectedKeys. Estimating the count is fine — over-estimating wastes
-// a little bloom space, under-estimating raises the filter's false-
-// positive rate above target.
+// NewWriter creates a writer for path. expectedKeys sizes the bloom
+// filter; an over-estimate wastes a little memory, an under-estimate
+// raises the false-positive rate above target.
 func NewWriter(path string, expectedKeys int) (*Writer, error) {
 	dir := filepath.Dir(path)
 	tmpPath := path + ".tmp"
-
 	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("sstable: open %s: %w", tmpPath, err)
@@ -124,14 +108,17 @@ func NewWriter(path string, expectedKeys int) (*Writer, error) {
 	}, nil
 }
 
-// Add appends one record. Keys must be strictly ascending; duplicates
-// and out-of-order keys return an error.
-func (w *Writer) Add(op record.Op, key, value []byte) error {
+// Add appends one record. (userKey, ts) must form a strictly
+// ascending MVCC-encoded-key sequence across calls. The bloom filter
+// is updated with userKey (not the encoded key), so any future
+// timestamp query for userKey will look up correctly.
+func (w *Writer) Add(op record.Op, userKey, value []byte, ts uint64) error {
 	if w.closed {
 		return errors.New("sstable: write on closed writer")
 	}
-	if w.lastKey != nil {
-		switch cmp := bytesCompare(key, w.lastKey); {
+	encKey := mvcckey.Encode(userKey, ts)
+	if w.lastEncKey != nil {
+		switch cmp := bytes.Compare(encKey, w.lastEncKey); {
 		case cmp == 0:
 			return ErrDuplicate
 		case cmp < 0:
@@ -139,31 +126,36 @@ func (w *Writer) Add(op record.Op, key, value []byte) error {
 		}
 	}
 
-	encoded := record.Encode(&record.Record{Op: op, Key: key, Value: value})
+	encoded := record.Encode(&record.Record{
+		Op:        op,
+		Timestamp: ts,
+		Key:       encKey,
+		Value:     value,
+	})
 
-	// If adding this record would overflow the current block AND the
-	// block already has at least one record, close the current block
-	// first. We never split a record across blocks, so an oversized
-	// record (larger than blockSize on its own) ends up in a block by
-	// itself.
 	if len(w.blockBuf) > 0 && len(w.blockBuf)+len(encoded) > blockSize {
 		if err := w.flushBlock(); err != nil {
 			return err
 		}
 	}
 	if len(w.blockBuf) == 0 {
-		w.blockFirstKey = append([]byte(nil), key...)
+		w.blockFirstKey = append([]byte(nil), encKey...)
 	}
 	w.blockBuf = append(w.blockBuf, encoded...)
 
-	w.filter.Add(key)
-	w.lastKey = append(w.lastKey[:0], key...)
+	// Bloom filter sees userKey, not encKey. This is the critical
+	// invariant: a Get(userKey, anyTimestamp) needs the filter to
+	// return "maybe" for any version of userKey we've added.
+	w.filter.Add(userKey)
+
+	w.lastEncKey = append(w.lastEncKey[:0], encKey...)
+	if ts > w.maxTimestamp {
+		w.maxTimestamp = ts
+	}
 	w.count++
 	return nil
 }
 
-// flushBlock writes the current block to the file, records an index
-// entry, and resets the block state.
 func (w *Writer) flushBlock() error {
 	if len(w.blockBuf) == 0 {
 		return nil
@@ -183,8 +175,12 @@ func (w *Writer) flushBlock() error {
 	return nil
 }
 
-// Finish writes the index, the bloom filter, and the footer; fsyncs;
-// renames the temp file to the final path; fsyncs the directory.
+// Finish writes the index, bloom filter, and footer; fsyncs; renames
+// the temp file to the final path; fsyncs the directory.
+//
+// Ordering invariant: by the time this returns, the SSTable file
+// (including its footer with MaxTimestamp) is fully durable on disk.
+// Callers that subsequently truncate or rotate the WAL depend on this.
 func (w *Writer) Finish() error {
 	if w.closed {
 		return errors.New("sstable: finish on closed writer")
@@ -195,7 +191,6 @@ func (w *Writer) Finish() error {
 		return err
 	}
 
-	// Index section.
 	indexOffset := w.written
 	var indexBytes []byte
 	for _, e := range w.index {
@@ -211,7 +206,6 @@ func (w *Writer) Finish() error {
 	indexSize := int64(len(indexBytes))
 	w.written += indexSize
 
-	// Bloom section.
 	bloomOffset := w.written
 	bloomBytes := w.filter.Bytes()
 	if _, err := w.bw.Write(bloomBytes); err != nil {
@@ -220,13 +214,13 @@ func (w *Writer) Finish() error {
 	bloomSize := int64(len(bloomBytes))
 	w.written += bloomSize
 
-	// Footer.
 	footer := make([]byte, footerSize)
 	binary.LittleEndian.PutUint64(footer[0:8], uint64(indexOffset))
 	binary.LittleEndian.PutUint64(footer[8:16], uint64(indexSize))
 	binary.LittleEndian.PutUint64(footer[16:24], uint64(bloomOffset))
 	binary.LittleEndian.PutUint64(footer[24:32], uint64(bloomSize))
-	binary.LittleEndian.PutUint64(footer[32:40], magic)
+	binary.LittleEndian.PutUint64(footer[32:40], w.maxTimestamp)
+	binary.LittleEndian.PutUint64(footer[40:48], magic)
 	if _, err := w.bw.Write(footer); err != nil {
 		return fmt.Errorf("sstable: write footer: %w", err)
 	}
@@ -249,8 +243,6 @@ func (w *Writer) Finish() error {
 	return nil
 }
 
-// Abort closes and removes the temp file. Safe to call after a partial
-// Add sequence on the error path. Calling Abort after Finish is a no-op.
 func (w *Writer) Abort() error {
 	if w.closed {
 		return nil
@@ -263,26 +255,21 @@ func (w *Writer) Abort() error {
 	return nil
 }
 
-// Count returns the number of records Added so far.
 func (w *Writer) Count() int { return w.count }
 
-// Reader reads an immutable SSTable. Safe for concurrent reads once opened.
+// Reader reads an immutable SSTable. Safe for concurrent reads.
 type Reader struct {
-	path   string
-	f      *os.File
-	size   int64
-	index  []indexEntry
-	filter *bloom.Filter
+	path         string
+	f            *os.File
+	size         int64
+	index        []indexEntry
+	filter       *bloom.Filter
+	maxTimestamp uint64
 
-	// blockReadCount counts block reads served by Get. Used by tests
-	// to verify the bloom filter is skipping reads. Atomic so concurrent
-	// Gets stay race-clean.
 	blockReadCount atomic.Int64
-
-	closed bool
+	closed         bool
 }
 
-// OpenReader opens an SSTable at path and loads its index into memory.
 func OpenReader(path string) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -304,7 +291,7 @@ func OpenReader(path string) (*Reader, error) {
 		f.Close()
 		return nil, fmt.Errorf("sstable: read footer: %w", err)
 	}
-	gotMagic := binary.LittleEndian.Uint64(footer[32:40])
+	gotMagic := binary.LittleEndian.Uint64(footer[40:48])
 	if gotMagic != magic {
 		f.Close()
 		return nil, fmt.Errorf("%w: got %#x", ErrBadMagic, gotMagic)
@@ -313,6 +300,7 @@ func OpenReader(path string) (*Reader, error) {
 	indexSize := int64(binary.LittleEndian.Uint64(footer[8:16]))
 	bloomOffset := int64(binary.LittleEndian.Uint64(footer[16:24]))
 	bloomSize := int64(binary.LittleEndian.Uint64(footer[24:32]))
+	maxTS := binary.LittleEndian.Uint64(footer[32:40])
 
 	limit := size - footerSize
 	if indexOffset < 0 || indexSize < 0 || indexOffset+indexSize > limit ||
@@ -321,7 +309,6 @@ func OpenReader(path string) (*Reader, error) {
 		return nil, fmt.Errorf("sstable %s: footer offsets out of range", path)
 	}
 
-	// Index.
 	indexBuf := make([]byte, indexSize)
 	if indexSize > 0 {
 		if _, err := f.ReadAt(indexBuf, indexOffset); err != nil {
@@ -349,7 +336,6 @@ func OpenReader(path string) (*Reader, error) {
 		offset += n
 	}
 
-	// Bloom.
 	var filter *bloom.Filter
 	if bloomSize > 0 {
 		bloomBuf := make([]byte, bloomSize)
@@ -364,72 +350,107 @@ func OpenReader(path string) (*Reader, error) {
 		}
 	}
 
-	return &Reader{path: path, f: f, size: size, index: idx, filter: filter}, nil
+	return &Reader{
+		path:         path,
+		f:            f,
+		size:         size,
+		index:        idx,
+		filter:       filter,
+		maxTimestamp: maxTS,
+	}, nil
 }
 
-// Get returns the value for key.
+// MaxTimestamp returns the largest timestamp recorded in this file's
+// footer. Used by the DB layer to compute the initial value of its
+// timestamp counter on Open.
+func (r *Reader) MaxTimestamp() uint64 { return r.maxTimestamp }
+
+// GetAsOf returns the version of userKey visible at snapshot.
 //
-// found=false        → key is not in this SSTable
-// op=OpDelete, found → tombstone
-// op=OpPut,   found  → live value
-func (r *Reader) Get(key []byte) (value []byte, op record.Op, found bool, err error) {
+//   - (value, OpPut, true,  nil) — a live value
+//   - (nil,   OpDelete, true,  nil) — masked by a tombstone
+//   - (nil,   0,        false, nil) — no visible version
+func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op record.Op, found bool, err error) {
 	if r.closed {
 		return nil, 0, false, errors.New("sstable: read on closed reader")
 	}
 	if len(r.index) == 0 {
 		return nil, 0, false, nil
 	}
-
-	// Bloom check: if the filter says no, skip the block read entirely.
-	if r.filter != nil && !r.filter.MayContain(key) {
+	// Bloom check is on userKey, NOT the encoded key. If we hashed the
+	// encoded key we'd have a separate filter entry per version, and
+	// a lookup at any snapshot other than an exact previous write
+	// timestamp would falsely report "absent."
+	if r.filter != nil && !r.filter.MayContain(userKey) {
 		return nil, 0, false, nil
 	}
 
-	hi := sort.Search(len(r.index), func(i int) bool {
-		return bytesCompare(r.index[i].firstKey, key) > 0
+	target := mvcckey.Encode(userKey, snapshot)
+	n := len(r.index)
+
+	// Largest block N with firstKey <= target. The answer (if any) is
+	// either inside block N or at the start of block N+1.
+	hi := sort.Search(n, func(i int) bool {
+		return bytes.Compare(r.index[i].firstKey, target) > 0
 	})
-	if hi == 0 {
-		return nil, 0, false, nil
+	startBlock := 0
+	if hi > 0 {
+		startBlock = hi - 1
 	}
-	blk := r.index[hi-1]
 
-	buf := make([]byte, blk.blockSize)
-	if _, err := r.f.ReadAt(buf, blk.blockOffset); err != nil {
-		return nil, 0, false, fmt.Errorf("sstable: read block: %w", err)
-	}
-	r.blockReadCount.Add(1)
-
-	offset := int64(0)
-	for offset < blk.blockSize {
-		rec, n, derr := record.Decode(buf[offset:])
-		if derr != nil {
-			return nil, 0, false, fmt.Errorf("sstable %s: decode in block at %d: %w", r.path, blk.blockOffset+offset, derr)
+	for blkIdx := startBlock; blkIdx < n && blkIdx <= startBlock+1; blkIdx++ {
+		blk := r.index[blkIdx]
+		buf := make([]byte, blk.blockSize)
+		if _, err := r.f.ReadAt(buf, blk.blockOffset); err != nil {
+			return nil, 0, false, fmt.Errorf("sstable: read block: %w", err)
 		}
-		cmp := bytesCompare(rec.Key, key)
-		if cmp == 0 {
+		r.blockReadCount.Add(1)
+
+		offset := int64(0)
+		for offset < blk.blockSize {
+			rec, decN, derr := record.Decode(buf[offset:])
+			if derr != nil {
+				return nil, 0, false, fmt.Errorf("sstable %s: decode in block at %d: %w", r.path, blk.blockOffset+offset, derr)
+			}
+			offset += int64(decN)
+
+			// Skip records whose encoded key sorts before target
+			// (i.e., versions newer than our snapshot).
+			if bytes.Compare(rec.Key, target) < 0 {
+				continue
+			}
+
+			// First record at-or-after target: check userKey match.
+			recUserKey, _, ok := mvcckey.Decode(rec.Key)
+			if !ok {
+				return nil, 0, false, fmt.Errorf("sstable %s: malformed encoded key", r.path)
+			}
+			if !bytes.Equal(recUserKey, userKey) {
+				// Moved past userKey without a visible version.
+				return nil, 0, false, nil
+			}
 			if rec.Op == record.OpDelete {
 				return nil, record.OpDelete, true, nil
 			}
 			return append([]byte(nil), rec.Value...), record.OpPut, true, nil
 		}
-		if cmp > 0 {
-			return nil, 0, false, nil
-		}
-		offset += int64(n)
+		// Block exhausted without finding a key >= target — the answer
+		// (if any) is at the start of the next block; loop continues.
 	}
+
 	return nil, 0, false, nil
 }
 
-// Iterate yields each record in sorted order across all blocks. Return
-// false from fn to stop. Returns a non-nil error if the file is corrupt.
-func (r *Reader) Iterate(fn func(op record.Op, key, value []byte) bool) error {
+// Iterate yields each record in sorted order (encoded-key ascending).
+// Used by compaction; the encoded key contains both userKey and
+// timestamp.
+func (r *Reader) Iterate(fn func(op record.Op, encKey, value []byte) bool) error {
 	if r.closed {
 		return errors.New("sstable: iterate on closed reader")
 	}
 	if len(r.index) == 0 {
 		return nil
 	}
-
 	for _, blk := range r.index {
 		buf := make([]byte, blk.blockSize)
 		if _, err := r.f.ReadAt(buf, blk.blockOffset); err != nil {
@@ -450,7 +471,6 @@ func (r *Reader) Iterate(fn func(op record.Op, key, value []byte) bool) error {
 	return nil
 }
 
-// Close releases the underlying file. Safe to call more than once.
 func (r *Reader) Close() error {
 	if r.closed {
 		return nil
@@ -459,12 +479,7 @@ func (r *Reader) Close() error {
 	return r.f.Close()
 }
 
-// NumBlocks returns the number of data blocks in this SSTable. Useful
-// for tests and debugging.
-func (r *Reader) NumBlocks() int { return len(r.index) }
-
-// BlockReadsForTesting returns the number of block reads served by Get
-// so far. Used by tests to verify the bloom filter is doing its job.
+func (r *Reader) NumBlocks() int              { return len(r.index) }
 func (r *Reader) BlockReadsForTesting() int64 { return r.blockReadCount.Load() }
 
 func syncDir(dir string) error {
@@ -479,30 +494,4 @@ func syncDir(dir string) error {
 		}
 	}
 	return nil
-}
-
-func bytesCompare(a, b []byte) int {
-	if len(a) == len(b) {
-		for i := range a {
-			if a[i] != b[i] {
-				if a[i] < b[i] {
-					return -1
-				}
-				return 1
-			}
-		}
-		return 0
-	}
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] != b[i] {
-			if a[i] < b[i] {
-				return -1
-			}
-			return 1
-		}
-	}
-	if len(a) < len(b) {
-		return -1
-	}
-	return 1
 }
