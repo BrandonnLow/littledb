@@ -25,6 +25,12 @@ type Op byte
 const (
 	OpPut    Op = 1
 	OpDelete Op = 2
+	// OpCommit is the txn-commit marker. A record with this op has no
+	// key or value; its Timestamp identifies the txn whose preceding
+	// data records (sharing that Timestamp) should be applied as a
+	// group. WAL recovery buffers data records and drains them when
+	// the matching OpCommit appears.
+	OpCommit Op = 3
 )
 
 // HeaderSize is the fixed size of a record's header in bytes:
@@ -114,7 +120,7 @@ func Decode(b []byte) (*Record, int, error) {
 		return nil, 0, ErrCorrupt
 	}
 
-	if op != OpPut && op != OpDelete {
+	if op != OpPut && op != OpDelete && op != OpCommit {
 		return nil, 0, ErrInvalidOp
 	}
 
