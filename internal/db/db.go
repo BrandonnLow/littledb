@@ -4,9 +4,7 @@
 // multiple versions of a userKey coexist; reads ask for "the version as of snapshot T."
 //
 // The single-version Get(k) internally reads as-of the current write-counter value,
-// so it sees the latest committed version of k. Transactions will
-// introduce explicit Begin() returning a Txn that captures its own
-// snapshot timestamp.
+// so it sees the latest committed version of k.
 package db
 
 import (
@@ -126,19 +124,43 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	}
 
 	mt := memtable.New()
+	// Buffer pending records until we see their Opcommit. Records
+	// without a matching commit marker (an uncommitted partial txn at
+	// the WAL tail) are silently discarded — that's the atomicity
+	// guarantee. All records in `buffer` share a single timestamp,
+	// because txns serialize at commit time under the write lock.
+	var buffer []*record.Record
 	err = w.Scan(func(offset int64, rec *record.Record) error {
 		if rec.Timestamp > maxTS {
 			maxTS = rec.Timestamp
 		}
 		switch rec.Op {
-		case record.OpPut:
-			return mt.Put(rec.Key, rec.Value, rec.Timestamp)
-		case record.OpDelete:
-			return mt.Delete(rec.Key, rec.Timestamp)
+		case record.OpPut, record.OpDelete:
+			buffer = append(buffer, rec)
+		case record.OpCommit:
+			for _, br := range buffer {
+				if br.Timestamp != rec.Timestamp {
+					return fmt.Errorf("db: replay: ts mismatch (data %d vs commit %d)",
+						br.Timestamp, rec.Timestamp)
+				}
+				switch br.Op {
+				case record.OpPut:
+					if err := mt.Put(br.Key, br.Value, br.Timestamp); err != nil {
+						return err
+					}
+				case record.OpDelete:
+					if err := mt.Delete(br.Key, br.Timestamp); err != nil {
+						return err
+					}
+				}
+			}
+			buffer = buffer[:0]
 		default:
-			return fmt.Errorf("db: unknown op %d in wal", rec.Op)
+			return fmt.Errorf("db: replay: unknown op %d", rec.Op)
 		}
+		return nil
 	})
+
 	if err != nil {
 		w.Close()
 		for _, r := range ssts {
@@ -177,63 +199,20 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 
 // Put writes (key, value) at a freshly-allocated timestamp.
 func (db *DB) Put(key, value []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return errClosed
+	t := db.Begin()
+	if err := t.Put(key, value); err != nil {
+		return err
 	}
-
-	// Allocate the timestamp BEFORE the WAL append, and inside the
-	// write lock. This is the ordering invariant: any reader that sees
-	// counter value T has also seen every Put/Delete with ts < T
-	// applied to the memtable, because both happened under the same
-	// lock acquisition.
-	ts := db.nextTimestamp
-	db.nextTimestamp++
-
-	rec := &record.Record{Op: record.OpPut, Timestamp: ts, Key: key, Value: value}
-	if _, err := db.wal.Append(rec); err != nil {
-		return fmt.Errorf("db: put wal: %w", err)
-	}
-	if err := db.memtable.Put(key, value, ts); err != nil {
-		return fmt.Errorf("db: put memtable: %w", err)
-	}
-
-	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
-		if err := db.flushLocked(); err != nil {
-			return fmt.Errorf("db: flush after put: %w", err)
-		}
-		db.signalCompact()
-	}
-	return nil
+	return t.Commit()
 }
 
 // Delete writes a tombstone at a freshly-allocated timestamp.
 func (db *DB) Delete(key []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return errClosed
+	t := db.Begin()
+	if err := t.Delete(key); err != nil {
+		return err
 	}
-
-	ts := db.nextTimestamp
-	db.nextTimestamp++
-
-	rec := &record.Record{Op: record.OpDelete, Timestamp: ts, Key: key}
-	if _, err := db.wal.Append(rec); err != nil {
-		return fmt.Errorf("db: delete wal: %w", err)
-	}
-	if err := db.memtable.Delete(key, ts); err != nil {
-		return fmt.Errorf("db: delete memtable: %w", err)
-	}
-
-	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
-		if err := db.flushLocked(); err != nil {
-			return fmt.Errorf("db: flush after delete: %w", err)
-		}
-		db.signalCompact()
-	}
-	return nil
+	return t.Commit()
 }
 
 // Get returns the latest committed version of key. Equivalent to

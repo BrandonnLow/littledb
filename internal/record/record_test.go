@@ -112,6 +112,22 @@ func TestDecodeCorruptTimestamp(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeCommitMarker(t *testing.T) {
+	// Commit markers have no key or value, just an op and a timestamp.
+	r := &Record{Op: OpCommit, Timestamp: 12345}
+	buf := Encode(r)
+	got, _, err := Decode(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Op != OpCommit || got.Timestamp != 12345 {
+		t.Errorf("got %+v", got)
+	}
+	if len(got.Key) != 0 || len(got.Value) != 0 {
+		t.Errorf("commit marker had non-empty key/value: %+v", got)
+	}
+}
+
 func TestDecodeInvalidOp(t *testing.T) {
 	r := &Record{Op: 99, Timestamp: 0, Key: []byte("k"), Value: []byte("v")}
 	buf := Encode(r)
