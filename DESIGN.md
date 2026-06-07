@@ -38,7 +38,11 @@ The hot path is **synchronous disk I/O with strict ordering**: each write append
 
 **`defer` for cleanup.** Several paths must release a resource on every exit — closing a WAL file, unregistering a transaction, removing a temp SSTable on abort. `defer` makes these concise and panic-safe, versus `goto cleanup` chains in C, RAII guards in C++, or verbose `try-finally` in Java.
 
+**Errors are values, not control flow.** Recovery code benefits most: WAL replay distinguishes `io.EOF` (clean end of log), `io.ErrUnexpectedEOF` (a record truncated by a crash mid-write), and `ErrCorrupt` (a CRC mismatch) as three separate conditions, handled with plain comparisons rather than exception unwinding that hides which path the code took. A truncated tail is expected and recoverable; a CRC mismatch is not — keeping them as distinct values keeps that decision explicit.
+
 **Standard library covers it, zero dependencies.** `os.File` gives `Sync()` (fsync), `Write`/`WriteAt`, and `os.Rename`; `hash/crc32` with Castagnoli for CRC-32C; `encoding/binary` for fixed-endianness on-disk formats; `container/heap` for the compaction merge heap; `sort.Search` for the SSTable index. The whole `go.mod` has zero external imports — fewer surprises in GC, fsync, or scheduling behaviour, and less to reason about.
+
+**Single static binary.** `go build` produces one file with no runtime dependency — no interpreter, no shared libraries, no install step. The CLI demo and REPL ship as a standalone executable, without a package manager or build system on the target machine.
 
 **Race detector in the toolchain.** `go test -race` runs on the full suite every commit and catches ordering bugs. TSan and JVM equivalents exist but none is as low-friction as one flag.
 
