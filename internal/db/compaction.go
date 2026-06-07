@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/BrandonnLow/littledb/internal/mvcckey"
 	"github.com/BrandonnLow/littledb/internal/record"
@@ -44,22 +45,34 @@ func (h *mergeHeap) Pop() any {
 	return x
 }
 
-// compactSSTables merges inputs (newest-first) into one new SSTable
+// compactSSTables // compactSSTables merges inputs (newest-first) into one new SSTable
 // at outputPath.
 //
-// Records carry MVCC timestamps in the ncoded key, and we DO NOT drop
-// tombstones here. Tombstones at any timestamp may still be needed to
-// mask older versions visible to active transactions. TODO: introduce a
-// "low watermark" — the  oldest read timestamp held by any active transaction
-// — and drop tombstones/versions older than that.
+// Version GC is now performed.
 //
-// Identical encoded keys (same userKey AND same timestamp) shouldn't
-// occur in normal operation, but if they do across SSTables being
-// merged we keep the first popped (newer source) and silently drop
-// the rest. Letting sstable.Writer's ErrDuplicate bubble up here
-// would crash compaction; a soft handling lets the system keep
-// running and surface the bigger upstream bug later.
-func compactSSTables(inputs []*sstable.Reader, outputPath string) error {
+// Watermark = min(oldest active txn's readSnap, nextTimestamp - 1).
+// A version V@T for userKey K is observable only by snapshots in
+// [T, T_next), where T_next is the timestamp of K's next-newer
+// version (or +∞ for K's latest). For V to be reachable by some
+// active or future snapshot, T_next must exceed the watermark.
+// So during the merge, walking newest-first per userKey:
+//   - The first (newest) version of each userKey is always emitted,
+//     UNLESS it's a tombstone with T ≤ watermark AND we're at the
+//     bottom of the LSM (no older versions exist below us). In that
+//     case the entire userKey vanishes — the tombstone is no longer
+//     needed because no observable snapshot would distinguish "key
+//     deleted" from "key never existed."
+//   - Older versions are emitted only if their next-newer version's
+//     ts > watermark (= there's still a snapshot in the gap).
+//
+// bottomOfLSM is true when this compaction's output occupies the
+// oldest slot in the LSM — no older SSTables exist below it that
+// might contain versions the tombstone is masking. Our size-tiered
+// compaction always satisfies this (we merge the oldest N tail).
+//
+// Identical encoded keys across inputs are soft-deduped (the
+// first popped wins).
+func compactSSTables(inputs []*sstable.Reader, outputPath string, watermark uint64, bottomOfLSM bool) error {
 	sources := make([][]mergeEntry, len(inputs))
 	totalRecords := 0
 	for i, r := range inputs {
@@ -97,6 +110,10 @@ func compactSSTables(inputs []*sstable.Reader, outputPath string) error {
 	var lastEncKey []byte
 	var lastValid bool
 
+	// Per-userKey state for version GC.
+	var currentUserKey []byte
+	var prevTS uint64
+
 	for h.Len() > 0 {
 		e := heap.Pop(h).(mergeEntry)
 
@@ -114,15 +131,41 @@ func compactSSTables(inputs []*sstable.Reader, outputPath string) error {
 		lastEncKey = e.encKey
 		lastValid = true
 
-		// Decode the encoded key back into userKey + ts so the Writer
-		// can re-encode internally. The double encode/decode is a
-		// small cost; we accept it for API cleanliness (the Writer's
-		// public interface takes userKey + ts, not encoded keys).
 		userKey, ts, ok := mvcckey.Decode(e.encKey)
 		if !ok {
 			w.Abort()
 			return fmt.Errorf("compaction: malformed encoded key (len=%d)", len(e.encKey))
 		}
+
+		// Detect transition to a new userKey group.
+		firstOfUserKey := currentUserKey == nil || !bytes.Equal(userKey, currentUserKey)
+		if firstOfUserKey {
+			currentUserKey = append(currentUserKey[:0], userKey...)
+		}
+
+		if firstOfUserKey {
+			// Newest version of this userKey. Tombstone GC: at the
+			// bottom of the LSM, a tombstone with ts ≤ watermark
+			// can't be observed by any current or future snapshot,
+			// and there are no older versions below to expose.
+			// Drop it and let the cascade below drop older versions.
+			if bottomOfLSM && e.op == record.OpDelete && ts <= watermark {
+				prevTS = ts // ≤ watermark, so older versions drop too
+				continue
+			}
+		} else {
+			// Older version. Observable only if prevTS > watermark.
+			// Only safe at the bottom of the LSM: dropping an older
+			// version mid-layer would expose even-older versions in
+			// lower SSTables that this one was shadowing for reads
+			// in [ts, prevTS).
+			if bottomOfLSM && prevTS <= watermark {
+				continue
+			}
+		}
+
+		prevTS = ts
+
 		if err := w.Add(e.op, userKey, e.value, ts); err != nil {
 			w.Abort()
 			return fmt.Errorf("compaction: write: %w", err)
@@ -180,14 +223,24 @@ func (db *DB) tryCompactOnce() (bool, error) {
 	copy(inputs, db.sstables[start:])
 	copy(inputIDs, db.sstableIDs[start:])
 
-	// Output reuses max(inputIDs) so on-disk ID order matches recency
-	// order. See the compaction ID/recency bug fix in DESIGN.md.
+	// Determine if this compaction's output reaches the bottom of the
+	// LSM — i.e., our inputs include the SSTable with the smallest ID
+	// (the oldest one), so no older SSTable will sit below our output.
+	// Derived from the actual input set rather than from a structural
+	// assumption about how `inputs` was selected; correct regardless
+	// of compaction strategy.
+	bottomOfLSM := slices.Min(inputIDs) == slices.Min(db.sstableIDs)
+
 	outputID := inputIDs[0]
 	db.mu.Unlock()
 
+	// Compute watermark outside the write lock (takes RLock + the
+	// activeTxnsMu briefly).
+	watermark := db.computeWatermark()
+
 	outputPath := filepath.Join(db.dir, sstableFilename(outputID))
 
-	if err := compactSSTables(inputs, outputPath); err != nil {
+	if err := compactSSTables(inputs, outputPath, watermark, bottomOfLSM); err != nil {
 		os.Remove(outputPath)
 		os.Remove(outputPath + ".tmp")
 		return false, err

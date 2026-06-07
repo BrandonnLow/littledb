@@ -147,6 +147,48 @@ func (m *Memtable) Iterate(fn func(userKey, value []byte, op Op, ts uint64) bool
 	})
 }
 
+// NewestVersionTS returns the timestamp of the newest stored version
+// of userKey. Used by the DB's commit-time conflict check to decide
+// whether any committer has touched the key since this Txn's Begin.
+//
+// Implementation: Encode(userKey, ^uint64(0)) has the smallest
+// possible suffix for userKey (^uint64(0) becomes 0x00..00 after the
+// bitwise NOT), so SeekGE lands on the smallest existing encoded key
+// for userKey — which, given descending-ts encoding, is its newest
+// version.
+func (m *Memtable) NewestVersionTS(userKey []byte) (ts uint64, found bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	target := mvcckey.Encode(userKey, ^uint64(0))
+	node := m.sl.SeekGE(target)
+	if node == nil {
+		return 0, false
+	}
+	nodeUserKey, nodeTS, ok := mvcckey.Decode(node.Key())
+	if !ok || !bytes.Equal(nodeUserKey, userKey) {
+		return 0, false
+	}
+	return nodeTS, true
+}
+
+// VersionCountForTesting returns the number of distinct versions of
+// userKey stored in this memtable. Used to verify GC behaviour.
+func (m *Memtable) VersionCountForTesting(userKey []byte) int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	target := mvcckey.Encode(userKey, ^uint64(0))
+	count := 0
+	for n := m.sl.SeekGE(target); n != nil; n = n.Next() {
+		nodeUserKey, _, ok := mvcckey.Decode(n.Key())
+		if !ok || !bytes.Equal(nodeUserKey, userKey) {
+			break
+		}
+		count++
+	}
+	return count
+}
+
 // encodeValue and decodeValue pack the op byte in front of the value.
 // Tombstones store an empty payload; live values store their bytes.
 

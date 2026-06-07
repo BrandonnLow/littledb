@@ -296,6 +296,10 @@ func TestCompactionMergesOldSSTables(t *testing.T) {
 }
 
 func TestCompactionPreservesAllVersions(t *testing.T) {
+	// Compaction can drop versions that no active or
+	// future snapshot could observe. To keep v1 alive across compaction
+	// we hold an open txn whose readSnap pins v1 — that drags the
+	// watermark down and inhibits GC.
 	d, _ := OpenWith(t.TempDir(), Options{
 		SyncOnWrite:                 false,
 		CompactionTrigger:           2,
@@ -306,6 +310,11 @@ func TestCompactionPreservesAllVersions(t *testing.T) {
 	d.Put([]byte("k"), []byte("v1"))
 	snap1 := d.NextTimestampForTesting() - 1
 	d.FlushForTesting()
+
+	// Pin v1 by holding an active txn at snap1.
+	pinTxn := d.Begin()
+	defer pinTxn.Rollback()
+
 	d.Put([]byte("k"), []byte("v2"))
 	d.FlushForTesting()
 
