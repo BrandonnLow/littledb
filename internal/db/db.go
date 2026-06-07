@@ -31,8 +31,13 @@ const (
 
 var (
 	ErrKeyNotFound = errors.New("db: key not found")
-	errClosed      = errors.New("db: closed")
-	sstableNameRE  = regexp.MustCompile(`^(\d{6})\.sst$`)
+	// ErrConflict is returned by Txn.Commit when a concurrent
+	// transaction committed a write to one of this txn's keys between
+	// Begin and Commit. Snapshot isolation with first-committer-wins:
+	// the loser must Begin a fresh txn and retry. See Txn.Commit.
+	ErrConflict   = errors.New("db: transaction conflict")
+	errClosed     = errors.New("db: closed")
+	sstableNameRE = regexp.MustCompile(`^(\d{6})\.sst$`)
 )
 
 type Options struct {
@@ -71,6 +76,14 @@ type DB struct {
 	nextTimestamp uint64
 
 	closed bool
+
+	// activeTxnMu protects activeTxns. It's a leaf mutex — never
+	// acquired while holding db.mu — so the watermark computation has
+	// to sample db.nextTimestamp under db.mu.RLock first and then
+	// iterate activeTxns under activeTxnsMu. The two-phase sampling
+	// is benign for correctness; see computeWaterMark.
+	activeTxnsMu sync.Mutex
+	activeTxns   map[*Txn]struct{}
 
 	compactMu     sync.Mutex
 	compactCh     chan struct{}
@@ -183,6 +196,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		sstableIDs:    sstIDsRev,
 		nextID:        nextID,
 		nextTimestamp: maxTS + 1, // first write gets at least 1
+		activeTxns:    make(map[*Txn]struct{}),
 		compactCh:     make(chan struct{}, 1),
 		compactDoneCh: make(chan struct{}),
 	}
@@ -414,6 +428,99 @@ func (db *DB) NextTimestampForTesting() uint64 {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.nextTimestamp
+}
+
+// registerTxn adds t to the active set. Called from Begin.
+func (db *DB) registerTxn(t *Txn) {
+	db.activeTxnsMu.Lock()
+	db.activeTxns[t] = struct{}{}
+	db.activeTxnsMu.Unlock()
+}
+
+// unregisterTxn removes t from the active set. Called from Commit and
+// Rollback. Idempotent — removing an absent key is a no-op.
+func (db *DB) unregisterTxn(t *Txn) {
+	db.activeTxnsMu.Lock()
+	delete(db.activeTxns, t)
+	db.activeTxnsMu.Unlock()
+}
+
+// computeWatermark returns the minimum read snapshot across all
+// currently-active transactions, clamped above by the most recent
+// committed timestamp (nextTimestamp - 1). Versions of any key with
+// no observable snapshot at or above this watermark are GC candidates
+// at compaction time.
+//
+// Two-phase sampling avoids holding both locks at once. Safety rests
+// on two observations:
+//   - A txn that finished between the phases is gone from our
+//     iteration, but its reads have already returned to the caller
+//     before unregisterTxn ran — they can't be invalidated by any
+//     subsequent GC, so excluding it from the watermark is safe.
+//   - A txn that began between the phases has readSnap ≥ the
+//     nextTimestamp, so it can't pull our watermark below a value
+//     that still protects it.
+func (db *DB) computeWatermark() uint64 {
+	db.mu.RLock()
+	watermark := db.nextTimestamp
+	db.mu.RUnlock()
+	if watermark > 0 {
+		watermark--
+	}
+
+	db.activeTxnsMu.Lock()
+	for t := range db.activeTxns {
+		if t.readSnap < watermark {
+			watermark = t.readSnap
+		}
+	}
+	db.activeTxnsMu.Unlock()
+
+	return watermark
+}
+
+// hasCommitNewerThanLocked reports whether any committed write to
+// userKey has timestamp > readSnap. Caller must hold db.mu in write
+// mode. Used by Txn.Commit to detect write-write conflicts.
+//
+// The implementation walks the active memtable, the frozen memtable
+// (if any), and every SSTable, asking each for the timestamp of
+// userKey's newest version. Short-circuits on the first match.
+func (db *DB) hasCommitNewerThanLocked(userKey []byte, readSnap uint64) (bool, error) {
+	if ts, found := db.memtable.NewestVersionTS(userKey); found && ts > readSnap {
+		return true, nil
+	}
+	if db.frozen != nil {
+		if ts, found := db.frozen.NewestVersionTS(userKey); found && ts > readSnap {
+			return true, nil
+		}
+	}
+	for _, r := range db.sstables {
+		ts, found, err := r.NewestVersionTS(userKey)
+		if err != nil {
+			return false, err
+		}
+		if found && ts > readSnap {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// VersionCountForTesting returns the total number of stored versions
+// of userKey across the active memtable, frozen memtable (if any),
+// and all SSTables. Used to verify GC.
+func (db *DB) VersionCountForTesting(userKey []byte) int {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	count := db.memtable.VersionCountForTesting(userKey)
+	if db.frozen != nil {
+		count += db.frozen.VersionCountForTesting(userKey)
+	}
+	for _, r := range db.sstables {
+		count += r.VersionCountForTesting(userKey)
+	}
+	return count
 }
 
 func sstableFilename(id int) string { return fmt.Sprintf("%06d.sst", id) }

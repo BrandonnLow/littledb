@@ -215,11 +215,10 @@ func TestConcurrentTxnsIndependent(t *testing.T) {
 	}
 }
 
-// TestConcurrentTxnsLastWriterWins documents the previous conflict
-// semantics: two concurrent txns can write the same key, and the
-// later committer's value wins. We will replace this with
-// first-committer-wins (returning ErrConflict to the loser).
-func TestConcurrentTxnsLastWriterWins(t *testing.T) {
+// TestConcurrentTxnsFirstCommitterWins is the conflict rule:
+// when two overlapping txns write the same key, the first to commit
+// succeeds and the second gets ErrConflict.
+func TestConcurrentTxnsFirstCommitterWins(t *testing.T) {
 	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
 	defer d.Close()
 
@@ -231,13 +230,122 @@ func TestConcurrentTxnsLastWriterWins(t *testing.T) {
 	if err := txA.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := txB.Commit(); err != nil {
-		t.Fatal(err)
+	err := txB.Commit()
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("txB.Commit() err = %v, want ErrConflict", err)
 	}
 
 	got, _ := d.Get([]byte("k"))
-	if !bytes.Equal(got, []byte("from-B")) {
-		t.Errorf("got %q, want from-B (last writer wins)", got)
+	if !bytes.Equal(got, []byte("from-A")) {
+		t.Errorf("got %q, want from-A (first committer wins)", got)
+	}
+}
+
+func TestNoConflictWithDifferentKeys(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
+	defer d.Close()
+
+	txA := d.Begin()
+	txB := d.Begin()
+	txA.Put([]byte("a"), []byte("1"))
+	txB.Put([]byte("b"), []byte("2"))
+
+	if err := txA.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := txB.Commit(); err != nil {
+		t.Errorf("disjoint-key txns must not conflict: %v", err)
+	}
+}
+
+func TestConflictWithCommittedPut(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
+	defer d.Close()
+
+	tx := d.Begin()
+	tx.Put([]byte("k"), []byte("from-txn"))
+
+	if err := d.Put([]byte("k"), []byte("from-direct")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := tx.Commit()
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("txn.Commit() err = %v, want ErrConflict", err)
+	}
+
+	got, _ := d.Get([]byte("k"))
+	if !bytes.Equal(got, []byte("from-direct")) {
+		t.Errorf("got %q, want from-direct", got)
+	}
+}
+
+func TestReadOnlyTxnNoConflict(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
+	defer d.Close()
+	d.Put([]byte("k"), []byte("v1"))
+
+	tx := d.Begin()
+	if _, err := tx.Get([]byte("k")); err != nil {
+		t.Fatal(err)
+	}
+
+	d.Put([]byte("k"), []byte("v2"))
+
+	if err := tx.Commit(); err != nil {
+		t.Errorf("read-only commit err = %v", err)
+	}
+}
+
+func TestRetryAfterConflict(t *testing.T) {
+	d, _ := OpenWith(t.TempDir(), Options{SyncOnWrite: false})
+	defer d.Close()
+
+	txA := d.Begin()
+	txB := d.Begin()
+	txA.Put([]byte("k"), []byte("A"))
+	txB.Put([]byte("k"), []byte("B"))
+	txA.Commit()
+	if err := txB.Commit(); !errors.Is(err, ErrConflict) {
+		t.Fatal(err)
+	}
+
+	tx := d.Begin()
+	v, _ := tx.Get([]byte("k"))
+	if !bytes.Equal(v, []byte("A")) {
+		t.Errorf("retry saw %q, want A", v)
+	}
+	tx.Put([]byte("k"), []byte("C"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.Get([]byte("k"))
+	if !bytes.Equal(got, []byte("C")) {
+		t.Errorf("got %q, want C", got)
+	}
+}
+
+func TestConflictRejectedTxnLeavesNoWALRecord(t *testing.T) {
+	dir := t.TempDir()
+	d, _ := OpenWith(dir, Options{SyncOnWrite: true})
+
+	d.Put([]byte("k"), []byte("v0"))
+
+	txA := d.Begin()
+	txB := d.Begin()
+	txA.Put([]byte("k"), []byte("A"))
+	txB.Put([]byte("k"), []byte("B"))
+	txA.Commit()
+	if err := txB.Commit(); !errors.Is(err, ErrConflict) {
+		t.Fatal(err)
+	}
+	d.Close()
+
+	d2, _ := Open(dir)
+	defer d2.Close()
+	got, _ := d2.Get([]byte("k"))
+	if !bytes.Equal(got, []byte("A")) {
+		t.Errorf("after restart got %q, want A (B's conflicted writes must not persist)", got)
 	}
 }
 

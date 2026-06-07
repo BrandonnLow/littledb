@@ -51,11 +51,13 @@ func (db *DB) Begin() *Txn {
 	if readSnap > 0 {
 		readSnap--
 	}
-	return &Txn{
+	t := &Txn{
 		db:       db,
 		readSnap: readSnap,
 		writes:   make(map[string]txnWrite),
 	}
+	db.registerTxn(t)
+	return t
 }
 
 // Get returns the value of key visible to this transaction. Local
@@ -104,19 +106,30 @@ func (t *Txn) Rollback() error {
 	}
 	t.writes = nil
 	t.finished = true
+	t.db.unregisterTxn(t)
 	return nil
 }
 
 // Commit atomically writes all buffered changes. On success, every
 // write becomes visible to subsequent readers at the same commit
-// timestamp. On failure (e.g., a WAL write error), the Txn is left in
-// the finished state and the DB is left in a consistent state — any
-// records that did reach the WAL will be discarded on restart because
-// no OpCommit record follows them.
+// timestamp. On failure (e.g., conflict with a concurrent committer,
+// or a WAL write error), the Txn is left in the finished state and
+// the DB is left in a consistent state — any records that did reach
+// the WAL will be discarded on restart because no OpCommit record
+// follows them.
 func (t *Txn) Commit() error {
 	if t.finished {
 		return ErrTxnFinished
 	}
+
+	// Always remove from the active registry once Commit returns
+	// (including on panic — defers run during unwinding).
+	// unregisterTxn only acquires activeTxnsMu; no path holds
+	// activeTxnsMu while waiting for db.mu, so calling it with or
+	// without db.mu still held is deadlock-free. The defer order
+	// relative to the db.mu.Unlock below is incidental, not
+	// load-bearing.
+	defer t.db.unregisterTxn(t)
 
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
@@ -130,6 +143,26 @@ func (t *Txn) Commit() error {
 	if len(t.writes) == 0 {
 		t.finished = true
 		return nil
+	}
+
+	// First-committer-wins conflict detection. For each key we want
+	// to write, ask the storage layer: has anyone committed a newer
+	// version since our readSnap? If yes, our writes are based on
+	// stale data — abort without touching the WAL.
+	//
+	// Must happen under the write lock, before allocating commitTS:
+	// otherwise a concurrent committer could slip in between the
+	// check and the allocation, and we'd miss their write.
+	for k := range t.writes {
+		has, err := t.db.hasCommitNewerThanLocked([]byte(k), t.readSnap)
+		if err != nil {
+			t.finished = true
+			return fmt.Errorf("db: conflict check: %w", err)
+		}
+		if has {
+			t.finished = true
+			return ErrConflict
+		}
 	}
 
 	// Allocate one commit timestamp for all writes in this txn.

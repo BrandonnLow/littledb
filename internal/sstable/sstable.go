@@ -441,6 +441,94 @@ func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op reco
 	return nil, 0, false, nil
 }
 
+// NewestVersionTS returns the timestamp of the newest stored version
+// of userKey in this SSTable, or (0, false) if userKey is not present.
+// Used by the DB's commit-time conflict check.
+//
+// Mirrors GetAsOf's structure: bloom check, binary-search the index
+// for the block whose firstKey is the largest ≤ target, scan that
+// block (and possibly the next) for the first key ≥ target. Target is
+// Encode(userKey, ^uint64(0)), which sorts at the position of the
+// newest possible version of userKey.
+func (r *Reader) NewestVersionTS(userKey []byte) (ts uint64, found bool, err error) {
+	if r.closed {
+		return 0, false, errors.New("sstable: read on closed reader")
+	}
+	if len(r.index) == 0 {
+		return 0, false, nil
+	}
+	if r.filter != nil && !r.filter.MayContain(userKey) {
+		return 0, false, nil
+	}
+
+	target := mvcckey.Encode(userKey, ^uint64(0))
+	n := len(r.index)
+
+	hi := sort.Search(n, func(i int) bool {
+		return bytes.Compare(r.index[i].firstKey, target) > 0
+	})
+	startBlock := 0
+	if hi > 0 {
+		startBlock = hi - 1
+	}
+
+	for blkIdx := startBlock; blkIdx < n && blkIdx <= startBlock+1; blkIdx++ {
+		blk := r.index[blkIdx]
+		buf := make([]byte, blk.blockSize)
+		if _, err := r.f.ReadAt(buf, blk.blockOffset); err != nil {
+			return 0, false, fmt.Errorf("sstable: read block: %w", err)
+		}
+		r.blockReadCount.Add(1)
+
+		offset := int64(0)
+		for offset < blk.blockSize {
+			rec, decN, derr := record.Decode(buf[offset:])
+			if derr != nil {
+				return 0, false, fmt.Errorf("sstable %s: decode in block at %d: %w",
+					r.path, blk.blockOffset+offset, derr)
+			}
+			offset += int64(decN)
+
+			if bytes.Compare(rec.Key, target) < 0 {
+				continue
+			}
+			recUserKey, recTS, ok := mvcckey.Decode(rec.Key)
+			if !ok {
+				return 0, false, fmt.Errorf("sstable %s: malformed encoded key", r.path)
+			}
+			if !bytes.Equal(recUserKey, userKey) {
+				return 0, false, nil
+			}
+			return recTS, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// VersionCountForTesting returns the number of stored versions of
+// userKey in this SSTable. Used to verify GC behaviour. Scans the
+// whole file; slow, fine for tests.
+func (r *Reader) VersionCountForTesting(userKey []byte) int {
+	if r.closed {
+		return 0
+	}
+	if r.filter != nil && !r.filter.MayContain(userKey) {
+		return 0
+	}
+	count := 0
+	_ = r.Iterate(func(op record.Op, encKey, value []byte) bool {
+		decodedUserKey, _, ok := mvcckey.Decode(encKey)
+		if !ok {
+			return true
+		}
+		if bytes.Equal(decodedUserKey, userKey) {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
 // Iterate yields each record in sorted order (encoded-key ascending).
 // Used by compaction; the encoded key contains both userKey and
 // timestamp.
