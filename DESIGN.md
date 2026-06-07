@@ -16,6 +16,45 @@ and the reasoning.
 
 ## Decision log
 
+### Phase 1 — Language: Why Go
+
+Considerations include: memory safety without GC stalls dominating writes, a usable concurrency model for reader/writer/compaction workflow, predictable file-and-fsync semantics, and a standard library covering the syscalls a database needs.
+
+The hot path is **synchronous disk I/O with strict ordering**: each write appends a record to the WAL buffer, fsyncs, mutates the in-memory memtable, and returns. A background goroutine flushes a full memtable to a new SSTable (fsync + atomic rename + directory fsync); another merges old SSTables; readers traverse the memtable skiplist and binary-search SSTable indexes. None of this is CPU-bound — all of it is latency-sensitive and concurrent.
+
+#### Three language properties follow directly:
+
+1. **Memory safety.** The engine parses untrusted-shape inputs (malformed recovered WAL records, corrupted SSTable footers), so out-of-bounds reads, type confusion, and use-after-free must be caught without manual byte tracking. A use-after-free in the page cache or an uninitialised-buffer read in the WAL parser is a data corruption bug that silently return wrong bytes and spreads.
+
+2. **First-class concurrency.** There are at least four independent mutexes with a documented acquisition order: a write lock serialising commits, a read lock for snapshot captures, the active-txn registry's mutex, and the memtable's RWMutex — plus a compaction goroutine coordinating with foreground writes over channels. A language whose concurrency is library APIs makes this verbose; one where it's syntax (goroutines, channels, `defer`) makes it expressible.
+
+3. **Direct syscall access.** Correctness rests on `fsync(2)` and `rename(2)`, plus fsync of the parent directory after a rename. The language must expose these without an abstraction hiding whether data is actually durable.
+
+#### Why Go fits:
+
+**GC'd but predictable.** Go's concurrent mark-sweep GC targets sub-millisecond pauses — typically under 500µs. Against the fsync budget (100–300µs to NVMe, 5–10ms to spinning disk) that's invisible noise, so memory safety comes without latency spikes on the write path.
+
+**Goroutines and channels match the architecture.** The compaction loop is one function: `for range db.compactCh { tryCompactOnce() }`. Signalling is a non-blocking send to a buffered channel that coalesces — `select { case db.compactCh <- struct{}{}: default: }`. The C (`pthread_cond_t` + flag) or C++ (`std::condition_variable`) equivalents are several times the code and surface area, and Java's `ExecutorService` doesn't compose with the `defer`-based cleanup the rest of the code uses.
+
+**`defer` for cleanup.** Several paths must release a resource on every exit — closing a WAL file, unregistering a transaction, removing a temp SSTable on abort. `defer` makes these concise and panic-safe, versus `goto cleanup` chains in C, RAII guards in C++, or verbose `try-finally` in Java.
+
+**Standard library covers it, zero dependencies.** `os.File` gives `Sync()` (fsync), `Write`/`WriteAt`, and `os.Rename`; `hash/crc32` with Castagnoli for CRC-32C; `encoding/binary` for fixed-endianness on-disk formats; `container/heap` for the compaction merge heap; `sort.Search` for the SSTable index. The whole `go.mod` has zero external imports — fewer surprises in GC, fsync, or scheduling behaviour, and less to reason about.
+
+**Race detector in the toolchain.** `go test -race` runs on the full suite every commit and catches ordering bugs. TSan and JVM equivalents exist but none is as low-friction as one flag.
+
+**Right-granularity primitives.** `sync/atomic` and `sync.RWMutex` cover both cases: `nextTimestamp` lives behind the write lock, while lock-free reads use `atomic.Int64` (e.g. `blockReadCount` in the SSTable reader). In C you'd choose between pthreads and platform atomics and write the wrappers yourself.
+
+#### Why not the alternatives
+
+**Rust** — the closest competitor: no GC, memory-safe, strong concurrency guarantees, similar reach. The cost is authoring velocity. The MVCC encoding shares byte slices across module boundaries (the memtable stores `userKey || ^ts`, the SSTable rewrites it, compaction decodes and re-encodes), and in Rust each signature forces a choice between `&'a [u8]` (borrows that propagate up call sites), `Vec<u8>` (owning copies that materialise every encoding step), or `Arc<[u8]>` (atomic-refcount overhead in hot paths). Go lets the slices flow as `[]byte` and reclaims them via GC, keeping LSM semantics in the foreground. Production LSMs ship in Rust (TiKV, sled) — it's a productivity trade, not a correctness one.
+
+**C++** — what RocksDB and LevelDB are built in. Against it here: build complexity (CMake, dependency management, header/impl duplication), opt-in memory safety (raw `new`/`delete` and pointer arithmetic are still legal), and concurrency as libraries rather than syntax. Expect increased line count plus explicit move-semantics, copy-constructor, and exception-safety decisions at every API boundary.
+
+**Java (and C#)** — Cassandra proves the JVM can host a serious LSM. But GC pauses are larger and harder to bound (G1's stop-the-world phases run tens of milliseconds, dominating single-write latency on fast storage; ZGC helps but doesn't match Go's profile out of the box, and the .NET CLR shares the same pause disadvantage), `FileChannel`/`RandomAccessFile` are clunkier than `os.File`, there's no `defer` (`try-with-resources` doesn't cover multi-resource cleanup-on-error), and the Gradle/Maven loop is slower than `go test ./...`.
+
+**Python/Ruby** — non-starters: the GIL makes reader, writer, and compaction goroutines contend for one interpreter slot, and per-operation overhead is higher.
+
+
 ### Phase 1 — Architecture: Bitcask-style
 
 The Phase 1 storage engine is Bitcask-style: one append-only log file,
