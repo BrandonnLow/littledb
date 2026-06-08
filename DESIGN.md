@@ -16,7 +16,9 @@ and the reasoning.
 
 ## Decision log
 
-### Phase 1 — Language: Why Go
+## Phase 1 — Append-only KV store, write-ahead log, crash recovery
+
+### Language: Why Go
 
 Considerations include: memory safety without GC stalls dominating writes, a usable concurrency model for reader/writer/compaction workflow, predictable file-and-fsync semantics, and a standard library covering the syscalls a database needs.
 
@@ -59,7 +61,7 @@ The hot path is **synchronous disk I/O with strict ordering**: each write append
 **Python/Ruby** — non-starters: the GIL makes reader, writer, and compaction goroutines contend for one interpreter slot, and per-operation overhead is higher.
 
 
-### Phase 1 — Architecture: Bitcask-style
+### Architecture: Bitcask-style
 
 The Phase 1 storage engine is Bitcask-style: one append-only log file,
 an in-memory `map[string]int64` mapping each key to the offset of its
@@ -81,7 +83,7 @@ becomes the durability layer in front of a memtable.
 (no compaction until Phase 2). Reads pay one disk seek where a fully
 RAM-resident KV would be all-memory.
 
-### Phase 1 — Record format and crash recovery contract
+### Record format and crash recovery contract
 
 Each record on disk: `CRC32(4) | Op(1) | KeyLen(4) | ValueLen(4) | Key | Value`.
 13-byte header, little-endian, CRC-32C (Castagnoli polynomial). The CRC
@@ -108,7 +110,7 @@ the CRC matched but the op byte is unknown. This is not a torn-write
 signal — it's either a bug in the encoder or real on-disk corruption,
 so recovery refuses to start rather than silently dropping data.
 
-### Phase 1 — fsync on every write (default)
+### fsync on every write (default)
 
 `Put` and `Delete` issue `fsync(2)` before returning. This is the
 durability contract: when the call returns nil, the record is on disk.
@@ -126,7 +128,7 @@ and async durability exist as concepts. We expose this via
 Default is true. The unsafe mode is for benchmarks only in Phase 1; in
 Phase 3 we'll revisit with group commit.
 
-### Phase 1 — Directory fsync on file creation
+### Directory fsync on file creation
 
 On Linux, fsyncing a newly-created file does not make the directory
 entry pointing to it durable. A crash right after `creat()` can leave
@@ -134,7 +136,7 @@ the file's contents on disk but no dirent, effectively losing the file.
 `wal.Open` calls `syncDir(dir)` exactly once, when it just created the
 log file, to close this window.
 
-### Phase 1 — Concurrency: single `sync.RWMutex` at the DB level
+### Concurrency: single `sync.RWMutex` at the DB level
 
 `Put` and `Delete` take the write lock. `Get` takes the read lock only
 long enough to look up the offset in the index, then releases it before
@@ -147,7 +149,7 @@ writer (`TestConcurrentReadersAndWriter`).
 This is the simplest correct model. Sharding the lock or using
 sync.Map would be a Phase 2+ optimization once we've measured contention.
 
-### Phase 1 — Delete is idempotent and skips writing for missing keys
+### Delete is idempotent and skips writing for missing keys
 
 Deleting a missing key returns nil and writes no tombstone. The
 alternative (always write a tombstone) wastes a record and an fsync on
@@ -158,7 +160,9 @@ distinguish "key didn't exist" from "key existed and was deleted" at
 the API level. We accept that trade-off — it's the same one every real
 KV store accepts.
 
-### Phase 2 — Architecture transition: Bitcask → LSM tree
+## Phase 2 — SSTables, compaction, bloom filters
+
+### Architecture transition: Bitcask → LSM tree
 
 The Phase 1 `map[string]int64` index is gone. Writes now go through the
 WAL (durability) and into an in-memory **memtable** (sorted, supports
@@ -177,7 +181,7 @@ compaction periodically merges SSTables to drop superseded keys.
 have the same shape. The internal redesign was invisible to callers,
 which is partly why Phase 1's clean package boundaries paid off.
 
-### Phase 2 — Record format reused at every layer
+### Record format reused at every layer
 
 The same `record` package from Phase 1 encodes records in the WAL, in
 SSTable data blocks, **and** in SSTable index entries. CRC checksumming
@@ -189,7 +193,7 @@ The one cost is conceptual: index entries store `key = blockFirstKey`,
 inside the generic record. This convention is private to the sstable
 package; no other code sees it.
 
-### Phase 2 — Memtable: skiplist with tombstone encoding
+### Memtable: skiplist with tombstone encoding
 
 The memtable is a skiplist (randomized levels, no rebalancing, simpler
 than a balanced tree) wrapped with an `RWMutex` and a size accountant.
@@ -206,7 +210,7 @@ older layers."
 reads keep working. This is what makes the active-vs-frozen handoff
 during flush atomic from the API's perspective.
 
-### Phase 2 — SSTable layout: data blocks + sparse index + bloom + footer
+### SSTable layout: data blocks + sparse index + bloom + footer
 
 ```
 DATA   (sorted records, grouped into ~4 KB blocks)
@@ -235,7 +239,7 @@ observe a partial SSTable. Unlike the WAL — where a torn tail is
 *expected* and silently truncated on recovery — corrupt or truncated
 SSTables surface errors loudly. By construction, they shouldn't exist.
 
-### Phase 2 — Bloom filters: FNV-1a + Kirsch-Mitzenmacher
+### Bloom filters: FNV-1a + Kirsch-Mitzenmacher
 
 10 bits per key, target ~1% false-positive rate. Hash with FNV-1a
 (deterministic, no seed, hardware-friendly), split the 64-bit output
@@ -252,7 +256,7 @@ the bloom whether the key could be present. On a miss-heavy workload
 this is roughly a 100× speedup; on a hit-heavy one it's effectively
 free.
 
-### Phase 2 — Memtable flush: synchronous, WAL truncate-by-delete
+### Memtable flush: synchronous, WAL truncate-by-delete
 
 When the memtable crosses `MemtableSizeMax` (default 4 MB), the writer
 that triggered the threshold does the flush before returning:
@@ -269,7 +273,7 @@ Phase 3 if it becomes urgent for transactions) will move the flush to
 a background goroutine and use proper WAL rotation with numbered
 files.
 
-### Phase 2 — Compaction: size-tiered, background, max-input-ID output
+### Compaction: size-tiered, background, max-input-ID output
 
 A background goroutine watches a `compactCh`. When the SSTable count
 reaches `CompactionTrigger` (default 4), it picks the oldest N
@@ -288,7 +292,7 @@ unlinked, but the FDs stay alive while any in-flight Get holds them.
 GC finalizers on `*os.File` close them once no references remain.
 Production systems would refcount; this is a Phase 2 simplification.
 
-### Phase 2 — Compaction ID/recency bug and its fix
+### Compaction ID/recency bug and its fix
 
 **Originally:** the merged output got a fresh ID via `db.nextID++`,
 which is always higher than any input. In memory, the merged file
@@ -319,7 +323,7 @@ guard. Caught by external review, not by my own testing — a reminder
 that property tests on a single live process can miss bugs that only
 manifest across a restart.
 
-### Phase 2 — DisableBackgroundCompaction (test-only option)
+### DisableBackgroundCompaction (test-only option)
 
 The compaction tests need to reproduce specific SSTable layouts
 deterministically. The background goroutine racing manual
@@ -327,42 +331,307 @@ deterministically. The background goroutine racing manual
 DisableBackgroundCompaction = true` skips the goroutine; production
 code should never set it.
 
-## Package layout
+## Phase 3 — MVCC, transactions, snapshot isolation
+
+Phase 3 transformed the engine from single-value-per-key to multi-version
+concurrency control. Reads slice the database at a logical timestamp; writes
+append new versions rather than overwriting; transactions buffer locally and
+commit atomically with first-committer-wins conflict detection.
+
+### Record format change
+
+Header grew from 13 to 21 bytes to hold a `Timestamp uint64`:
 
 ```
-cmd/littledb/          CLI entry: flags, signals, plumbing only
-internal/record/       Pure logic: encode/decode + CRC, no I/O
-internal/wal/          Append-only log file: writer, scanner, recovery
-internal/skiplist/     Sorted in-memory map (probabilistic balancing)
-internal/memtable/     Tombstone-aware write buffer; RWMutex + freeze
-internal/bloom/        FNV-1a + Kirsch-Mitzenmacher bloom filter
-internal/sstable/      Immutable sorted file: data blocks + index + bloom
-internal/db/           LSM orchestration: memtable + SSTables + WAL + compaction
-internal/repl/         Command parser and dispatcher
+CRC32(4) | Op(1) | Timestamp(8) | KeyLen(4) | ValueLen(4) | Key | Value
 ```
 
-Each `internal/` package can be tested in isolation. Dependencies flow
-upward: `record` is the foundation; `wal`, `skiplist`, and `bloom`
-depend only on it (or nothing); `memtable` wraps `skiplist`; `sstable`
-combines `record` and `bloom`; `db` orchestrates everything; `repl`
-depends on `db` via an interface so tests substitute a fake store.
+Field-offset constants exposed in `record` package (`OffsetCRC`, `OffsetOp`,
+`OffsetTimestamp`, `OffsetKeyLen`, `OffsetValueLen`) so the WAL doesn't peek
+at byte ranges directly; a `HeaderLengths(hdr)` helper returns key/value
+lengths. CRC covers everything after itself — a flipped bit anywhere in
+op/timestamp/lengths/payload surfaces as `ErrCorrupt`.
 
-## Open questions for Phase 3
+A third op was added: `OpCommit = 3` (atomicity marker for multi-write txns;
+no key/value, just a timestamp).
 
-- **Timestamp source.** Logical counter (simple, deterministic) vs.
-  wall clock (interoperable but exposes us to clock skew). Probably
-  logical.
-- **MVCC encoding.** Append timestamp to the key (`key|ts`), or carry
-  it as a separate field in the record format? Key suffix is simpler
-  for the existing sorted SSTable code; a separate field is cleaner
-  semantically.
-- **Snapshot isolation vs. serializable.** Snapshot isolation is the
-  classic LSM choice (LevelDB, RocksDB) and is what we'll implement.
-  Write-skew is the known anomaly we accept.
-- **Garbage collection of old versions.** When can compaction drop a
-  version? Only when no active transaction has a read timestamp older
-  than the next-newer version of the same key. Requires tracking
-  oldest active read timestamp.
-- **Group commit.** Phase 1 measured ~1100× fsync overhead. With
-  transactions, batching multiple commits into one fsync is the
-  obvious win. Probably introduce this alongside the transaction API.
+Format is **not backward-compatible** with Phase 2's 13-byte header. Clean
+cut accepted; a production system would version the on-disk format.
+
+### MVCC key encoding (`internal/mvcckey`)
+
+User keys are paired with descending-timestamp suffixes:
+
+```
+Encode(userKey, ts) = userKey || bigEndian(^ts)
+```
+
+Sort order: userKey ascending, then timestamp **descending** within userKey.
+The bitwise NOT and big-endian together give descending byte-wise sort for
+descending numeric timestamps.
+
+What this buys: all versions of any userKey K cluster together with the
+newest first. A read "as of snapshot T" seeks `Encode(K, T)`; SeekGE lands
+on the first encoded key ≥ that target — which by descending-ts order is
+the newest version with `ts ≤ T`.
+
+### Snapshot semantics
+
+**A snapshot S sees the newest version of each userKey with `ts ≤ S`.**
+
+- `nextTimestamp` is the next-to-assign value; one greater than the last assigned.
+- "Right now" as a snapshot = `nextTimestamp - 1` (the last-committed value).
+- A brand-new DB has `nextTimestamp = 1`, so snapshot `0` represents "before
+  any writes." `GetAsOf(k, 0)` always returns not-found.
+- Defensive guard at the use site: if `nextTimestamp == 0`, `readSnap` stays 0.
+  Protects against any future bug that might wrap the counter to 0.
+
+### Memtable (rewritten)
+
+Skiplist now stores **encoded keys**, not raw user keys. API:
+
+```go
+Put(userKey, value, ts) error
+Delete(userKey, ts) error
+GetAsOf(userKey, snapshot) → (value, op, found)
+NewestVersionTS(userKey) → (ts, found)   // for conflict detection
+Iterate(fn(userKey, value, op, ts))      // for flush
+```
+
+Multiple versions of one userKey coexist as separate skiplist nodes.
+`GetAsOf` is one `SeekGE(Encode(userKey, snapshot))` plus a userKey-match
+check on the landed node. `NewestVersionTS` seeks to
+`Encode(userKey, ^uint64(0))` — the smallest possible encoded key for that
+userKey — which lands on its newest version.
+
+The skiplist itself gained `SeekGE(target) *Node` and `Node.Next()`.
+
+### SSTable (rewritten)
+
+`Writer.Add(op, userKey, value, ts)`; internally encodes for the data block;
+tracks `maxTimestamp` seen. Reader gains `GetAsOf` and `NewestVersionTS`
+mirroring the memtable shape.
+
+**Critical invariant: the bloom filter hashes `userKey`, not the encoded
+key.** Otherwise a lookup at any timestamp other than an exact previous
+write would falsely report "absent" because every version would have its
+own bloom entry. `TestBloomMatchesAnyTimestamp` is the regression guard.
+
+**Block search uses a two-block scan.** Binary search finds the largest
+block whose `firstKey ≤ target`. The answer is either in that block, or —
+if target sorts past every key in it — at the start of the next block. The
+Reader scans up to two consecutive blocks per lookup.
+
+**Footer grew 40 → 48 bytes.** New `MaxTimestamp uint64` slot between
+bloom-size and magic. Used by the DB to derive its initial counter value
+on Open.
+
+### DB timestamp counter
+
+`nextTimestamp uint64` on the DB struct, protected by `db.mu`. Bumped on
+every Put/Delete inside the write lock, **before** the WAL append.
+
+Why this ordering matters: any reader that captures counter value `T` under
+the read lock has, by virtue of the same lock acquisition, also seen every
+write with `ts < T` applied to the memtable. The counter and storage state
+are in lockstep from a reader's perspective.
+
+On `Open`, the counter is restored from
+`max(WAL max-ts, SSTable footer MaxTimestamp) + 1`. Monotonic across restarts.
+
+### Transactions (`internal/db/txn.go`)
+
+```go
+type Txn struct { /* ... */ }
+db.Begin() *Txn
+tx.Get(key) ([]byte, error)
+tx.Put(key, value) error
+tx.Delete(key) error
+tx.Commit() error    // may return ErrConflict
+tx.Rollback() error
+```
+
+**Concurrency contract**: one goroutine per Txn (undefined behavior
+otherwise). Different goroutines holding different Txns are safe.
+
+- **Begin** captures `readSnap = nextTimestamp - 1` under the read lock,
+  allocates a local write buffer, registers in the active-txn set. No WAL
+  or memtable activity.
+- **Get** checks the local buffer first (read-your-own-writes), then falls
+  through to `db.GetAsOf(key, readSnap)`.
+- **Put/Delete** stash into the local map with a defensive byte-copy of
+  the user's value.
+- **Commit** runs the conflict check, allocates one `commitTS`, writes all
+  data records + one `OpCommit` marker to the WAL, applies to the memtable.
+- **Rollback** clears the buffer, marks finished, unregisters.
+
+Single-statement `db.Put` / `db.Delete` route through `Begin → Put/Delete →
+Commit`. Same atomicity guarantee, two fsyncs per write (data + commit
+marker) instead of one. Acceptable trade for the unified code path;
+optimizable later with batched fsync.
+
+### Atomicity via OpCommit
+
+The atomicity problem: a multi-write transaction can't be atomic via a
+single record, and a sequence of fsynced records leaves a crash window
+where some records are durable and others aren't.
+
+Solution: a sentinel `OpCommit` record at the same timestamp as the txn's
+data records. The WAL recovery loop buffers data records by timestamp; an
+`OpCommit` drains the buffer to the memtable; if the scan reaches EOF with
+un-drained buffered records, they're an uncommitted partial txn —
+discarded.
+
+Three crash windows, all recoverable:
+
+1. **Crash mid-data-records**: a torn record stops `WAL.Scan`, no `OpCommit`
+   ever seen for that ts, buffer discarded.
+2. **Crash between last data record and commit marker**: scan reaches EOF
+   cleanly with un-drained records, discard.
+3. **Crash after commit marker**: full sequence on disk, replay normally.
+
+The recovery loop enforces that all records inside one txn share one
+timestamp; a mismatch is treated as corruption.
+
+### Memtable failure at commit time
+
+After the `OpCommit` is durable, the txn is committed *from disk's
+perspective*. If `memtable.Put` or `memtable.Delete` fails in the apply
+loop, in-memory state and durable state diverge — the next reader sees an
+inconsistent view.
+
+The only documented memtable failure is `ErrFrozen`, which is structurally
+impossible while we hold `db.mu` (freezing happens inside `flushLocked`,
+same lock). If it ever does fire, we **panic**: a process restart re-reads
+the durable log and reconstructs the correct state. Continuing in-memory
+would be strictly worse.
+
+### Active-txn registry and watermark
+
+`activeTxns map[*Txn]struct{}` on the DB, protected by its own `sync.Mutex`
+named `activeTxnsMu`. `Begin` inserts; `Commit` (via deferred call) and
+`Rollback` remove.
+
+**Lock ordering invariant**: `activeTxnsMu` is a leaf mutex. No code path
+holds it while waiting for `db.mu`. The watermark computation respects
+this by sampling in two phases:
+
+1. `db.mu.RLock` → sample `nextTimestamp` → release.
+2. `activeTxnsMu.Lock` → iterate the registry → release.
+
+Combined into `min(oldestActiveReadSnap, nextTimestamp - 1)`.
+
+The two-phase sampling is benign:
+
+- A txn that **finished** between the phases is gone from our iteration,
+  but its reads have already returned to the caller before `unregisterTxn`
+  ran — they can't be invalidated by any subsequent GC, so excluding its
+  `readSnap` is safe.
+- A txn that **began** between the phases has `readSnap ≥ nextTimestamp`
+  we sampled in phase 1, so it can't pull our watermark below a still-safe
+  value.
+
+### First-committer-wins conflict detection
+
+`ErrConflict` is returned by `Commit` when a concurrent committer wrote
+one of our keys between our Begin and our Commit.
+
+The check, for each key in the write set: "has anyone committed a write
+to K with `commitTS > our readSnap`?" Implementation walks active memtable
+→ frozen memtable → SSTables, asking each `NewestVersionTS(userKey)`.
+Short-circuits on the first match.
+
+**Placement matters**: the check must be inside the write lock and
+**before** allocating `commitTS`. Outside this critical section, a
+competing committer could slip in between the check and the allocation.
+Inside, allocation immediately follows the check; the WAL writes follow
+that; all atomic relative to other committers.
+
+A conflicted txn writes no records to the WAL — recovery never sees
+abandoned writes.
+
+### Version GC during compaction
+
+The watermark drives version garbage collection. A version `V@T` for
+userKey K is observable only by snapshots in `[T, T_next)`, where `T_next`
+is the timestamp of K's next-newer version (or +∞ for K's latest). For V
+to be reachable by some active or future snapshot, `T_next` must exceed
+the watermark.
+
+Per userKey, walking newest-first (encoded-key-ascending):
+
+- **Newest version**: always emitted, *unless* it's a tombstone with
+  `ts ≤ watermark` AND we're at the bottom of the LSM. In that case the
+  entire userKey vanishes (no observable snapshot would distinguish
+  "deleted" from "never existed").
+- **Older version**: emitted only if `prevTS > watermark` AND bottom of
+  LSM. Otherwise dropped.
+
+The cascade for the dropped-head-tombstone case is automatic: setting
+`prevTS = ts ≤ watermark` makes the older-version branch drop every
+remaining version in the same userKey group.
+
+### The bottomOfLSM invariant
+
+Both GC paths are conditional on `bottomOfLSM`. Dropping a record
+mid-layer could expose stale data: a tombstone might be masking even-older
+versions in lower SSTables; an older version might be shadowing
+even-older-still versions.
+
+**Derived from data, not structure**, at the call site:
+
+```go
+bottomOfLSM := slices.Min(inputIDs) == slices.Min(db.sstableIDs)
+```
+
+"Our inputs include the oldest SSTable in the LSM." Today's size-tiered
+strategy always merges the tail, so this evaluates to `true`; the explicit
+derivation keeps the answer correct for any future strategy that compacts
+a middle range.
+
+**Latent bug caught late in Phase 3**: the original code guarded only the
+head-tombstone-drop with `bottomOfLSM`, not the older-version-drop. The
+bug never manifested because the call site hardcoded `true`, but a
+mid-layer strategy would have silently dropped versions and exposed stale
+data. Now both paths are guarded, the flag is derived from inputs, and
+two direct tests against `compactSSTables` exercise the mid-layer path.
+
+### What is deliberately not in Phase 3
+
+- **Phantom prevention** — SI does not prevent phantoms. A txn reading
+  "all keys with prefix foo" can be undermined by a concurrent insert.
+- **Write skew prevention** — SI permits write skew. Would require
+  Serializable Snapshot Isolation (SSI) with read-tracking.
+- **Batched WAL fsync** — each WAL append fsyncs individually. A 3-write
+  txn = 4 fsyncs (3 data + 1 commit marker).
+- **Range scans / iterators** — point lookups only. Range scans + MVCC
+  snapshot filtering are Phase 4 work.
+- **Active-txn registry growth bound** — abandoned txns (Begin without
+  Commit/Rollback) leak slots and depress the watermark indefinitely.
+  Documented contract; not enforced.
+
+### Package layout (as of end of Phase 3)
+
+```
+internal/
+  bloom/      Bloom filter (unchanged from Phase 2)
+  mvcckey/    Encode/Decode for userKey+timestamp (new in Phase 3)
+  skiplist/   Skiplist with SeekGE and Node.Next (extended)
+  memtable/   MVCC-aware memtable (rewritten)
+  sstable/    MVCC-aware SSTable with MaxTimestamp footer (rewritten)
+  record/     Record format with Timestamp + OpCommit (extended)
+  wal/        WAL using record.HeaderLengths (minor)
+  db/         DB engine, Txn, conflict detection, compaction+GC (extended)
+  repl/       Interactive REPL (unchanged)
+```
+
+### Open questions for Phase 4 onward
+
+- Range scans and iterators across memtable + SSTables with MVCC
+  snapshot filtering.
+- Group-commit batched fsync to amortize cost across concurrent writers.
+- Bounding active-txn registry growth (timeout abandoned txns, or
+  expose a stat for monitoring).
+- Stress benchmark against BoltDB and BadgerDB for an honest comparison.
+- `internal/mvcc/` directory of unknown provenance — investigate with
+  `git log internal/mvcc/`, decide to keep, fold in, or delete.
