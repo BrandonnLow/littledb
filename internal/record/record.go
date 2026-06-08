@@ -34,7 +34,7 @@ const (
 )
 
 // HeaderSize is the fixed size of a record's header in bytes:
-// CRC32(4) + Op(1) + KeyLen(4) + ValueLen(4).
+// CRC32(4) + Op(1) + Timestamp(8) + KeyLen(4) + ValueLen(4).
 const HeaderSize = 21
 
 // Header field offsets within the encoded bytes. Useful for code that

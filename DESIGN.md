@@ -633,5 +633,3 @@ internal/
 - Bounding active-txn registry growth (timeout abandoned txns, or
   expose a stat for monitoring).
 - Stress benchmark against BoltDB and BadgerDB for an honest comparison.
-- `internal/mvcc/` directory of unknown provenance — investigate with
-  `git log internal/mvcc/`, decide to keep, fold in, or delete.
