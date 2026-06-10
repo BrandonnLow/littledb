@@ -97,8 +97,6 @@ func TestGCMidLayerKeepsTombstone(t *testing.T) {
 	r.Close()
 }
 
-// TestGCMidLayerKeepsOlderVersion guards the exact latent bug from Phase 3:
-// the older-version-drop branch originally lacked the bottomOfLSM guard.
 // Here the newest version's ts ≤ watermark, so at the bottom the older
 // version is unreachable and correctly GC'd — but mid-layer it must be kept,
 // because lower SSTables may rely on it for reads in its visibility window.
@@ -108,7 +106,7 @@ func TestGCMidLayerKeepsOlderVersion(t *testing.T) {
 		{record.OpPut, "k", "old", 5},  // older
 	}
 
-	// Mid-layer: both versions kept. (Buggy pre-fix code dropped "old" here.)
+	// Mid-layer: both versions kept.
 	r := runCompaction(t, versions, 100, false)
 	if got := r.VersionCountForTesting([]byte("k")); got != 2 {
 		t.Errorf("bottomOfLSM=false: kept %d versions of k, want 2 (older version preserved)", got)
