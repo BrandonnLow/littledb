@@ -331,7 +331,7 @@ deterministically. The background goroutine racing manual
 DisableBackgroundCompaction = true` skips the goroutine; production
 code should never set it.
 
-## Phase 3 — MVCC, transactions, snapshot isolation
+## Phase 3A — MVCC, transactions, snapshot isolation
 
 Phase 3 transformed the engine from single-value-per-key to multi-version
 concurrency control. Reads slice the database at a logical timestamp; writes
@@ -624,6 +624,80 @@ internal/
   db/         DB engine, Txn, conflict detection, compaction+GC (extended)
   repl/       Interactive REPL (unchanged)
 ```
+
+## Phase 3B — Range scans / iterators
+
+Point lookups (`Get`/`GetAsOf`) became ordered range scans. Motivated two
+ways: Phase 4's snapshot install streams a key range to replicas, and range
+iteration was a genuine gap in the user-facing API.
+
+### API
+
+```go
+db.Scan(start, end []byte, snapshot uint64) (*Iterator, error)
+db.ScanNow(start, end []byte) (*Iterator, error)   // snapshot = nextTimestamp-1
+it.Next() bool        // advance; false at end-of-range or on error
+it.Key() / it.Value() // current live pair; valid until the next Next()
+it.Err() / it.Close()
+```
+
+Pull-based (not callback) so Phase 4 can pull a batch, ship it, pull more.
+Forward-only; bounds are half-open `[start, end)` on user keys; nil start =
+from the first key, nil end = through the last. `Txn.Scan` and reverse
+iteration are deliberately deferred.
+
+### Architecture: per-layer cursors → merge → per-userKey collapse
+
+Each layer exposes a cursor yielding records in encoded-key order (userKey
+ascending, timestamp descending). A k-way min-heap merges them by encoded
+key, breaking ties by layer recency and dropping any record whose encoded
+key duplicates the one just emitted (newer layer wins — same rule as
+compaction, kept as cheap insurance against future cross-layer overlap).
+
+On top of the merged stream, a per-userKey collapse walks each userKey's
+versions newest-first, takes the first with `ts ≤ snapshot` as the visible
+version, emits it if a put, and skips the whole userKey if it's a tombstone
+or has no visible version. This is `compactSSTables`'s structure minus GC,
+plus a snapshot filter.
+
+The memtable layers are materialized: `Memtable.RangeSnapshot` copies the
+requested key range into a slice under a brief `RLock`, so a long scan never
+holds the memtable lock and never races the skiplist (which is not
+safe for concurrent read-during-write). The memtable is size-bounded, so the
+copy is bounded. SSTable layers stay lazy: `sstable.Reader.NewIterator`
+binary-searches to the start block and reads blocks on demand, stopping at
+the end bound.
+
+### Snapshot consistency
+
+`Scan` captures the active memtable, frozen memtable, and SSTable set under
+`db.mu.RLock`, then iterates lock-free. The snapshot bounds visibility within
+those layers — a write committed after `Scan` returns lands at a higher
+timestamp and is filtered out — so the iterator sees a stable, point-in-time
+view. A flush or compaction between capture and iteration is harmless: the
+memtable snapshot is already copied, and swapped-out readers stay live
+through the iterator's reference.
+
+### Reader lifetime
+
+`Iterator.Close()` releases the per-layer cursor buffers but does NOT close
+the underlying SSTable readers — they are shared with the live DB and with
+other scans. A reader that compaction swaps out of `db.sstables` mid-scan
+stays readable through the iterator's reference (Linux keeps the inode behind
+the open FD; nothing explicitly closes a swapped-out reader). The accepted
+cost: a long scan during heavy compaction pins old SSTable FDs open until GC
+finalizers reap them — the same finalizer simplification noted in Phase 2,
+stretched to scan timescales. Proper refcounting is deferred to Phase 4,
+where snapshot install provides a concrete consumer to design it against.
+
+### Deferred
+
+- `Txn.Scan` (read-your-own-writes range scans — merges the txn's local
+  buffer as a shadowing layer).
+- Reverse iteration (descending-ts encoding makes reverse version-collapse
+  fiddly; Phase 4 doesn't need it).
+- SSTable reader refcounting.
+
 
 ### Open questions for Phase 4 onward
 
