@@ -176,9 +176,11 @@ func (t *Txn) Commit() error {
 	}
 	sort.Strings(keys)
 
-	// Append all data records. If any append fails, mark finished and
-	// return — the partial records on disk will be discarded on
-	// recovery because no OpCommit will be written for this timestamp.
+	// When a replicator is attached (leader role), accumulate the txn's
+	// encoded records into entry as we append them, to ship to followers.
+	repl := t.db.replicator
+	var entry []byte
+
 	for _, k := range keys {
 		w := t.writes[k]
 		rec := &record.Record{
@@ -191,6 +193,9 @@ func (t *Txn) Commit() error {
 			t.finished = true
 			return fmt.Errorf("db: commit wal data: %w", err)
 		}
+		if repl != nil {
+			entry = append(entry, record.Encode(rec)...)
+		}
 	}
 
 	// Append the commit marker. Once this record is durable, the txn
@@ -200,6 +205,17 @@ func (t *Txn) Commit() error {
 	if _, err := t.db.wal.Append(commitRec); err != nil {
 		t.finished = true
 		return fmt.Errorf("db: commit wal marker: %w", err)
+	}
+
+	// Replicate after WAL durability and before the writes become visible.
+	// Called under db.mu, so commits replicate one at a time; a quorum must
+	// acknowledge before we proceed to the memtable apply.
+	if repl != nil {
+		entry = append(entry, record.Encode(commitRec)...)
+		if err := repl.Replicate(entry, commitTS); err != nil {
+			t.finished = true
+			return fmt.Errorf("db: replicate: %w", err)
+		}
 	}
 
 	// Apply to memtable. After this point the writes are visible to

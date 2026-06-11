@@ -40,6 +40,16 @@ var (
 	sstableNameRE = regexp.MustCompile(`^(\d{6})\.sst$`)
 )
 
+// Replicator is an optional hook invoked during Txn.Commit, after the txn's
+// records are durable in the WAl and before they are applied to the memtable.
+// On a replication leader it ships the entry (the txn's encoded records —
+// data records plus the OpCommit marker, all at one commitTS) to followers
+// and blocks until a quorum has it; returning an error aborts the commit.
+// A standalone DB leaves this nil and the commit path is unchanged.
+type Replicator interface {
+	Replicate(entry []byte, commitTS uint64) error
+}
+
 type Options struct {
 	SyncOnWrite                 bool
 	MemtableSizeMax             int64
@@ -76,6 +86,10 @@ type DB struct {
 	nextTimestamp uint64
 
 	closed bool
+
+	// replicator, if non-nil, is invoked on each commit between WAL
+	// durability and memtable apply (leader role). Set via SetReplicator.
+	replicator Replicator
 
 	// activeTxnMu protects activeTxns. It's a leaf mutex — never
 	// acquired while holding db.mu — so the watermark computation has
@@ -428,6 +442,103 @@ func (db *DB) NextTimestampForTesting() uint64 {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.nextTimestamp
+}
+
+// SetReplicator attaches r as the commit replication hook. Intended to be
+// called once during setup, before any commits. Passing nil detaches it.
+func (db *DB) SetReplicator(r Replicator) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.replicator = r
+}
+
+// LastAppliedTS returns the timestamp of the most recently applied commit
+// (nextTimestamp - 1). On a leader this is the last allocated commit; on a
+// follower it is the last commit received from the leader. Used to detect
+// when followers have caught up.
+func (db *DB) LastAppliedTS() uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.nextTimestamp == 0 {
+		return 0
+	}
+	return db.nextTimestamp - 1
+}
+
+// ApplyReplicated applies a replicated commit entry — the leader's exact
+// encoded bytes for one txn (data records followed by an OpCommit marker, all
+// sharing one commitTS) — to this (follower) DB. It appends the records to
+// the local WAL and applies them to the memtable at their embedded
+// timestamps, advancing nextTimestamp to track the leader. No conflict check
+// and no timestamp allocation: the leader already resolved the commit.
+//
+// The entry is validated before anything is written: a malformed entry (no
+// trailing OpCommit, or records whose timestamps disagree with the marker)
+// is rejected without touching the WAL.
+func (db *DB) ApplyReplicated(entry []byte) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return errClosed
+	}
+
+	var recs []*record.Record
+	offset := 0
+	for offset < len(entry) {
+		rec, n, err := record.Decode(entry[offset:])
+		if err != nil {
+			return fmt.Errorf("db: apply replicated: decode at %d: %w", offset, err)
+		}
+		recs = append(recs, rec)
+		offset += n
+	}
+	if len(recs) == 0 {
+		return errors.New("db: apply replicated: empty entry")
+	}
+	commitRec := recs[len(recs)-1]
+	if commitRec.Op != record.OpCommit {
+		return errors.New("db: apply replicated: entry not terminated by OpCommit")
+	}
+	commitTS := commitRec.Timestamp
+	for _, rec := range recs[:len(recs)-1] {
+		if rec.Op != record.OpPut && rec.Op != record.OpDelete {
+			return fmt.Errorf("db: apply replicated: unexpected op %d before marker", rec.Op)
+		}
+		if rec.Timestamp != commitTS {
+			return fmt.Errorf("db: apply replicated: ts mismatch (data %d vs marker %d)",
+				rec.Timestamp, commitTS)
+		}
+	}
+
+	for _, rec := range recs {
+		if _, err := db.wal.Append(rec); err != nil {
+			return fmt.Errorf("db: apply replicated: wal append: %w", err)
+		}
+	}
+	for _, rec := range recs[:len(recs)-1] {
+		switch rec.Op {
+		case record.OpPut:
+			if err := db.memtable.Put(rec.Key, rec.Value, rec.Timestamp); err != nil {
+				panic(fmt.Sprintf("db: memtable.Put on replicated apply (ts=%d): %v", rec.Timestamp, err))
+			}
+		case record.OpDelete:
+			if err := db.memtable.Delete(rec.Key, rec.Timestamp); err != nil {
+				panic(fmt.Sprintf("db: memtable.Delete on replicated apply (ts=%d): %v", rec.Timestamp, err))
+			}
+		}
+	}
+
+	if commitTS >= db.nextTimestamp {
+		db.nextTimestamp = commitTS + 1
+	}
+
+	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
+		if err := db.flushLocked(); err != nil {
+			return fmt.Errorf("db: apply replicated: flush: %w", err)
+		}
+		db.signalCompact()
+	}
+	return nil
 }
 
 // registerTxn adds t to the active set. Called from Begin.
