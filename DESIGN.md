@@ -690,20 +690,56 @@ finalizers reap them — the same finalizer simplification noted in Phase 2,
 stretched to scan timescales. Proper refcounting is deferred to Phase 4,
 where snapshot install provides a concrete consumer to design it against.
 
-### Deferred
+## Phase 4 — Replication and simulated Raft
 
-- `Txn.Scan` (read-your-own-writes range scans — merges the txn's local
-  buffer as a shadowing layer).
-- Reverse iteration (descending-ts encoding makes reverse version-collapse
-  fiddly; Phase 4 doesn't need it).
-- SSTable reader refcounting.
+### In-process multi-node, fixed leader, quorum commit
 
+A single-node DB replicated across N nodes: one fixed leader streams every
+committed txn to followers and returns to the client once a quorum has it.
+No election, no failover yet. "RPC" is a channel send; the Raft
+invariants are transport-independent, so the in-process transport is a real
+implementation, not a mock.
 
-### Open questions for Phase 4 onward
+#### The commit seam
 
-- Range scans and iterators across memtable + SSTables with MVCC
-  snapshot filtering.
-- Group-commit batched fsync to amortize cost across concurrent writers.
-- Bounding active-txn registry growth (timeout abandoned txns, or
-  expose a stat for monitoring).
-- Stress benchmark against BoltDB and BadgerDB for an honest comparison.
+The single-node commit pipeline had no place to interpose replication —
+Txn.Commit did conflict-check, commitTS allocation, WAL append, and memtable
+apply as one closed sequence under db.mu. Raft needs replication to happen
+*between* WAL durability and memtable visibility: an entry must be on a
+majority before the leader makes it readable. We cut that seam with an
+optional `Replicator` hook, invoked in Commit after the WAL appends and before
+the memtable apply, receiving the txn's encoded records (data + OpCommit) and
+the commitTS. A standalone DB leaves the hook nil; the commit path is byte-for
+-byte unchanged. The hook runs while db.mu is held, so commits replicate one
+at a time — not maximally concurrent, but unambiguously correct.
+
+#### Leader and follower
+
+The leader allocates commitTS and does conflict detection as before — both
+remain leader-only. Its Replicator ships the entry to all followers and
+returns once a majority (itself plus floor(N/2) follower acks) has applied it.
+Followers apply via `ApplyReplicated`, which validates the entry, appends the
+leader's exact bytes to the local WAL, applies them to the memtable at the
+leader's timestamps, and advances nextTimestamp to track — no conflict check,
+no timestamp allocation. Because followers append the leader's exact bytes,
+their WALs are byte-for-byte identical to the leader's (until a flush truncates
+them independently).
+
+#### Ordering and acks
+
+Commits serialize under the leader's db.mu, so at most one replication is in
+flight; the leader matches acks by commitTS and discards late acks from a
+prior commit. The channel transport gives per-node FIFO delivery, so followers
+apply entries in commit order. The leader counts its own copy toward the
+majority and needs floor(N/2) follower acks; a follower applies before it
+acks, so on the client's return the leader plus a majority hold the write.
+
+#### Deferred to later weeks
+
+Timestamp allocation and conflict detection stay leader-only. Reads route to
+the leader (linearizable); follower-local bounded-staleness reads come later.
+Crucially, we keep the existing apply-all WAL recovery, which is correct
+only under the no-crash assumption: under Raft the WAL is the *log*, and only
+entries up to a commitIndex are committed. Next commitIndex/lastApplied
+work will split "in the WAL" from "applied to the state machine," at which
+point followers must persist a commitIndex and replay only up to it.
