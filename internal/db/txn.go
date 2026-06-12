@@ -38,22 +38,15 @@ type txnWrite struct {
 func (db *DB) Begin() *Txn {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	// readSnap is the most recent assigned timestamp. nextTimestamp is
-	// next-to-assign; nextTimestamp - 1 is the latest committed value.
-	// On a brand-new DB nextTimestamp is 1, so readSnap is 0 and the
-	// first txn sees nothing — correct, since nothing has been
-	// committed yet.
-	//
-	// Defensive guard: a future bug that lets nextTimestamp reach 0
-	// (or wrap past max-uint64) would otherwise produce readSnap =
-	// ^uint64(0) and a txn that silently sees every committed write.
-	readSnap := db.nextTimestamp
-	if readSnap > 0 {
-		readSnap--
-	}
+	// Read snapshot is the applied watermark: under deferred apply
+	// (replication leader) nextTimestamp may already count an in-flight
+	// commit whose data is not yet in the memtable. Snapshotting at
+	// appliedTS guarantees everything with ts <= readSnap is visible, so a
+	// read-modify-write txn that misses such a commit will see it as newer at
+	// commit time and conflict, rather than silently overwriting it.
 	t := &Txn{
 		db:       db,
-		readSnap: readSnap,
+		readSnap: db.appliedTS,
 		writes:   make(map[string]txnWrite),
 	}
 	db.registerTxn(t)
@@ -196,6 +189,7 @@ func (t *Txn) Commit() error {
 	}
 
 	t.finished = true
+	t.db.appliedTS = commitTS
 
 	if t.db.memtable.ApproximateSize() >= t.db.opts.MemtableSizeMax {
 		if err := t.db.flushLocked(); err != nil {
@@ -232,7 +226,7 @@ func (db *DB) PrepareCommit(t *Txn) (entry []byte, commitTS uint64, err error) {
 	}
 
 	for k := range t.writes {
-		has, cerr := t.db.hasCommitNewerThanLocked([]byte(k), t.readSnap)
+		has, cerr := db.hasCommitNewerThanLocked([]byte(k), t.readSnap)
 		if cerr != nil {
 			t.finished = true
 			return nil, 0, fmt.Errorf("db: conflict check: %w", cerr)
