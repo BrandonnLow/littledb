@@ -32,7 +32,7 @@ type Node struct {
 	// Raft state, guarded by raftMu. raftMu and the store's db.mu are never
 	// held simultaneously: applies happen outside raftMu.
 	raftMu      sync.Mutex
-	log         [][]byte // log[i] is the entry at index i+1
+	log         *RaftLog // 1-based Raft log (entry bytes + term)
 	commitIndex uint64
 	lastApplied uint64
 	appliedCond *sync.Cond // broadcast when lastApplied advances
@@ -54,7 +54,7 @@ func (n *Node) DB() *db.DB { return n.store }
 func (n *Node) lastIndex() uint64 {
 	n.raftMu.Lock()
 	defer n.raftMu.Unlock()
-	return uint64(len(n.log))
+	return n.log.lastIndex()
 }
 
 func (n *Node) appliedIndex() uint64 {
@@ -126,9 +126,8 @@ func (n *Node) handleReplicate(m Message) {
 	}
 	n.raftMu.Lock()
 	// FIFO transport + fixed leader means entries arrive in order
-	// with no gaps, so the appended index is len(log)+1 == m.Index.
-	n.log = append(n.log, append([]byte(nil), m.Entry...))
-	idx := uint64(len(n.log))
+	// with no gaps, so the appended index is lastIndex()+1 == m.Index.
+	idx := n.log.append(currentTerm, m.Entry)
 	n.raftMu.Unlock()
 	_ = n.transport.Send(m.From, Message{Type: MsgAck, From: n.id, Index: idx, OK: true})
 }
@@ -138,7 +137,7 @@ func (n *Node) handleReplicate(m Message) {
 func (n *Node) handleCommit(m Message) {
 	n.raftMu.Lock()
 	ci := m.CommitIndex
-	if last := uint64(len(n.log)); ci > last {
+	if last := n.log.lastIndex(); ci > last {
 		ci = last
 	}
 	if ci > n.commitIndex {
@@ -169,7 +168,7 @@ func (n *Node) applyCommitted() {
 			return
 		}
 		idx := n.lastApplied + 1
-		entry := n.log[idx-1]
+		entry := n.log.entryAt(idx)
 		n.raftMu.Unlock()
 
 		// Apply outside raftMu (ApplyEntry takes db.mu).
@@ -205,8 +204,7 @@ func (n *Node) commit(t *db.Txn) error {
 		return fmt.Errorf("cluster: leader append to log: %w", err)
 	}
 	n.raftMu.Lock()
-	n.log = append(n.log, append([]byte(nil), entry...))
-	idx := uint64(len(n.log))
+	idx := n.log.append(currentTerm, entry)
 	n.raftMu.Unlock()
 
 	// Replicate and wait for a quorum to append. Majority of N is
@@ -301,6 +299,7 @@ func NewWithTransport(n int, dirs []string, opts db.Options, tr Transport) (*Clu
 			inbox:     tr.Inbox(NodeID(i)),
 			ackCh:     make(chan Message, inboxBuffer),
 			quit:      make(chan struct{}),
+			log:       NewRaftLog(),
 		})
 	}
 
