@@ -35,9 +35,10 @@ func TestClusterFollowerWALByteIdentical(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The leader appends data+OpCommit per txn; followers append the same
-	// bytes via ApplyReplicated. No flush was triggered, so the whole log is
-	// on disk and must be byte-for-byte identical across nodes.
+	// The leader appends data+OpCommit per txn to its WAL; followers append
+	// the same bytes via AppendToLog on receipt. No flush was triggered, so
+	// the whole log is on disk and must be byte-for-byte identical across
+	// nodes.
 	leaderLog, err := os.ReadFile(filepath.Join(ds[int(c.Leader())], walFile))
 	if err != nil {
 		t.Fatal(err)

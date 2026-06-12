@@ -110,27 +110,23 @@ func (t *Txn) Rollback() error {
 	return nil
 }
 
-// Commit atomically writes all buffered changes. On success, every
-// write becomes visible to subsequent readers at the same commit
-// timestamp. On failure (e.g., conflict with a concurrent committer,
-// or a WAL write error), the Txn is left in the finished state and
-// the DB is left in a consistent state — any records that did reach
-// the WAL will be discarded on restart because no OpCommit record
-// follows them.
 func (t *Txn) Commit() error {
 	if t.finished {
 		return ErrTxnFinished
 	}
-
-	// Always remove from the active registry once Commit returns
-	// (including on panic — defers run during unwinding).
-	// unregisterTxn only acquires activeTxnsMu; no path holds
-	// activeTxnsMu while waiting for db.mu, so calling it with or
-	// without db.mu still held is deadlock-free. The defer order
-	// relative to the db.mu.Unlock below is incidental, not
-	// load-bearing.
 	defer t.db.unregisterTxn(t)
 
+	// A replicated leader replaces the entire commit path with its own
+	// orchestration (PrepareCommit + log + replicate + apply).
+	t.db.mu.RLock()
+	override := t.db.commitOverride
+	t.db.mu.RUnlock()
+	if override != nil {
+		return override(t)
+	}
+
+	// Single-node path: conflict-check, allocate, log, and apply, all under
+	// the write lock.
 	t.db.mu.Lock()
 	defer t.db.mu.Unlock()
 
@@ -139,20 +135,11 @@ func (t *Txn) Commit() error {
 		return errClosed
 	}
 
-	// Empty txn: nothing to do, but still mark finished.
 	if len(t.writes) == 0 {
 		t.finished = true
 		return nil
 	}
 
-	// First-committer-wins conflict detection. For each key we want
-	// to write, ask the storage layer: has anyone committed a newer
-	// version since our readSnap? If yes, our writes are based on
-	// stale data — abort without touching the WAL.
-	//
-	// Must happen under the write lock, before allocating commitTS:
-	// otherwise a concurrent committer could slip in between the
-	// check and the allocation, and we'd miss their write.
 	for k := range t.writes {
 		has, err := t.db.hasCommitNewerThanLocked([]byte(k), t.readSnap)
 		if err != nil {
@@ -165,21 +152,14 @@ func (t *Txn) Commit() error {
 		}
 	}
 
-	// Allocate one commit timestamp for all writes in this txn.
 	commitTS := t.db.nextTimestamp
 	t.db.nextTimestamp++
 
-	// Sort keys for deterministic WAL order (helps testing and review).
 	keys := make([]string, 0, len(t.writes))
 	for k := range t.writes {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-
-	// When a replicator is attached (leader role), accumulate the txn's
-	// encoded records into entry as we append them, to ship to followers.
-	repl := t.db.replicator
-	var entry []byte
 
 	for _, k := range keys {
 		w := t.writes[k]
@@ -193,35 +173,14 @@ func (t *Txn) Commit() error {
 			t.finished = true
 			return fmt.Errorf("db: commit wal data: %w", err)
 		}
-		if repl != nil {
-			entry = append(entry, record.Encode(rec)...)
-		}
 	}
 
-	// Append the commit marker. Once this record is durable, the txn
-	// is officially committed. A crash before this point leaves an
-	// uncommitted partial txn that recovery will discard.
 	commitRec := &record.Record{Op: record.OpCommit, Timestamp: commitTS}
 	if _, err := t.db.wal.Append(commitRec); err != nil {
 		t.finished = true
 		return fmt.Errorf("db: commit wal marker: %w", err)
 	}
 
-	// Replicate after WAL durability and before the writes become visible.
-	// Called under db.mu, so commits replicate one at a time; a quorum must
-	// acknowledge before we proceed to the memtable apply.
-	if repl != nil {
-		entry = append(entry, record.Encode(commitRec)...)
-		if err := repl.Replicate(entry, commitTS); err != nil {
-			t.finished = true
-			return fmt.Errorf("db: replicate: %w", err)
-		}
-	}
-
-	// Apply to memtable. After this point the writes are visible to
-	// concurrent readers. The memtable.Put/Delete calls cannot fail
-	// (only ErrFrozen is possible, and we never freeze the active
-	// memtable outside flushLocked, which we hold the lock against).
 	for _, k := range keys {
 		w := t.writes[k]
 		switch w.op {
@@ -238,9 +197,6 @@ func (t *Txn) Commit() error {
 
 	t.finished = true
 
-	// Check flush threshold once at the end of the txn, rather than
-	// after each buffered write. A large txn could push the memtable
-	// well over the limit; the flush will catch up.
 	if t.db.memtable.ApproximateSize() >= t.db.opts.MemtableSizeMax {
 		if err := t.db.flushLocked(); err != nil {
 			return fmt.Errorf("db: flush after commit: %w", err)
@@ -248,4 +204,61 @@ func (t *Txn) Commit() error {
 		t.db.signalCompact()
 	}
 	return nil
+
+}
+
+// PrepareCommit performs the leader-side preparation of a replicated commit:
+// first-committer-wins conflict detection, commit-timestamp allocation, and
+// building the encoded entry (data records + OpCommit). It does NOT touch the
+// WAL or the memtable — the replication layer is responsible for AppendToLog
+// (durability) and ApplyEntry (visibility) once the entry is committed. The
+// txn is marked finished.
+//
+// Returns (nil, 0, nil) for an empty txn, ErrConflict on a write-write
+// conflict (without allocating a timestamp), or errClosed if the DB is closed.
+func (db *DB) PrepareCommit(t *Txn) (entry []byte, commitTS uint64, err error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if t.finished {
+		return nil, 0, ErrTxnFinished
+	}
+	if db.closed {
+		t.finished = true
+		return nil, 0, errClosed
+	}
+	if len(t.writes) == 0 {
+		t.finished = true
+		return nil, 0, nil
+	}
+
+	for k := range t.writes {
+		has, cerr := t.db.hasCommitNewerThanLocked([]byte(k), t.readSnap)
+		if cerr != nil {
+			t.finished = true
+			return nil, 0, fmt.Errorf("db: conflict check: %w", cerr)
+		}
+		if has {
+			t.finished = true
+			return nil, 0, ErrConflict
+		}
+	}
+
+	commitTS = db.nextTimestamp
+	db.nextTimestamp++
+	keys := make([]string, 0, len(t.writes))
+	for k := range t.writes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		w := t.writes[k]
+		rec := &record.Record{Op: w.op, Timestamp: commitTS, Key: []byte(k), Value: w.value}
+		entry = append(entry, record.Encode(rec)...)
+	}
+	commitRec := &record.Record{Op: record.OpCommit, Timestamp: commitTS}
+	entry = append(entry, record.Encode(commitRec)...)
+
+	t.finished = true
+	return entry, commitTS, nil
 }

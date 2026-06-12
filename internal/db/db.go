@@ -40,16 +40,6 @@ var (
 	sstableNameRE = regexp.MustCompile(`^(\d{6})\.sst$`)
 )
 
-// Replicator is an optional hook invoked during Txn.Commit, after the txn's
-// records are durable in the WAl and before they are applied to the memtable.
-// On a replication leader it ships the entry (the txn's encoded records —
-// data records plus the OpCommit marker, all at one commitTS) to followers
-// and blocks until a quorum has it; returning an error aborts the commit.
-// A standalone DB leaves this nil and the commit path is unchanged.
-type Replicator interface {
-	Replicate(entry []byte, commitTS uint64) error
-}
-
 type Options struct {
 	SyncOnWrite                 bool
 	MemtableSizeMax             int64
@@ -87,9 +77,10 @@ type DB struct {
 
 	closed bool
 
-	// replicator, if non-nil, is invoked on each commit between WAL
-	// durability and memtable apply (leader role). Set via SetReplicator.
-	replicator Replicator
+	// commitOverride, if non-nil, replaces the single-node commit path:
+	// Txn.Commit delegates the entire commit to it (leader role under a
+	// replication cluster). Set via SetCommitOverride.
+	commitOverride func(*Txn) error
 
 	// activeTxnMu protects activeTxns. It's a leaf mutex — never
 	// acquired while holding db.mu — so the watermark computation has
@@ -444,18 +435,22 @@ func (db *DB) NextTimestampForTesting() uint64 {
 	return db.nextTimestamp
 }
 
-// SetReplicator attaches r as the commit replication hook. Intended to be
-// called once during setup, before any commits. Passing nil detaches it.
-func (db *DB) SetReplicator(r Replicator) {
+// SetCommitOverride installs fn as the replacement for the single-node commit
+// path: when set, Txn.Commit delegates the entire commit to fn (leader role
+// under a replication cluster), which is responsible for conflict detection
+// (via PrepareCommit), logging, replication, and apply. Intended to be called
+// once during setup, before any commits. Passing nil restores the single-node
+// path.
+func (db *DB) SetCommitOverride(fn func(*Txn) error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	db.replicator = r
+	db.commitOverride = fn
 }
 
 // LastAppliedTS returns the timestamp of the most recently applied commit
-// (nextTimestamp - 1). On a leader this is the last allocated commit; on a
-// follower it is the last commit received from the leader. Used to detect
-// when followers have caught up.
+// (nextTimestamp - 1). Note that under deferred apply the leader's
+// nextTimestamp advances at PrepareCommit, ahead of the actual memtable
+// apply; cluster catch-up is tracked by Raft log index, not this value.
 func (db *DB) LastAppliedTS() uint64 {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -465,17 +460,39 @@ func (db *DB) LastAppliedTS() uint64 {
 	return db.nextTimestamp - 1
 }
 
-// ApplyReplicated applies a replicated commit entry — the leader's exact
-// encoded bytes for one txn (data records followed by an OpCommit marker, all
-// sharing one commitTS) — to this (follower) DB. It appends the records to
-// the local WAL and applies them to the memtable at their embedded
-// timestamps, advancing nextTimestamp to track the leader. No conflict check
-// and no timestamp allocation: the leader already resolved the commit.
-//
-// The entry is validated before anything is written: a malformed entry (no
-// trailing OpCommit, or records whose timestamps disagree with the marker)
-// is rejected without touching the WAL.
-func (db *DB) ApplyReplicated(entry []byte) error {
+// AppendToLog durably appends an entry's records to the WAL without applying
+// them to the memtable. This is the "append to the Raft log" half of a
+// replicated write: on the leader, its own committed-pending entry; on a
+// follower, an entry received via replication. The on-disk bytes are
+// identical to the leader's. Apply happens later, via ApplyEntry, once the
+// entry is known committed.
+func (db *DB) AppendToLog(entry []byte) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return errClosed
+	}
+	offset := 0
+	for offset < len(entry) {
+		rec, n, err := record.Decode(entry[offset:])
+		if err != nil {
+			return fmt.Errorf("db: append to log: decode at %d: %w", offset, err)
+		}
+		if _, err := db.wal.Append(rec); err != nil {
+			return fmt.Errorf("db: append to log: wal append: %w", err)
+		}
+		offset += n
+	}
+	return nil
+}
+
+// ApplyEntry applies a committed entry's records to the memtable at their
+// embedded timestamps, advancing nextTimestamp. It does NOT touch the WAL —
+// the entry is already durable there via AppendToLog. This is the "apply to
+// the state machine" half, driven by the commit index. The entry must be a
+// valid txn: data records (OpPut/OpDelete) terminated by an OpCommit marker,
+// all sharing one timestamp.
+func (db *DB) ApplyEntry(entry []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
@@ -487,44 +504,35 @@ func (db *DB) ApplyReplicated(entry []byte) error {
 	for offset < len(entry) {
 		rec, n, err := record.Decode(entry[offset:])
 		if err != nil {
-			return fmt.Errorf("db: apply replicated: decode at %d: %w", offset, err)
+			return fmt.Errorf("db: apply entry: decode at %d: %w", offset, err)
 		}
 		recs = append(recs, rec)
 		offset += n
 	}
 	if len(recs) == 0 {
-		return errors.New("db: apply replicated: empty entry")
+		return errors.New("db: apply entry: empty entry")
 	}
 	commitRec := recs[len(recs)-1]
 	if commitRec.Op != record.OpCommit {
-		return errors.New("db: apply replicated: entry not terminated by OpCommit")
+		return errors.New("db: apply entry: entry not terminated by OpCommit")
 	}
 	commitTS := commitRec.Timestamp
 	for _, rec := range recs[:len(recs)-1] {
-		if rec.Op != record.OpPut && rec.Op != record.OpDelete {
-			return fmt.Errorf("db: apply replicated: unexpected op %d before marker", rec.Op)
-		}
 		if rec.Timestamp != commitTS {
-			return fmt.Errorf("db: apply replicated: ts mismatch (data %d vs marker %d)",
+			return fmt.Errorf("db: apply entry: ts mismatch (data %d vs marker %d)",
 				rec.Timestamp, commitTS)
 		}
-	}
-
-	for _, rec := range recs {
-		if _, err := db.wal.Append(rec); err != nil {
-			return fmt.Errorf("db: apply replicated: wal append: %w", err)
-		}
-	}
-	for _, rec := range recs[:len(recs)-1] {
 		switch rec.Op {
 		case record.OpPut:
 			if err := db.memtable.Put(rec.Key, rec.Value, rec.Timestamp); err != nil {
-				panic(fmt.Sprintf("db: memtable.Put on replicated apply (ts=%d): %v", rec.Timestamp, err))
+				panic(fmt.Sprintf("db: memtable.Put on apply entry (ts=%d): %v", rec.Timestamp, err))
 			}
 		case record.OpDelete:
 			if err := db.memtable.Delete(rec.Key, rec.Timestamp); err != nil {
-				panic(fmt.Sprintf("db: memtable.Delete on replicated apply (ts=%d): %v", rec.Timestamp, err))
+				panic(fmt.Sprintf("db: memtable.Delete on apply entry (ts=%d): %v", rec.Timestamp, err))
 			}
+		default:
+			return fmt.Errorf("db: apply entry: unexpected op %d before marker", rec.Op)
 		}
 	}
 
@@ -534,7 +542,7 @@ func (db *DB) ApplyReplicated(entry []byte) error {
 
 	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
 		if err := db.flushLocked(); err != nil {
-			return fmt.Errorf("db: apply replicated: flush: %w", err)
+			return fmt.Errorf("db: apply entry: flush: %w", err)
 		}
 		db.signalCompact()
 	}
