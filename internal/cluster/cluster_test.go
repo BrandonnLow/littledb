@@ -130,10 +130,12 @@ func TestClusterDeleteReplicates(t *testing.T) {
 	}
 }
 
-// TestClusterCommitWaitsForMajority verifies the leader returns only after a
-// quorum has applied: immediately after Put returns (before any Quiesce), at
-// least a majority of nodes already hold the write. Followers apply before
-// they ack, so the leader plus the acking-quorum have it on return.
+// TestClusterCommitWaitsForMajority verifies the Raft guarantee on return.
+// Under deferred apply, followers append (and ack) an entry on receipt but
+// apply it only once the leader's commit index reaches them (a later
+// MsgCommit), so the count of nodes that have *applied* the write right after
+// Put returns may be only the leader. What a quorum is guaranteed to hold on
+// return is the entry in its *log*; the leader additionally has it applied.
 func TestClusterCommitWaitsForMajority(t *testing.T) {
 	const n = 5
 	c := newCluster(t, n)
@@ -143,14 +145,21 @@ func TestClusterCommitWaitsForMajority(t *testing.T) {
 		t.Fatal(err)
 	}
 	majority := n/2 + 1
-	have := 0
+
+	// The leader has applied: the write is readable on it immediately.
+	if got, err := c.Get([]byte("k")); err != nil || string(got) != "v" {
+		t.Fatalf("leader Get right after commit = (%q,%v), want v", got, err)
+	}
+
+	// A majority has the entry durably in its log (leader + acking quorum).
+	logged := 0
 	for i := 0; i < n; i++ {
-		if got, err := c.Node(i).DB().Get([]byte("k")); err == nil && string(got) == "v" {
-			have++
+		if c.Node(i).lastIndex() >= 1 {
+			logged++
 		}
 	}
-	if have < majority {
-		t.Errorf("right after commit, %d/%d nodes have the write, want >= %d (majority)", have, n, majority)
+	if logged < majority {
+		t.Errorf("right after commit, %d/%d nodes have the entry logged, want >= %d (majority)", logged, n, majority)
 	}
 }
 

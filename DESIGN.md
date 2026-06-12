@@ -734,12 +734,31 @@ apply entries in commit order. The leader counts its own copy toward the
 majority and needs floor(N/2) follower acks; a follower applies before it
 acks, so on the client's return the leader plus a majority hold the write.
 
-#### Deferred to later weeks
+### Deferred apply via commit index
 
-Timestamp allocation and conflict detection stay leader-only. Reads route to
-the leader (linearizable); follower-local bounded-staleness reads come later.
-Crucially, we keep the existing apply-all WAL recovery, which is correct
-only under the no-crash assumption: under Raft the WAL is the *log*, and only
-entries up to a commitIndex are committed. Next commitIndex/lastApplied
-work will split "in the WAL" from "applied to the state machine," at which
-point followers must persist a commitIndex and replay only up to it.
+Earlier implementation conflated three Raft steps: appending to the log, knowing
+an entry is committed, and applying it to the state machine. Pull them apart.
+
+- **db primitives.** `PrepareCommit` (conflict-check + allocate commitTS + build
+  entry, no side effects), `AppendToLog` (durable WAL append, no memtable),
+  `ApplyEntry` (memtable apply at embedded timestamps, no WAL). `Txn.Commit`
+  delegates the whole commit to an installed override on a replicated leader,
+  else runs the single-node path. The `Replicator` hook is retired.
+- **Per-node Raft state.** In-memory `log` (1-based index), `commitIndex`,
+  `lastApplied`, and an apply loop applying `lastApplied+1..commitIndex`.
+- **Follower path.** `MsgReplicate` → `AppendToLog` + log-append + ack (no
+  apply). `MsgCommit` → advance `commitIndex` (bounded by `lastIndex`) → apply
+  loop applies. Followers never apply uncommitted entries.
+- **Leader commit.** Under `commitMu` (serialized end-to-end so conflict
+  detection always sees the prior commit applied): `PrepareCommit` →
+  `AppendToLog` + log-append → broadcast `MsgReplicate` → wait quorum of
+  append-acks → advance `commitIndex` → apply locally → broadcast `MsgCommit` →
+  wait own `lastApplied` ≥ entry index → return.
+- **Locking.** `raftMu` (log/indices) and the store's `db.mu` are never held
+  simultaneously; applies run outside `raftMu`. `commitMu` is the outermost
+  leader lock.
+- **Guarantee on return.** A quorum has the entry logged and the leader has
+  applied it; minority followers apply slightly later (on their `MsgCommit`).
+- **Deferred.** Crash recovery still replays the whole WAL (apply-all); a
+  persisted commit index is left. Term is constant 1, in memory. Per-follower
+  nextIndex/matchIndex, prevLog checks, and slow-follower catch-up are next.
