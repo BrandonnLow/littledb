@@ -75,6 +75,15 @@ type DB struct {
 	// not-yet-applied write.
 	nextTimestamp uint64
 
+	// appliedTS is the highest commit timestamp actually applied to the
+	// memtable. On a single-node DB and on followers it equals the highest
+	// allocated commit (allocate and apply happen together), but on a
+	// replication leader it lags nextTimestamp during an in-flight commit:
+	// PrepareCommit allocates before the entry is applied. Begin derives a
+	// txn's read snapshot from this, not nextTimestamp, so a snapshot never
+	// claims to include a commit whose data is not yet visible.
+	appliedTS uint64
+
 	closed bool
 
 	// commitOverride, if non-nil, replaces the single-node commit path:
@@ -201,6 +210,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		sstableIDs:    sstIDsRev,
 		nextID:        nextID,
 		nextTimestamp: maxTS + 1, // first write gets at least 1
+		appliedTS:     maxTS,
 		activeTxns:    make(map[*Txn]struct{}),
 		compactCh:     make(chan struct{}, 1),
 		compactDoneCh: make(chan struct{}),
@@ -538,6 +548,10 @@ func (db *DB) ApplyEntry(entry []byte) error {
 
 	if commitTS >= db.nextTimestamp {
 		db.nextTimestamp = commitTS + 1
+	}
+
+	if commitTS > db.appliedTS {
+		db.appliedTS = commitTS
 	}
 
 	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {

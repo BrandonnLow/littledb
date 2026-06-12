@@ -53,6 +53,18 @@ func (g *gateTransport) release() {
 	}
 }
 
+func (g *gateTransport) setHolding(v bool) {
+	g.mu.Lock()
+	g.holding = v
+	g.mu.Unlock()
+}
+
+func (g *gateTransport) heldCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.held)
+}
+
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
