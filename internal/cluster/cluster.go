@@ -10,13 +10,13 @@ import (
 )
 
 // Node wraps a db.DB with a Raft-style log and a transport endpoint. Every
-// node maintains an in-memory log (1-based index), a commit index (highest
-// entry known committed), and a last-applied index (highest entry applied to
-// the memtable). Appending to the log and applying to the memtable are
-// separate steps: a follower appends an entry on receipt (MsgReplicate) and
-// applies it only once the leader's commit index covers it (MsgCommit). A
-// per-node apply loop performs the apply. Roles are fixed at construction
-// (node 0 is the leader).
+// node keeps an in-memory log (1-based index), a commit index (highest entry
+// known committed), and a last-applied index. Appending to the log and
+// applying to the memtable are separate: a follower appends entries on receipt
+// (AppendEntries) and applies them only once leaderCommit covers them. A
+// per-node apply loop performs the apply. The leader additionally runs one
+// replication goroutine per follower. Roles are fixed at construction (node 0
+// is the leader).
 type Node struct {
 	id        NodeID
 	store     *db.DB
@@ -25,17 +25,25 @@ type Node struct {
 	isLeader  bool
 
 	inbox <-chan Message
-	ackCh chan Message // leader: append-acks routed here for the commit loop
 	quit  chan struct{}
 	wg    sync.WaitGroup
 
 	// Raft state, guarded by raftMu. raftMu and the store's db.mu are never
-	// held simultaneously: applies happen outside raftMu.
+	// held simultaneously: applies and WAL appends happen outside raftMu.
 	raftMu      sync.Mutex
 	log         *RaftLog // 1-based Raft log (entry bytes + term)
 	commitIndex uint64
 	lastApplied uint64
 	appliedCond *sync.Cond // broadcast when lastApplied advances
+
+	// Leader-only replication state, guarded by raftMu. nextIndex/matchIndex
+	// track each follower; respCh routes that follower's responses to its
+	// replication goroutine; replSignal wakes the goroutine when there is new
+	// work (an appended entry or an advanced commit index).
+	nextIndex  map[NodeID]uint64
+	matchIndex map[NodeID]uint64
+	respCh     map[NodeID]chan Message
+	replSignal map[NodeID]chan struct{}
 
 	applySignal chan struct{} // coalescing wake for the apply loop
 
@@ -72,9 +80,18 @@ func (n *Node) commitIndexValue() uint64 {
 func (n *Node) start() {
 	n.appliedCond = sync.NewCond(&n.raftMu)
 	n.applySignal = make(chan struct{}, 1)
-	n.wg.Add(2)
-	go n.run()
-	go n.applyLoop()
+	if n.isLeader {
+		n.wg.Add(2 + len(n.peers))
+		go n.run()
+		go n.applyLoop()
+		for _, p := range n.peers {
+			go n.replicateTo(p)
+		}
+	} else {
+		n.wg.Add(2)
+		go n.run()
+		go n.applyLoop()
+	}
 }
 
 func (n *Node) stop() {
@@ -89,9 +106,8 @@ func (n *Node) signalApply() {
 	}
 }
 
-// run drains the inbox. A follower appends replicate requests and advances
-// its commit index on commit messages; the leader routes acks to its commit
-// loop.
+// run drains the inbox. A follower handles AppendEntries; the leader routes
+// each AppendResponse to the owning follower's replication goroutine.
 func (n *Node) run() {
 	defer n.wg.Done()
 	for {
@@ -100,51 +116,84 @@ func (n *Node) run() {
 			return
 		case m := <-n.inbox:
 			switch m.Type {
-			case MsgReplicate:
-				n.handleReplicate(m)
-			case MsgCommit:
-				n.handleCommit(m)
-			case MsgAck:
-				// Non-blocking: acks arriving between commits (when nothing is
-				// draining) are dropped; the active commit is always draining.
+			case MsgAppendEntries:
+				n.handleAppendEntries(m)
+			case MsgAppendResponse:
+				// Route to the follower's replication goroutine. Reliable
+				// (no drop): with one AppendEntries in flight per follower,
+				// dropping a response would stall that follower forever.
+				ch := n.respCh[m.From]
+				if ch == nil {
+					continue
+				}
 				select {
-				case n.ackCh <- m:
-				default:
+				case ch <- m:
+				case <-n.quit:
+					return
 				}
 			}
 		}
 	}
 }
 
-// handleReplicate (follower) appends the entry to the WAL and the in-memory
-// log, then acks. It does NOT apply — apply waits for a MsgCommit that
-// advances the commit index past this entry.
-func (n *Node) handleReplicate(m Message) {
-	if err := n.store.AppendToLog(m.Entry); err != nil {
-		_ = n.transport.Send(m.From, Message{Type: MsgAck, From: n.id, Index: m.Index, OK: false})
+// handleAppendEntries is the follower side of replication. On a prev-log
+// mismatch it rejects with a back-up hint and touches neither the WAL nor the
+// log. On a match it durably appends only the genuinely-new suffix (so WALs
+// stay byte-identical across nodes), advances its commit index, and wakes its
+// apply loop — apply itself stays deferred to the apply loop.
+func (n *Node) handleAppendEntries(m Message) {
+	n.raftMu.Lock()
+	if !n.log.matchesPrev(m.PrevLogIndex, m.PrevLogTerm) {
+		hint := n.log.lastIndex() + 1
+		n.raftMu.Unlock()
+		_ = n.transport.Send(m.From, Message{
+			Type: MsgAppendResponse, From: n.id, Term: currentTerm,
+			Success: false, ConflictHint: hint,
+		})
 		return
 	}
-	n.raftMu.Lock()
-	// FIFO transport + fixed leader means entries arrive in order
-	// with no gaps, so the appended index is lastIndex()+1 == m.Index.
-	idx := n.log.append(currentTerm, m.Entry)
+	// Entries cover indices PrevLogIndex+1, +2, ... Keep only those past our
+	// current end; ones we already hold are skipped (idempotent — under a
+	// fixed leader an existing index always carries the same term).
+	last := n.log.lastIndex()
+	var toAppend [][]byte
+	for i, e := range m.Entries {
+		if m.PrevLogIndex+uint64(i)+1 > last {
+			toAppend = append(toAppend, e)
+		}
+	}
+	matchIndex := m.PrevLogIndex + uint64(len(m.Entries))
 	n.raftMu.Unlock()
-	_ = n.transport.Send(m.From, Message{Type: MsgAck, From: n.id, Index: idx, OK: true})
-}
 
-// handleCommit (follower) advances the commit index (bounded by what it has
-// logged) and wakes the apply loop.
-func (n *Node) handleCommit(m Message) {
+	// Durably append the new suffix (each call takes db.mu) outside raftMu.
+	for _, e := range toAppend {
+		if err := n.store.AppendToLog(e); err != nil {
+			_ = n.transport.Send(m.From, Message{
+				Type: MsgAppendResponse, From: n.id, Term: currentTerm,
+				Success: false, ConflictHint: n.lastIndex() + 1,
+			})
+			return
+		}
+	}
+
 	n.raftMu.Lock()
-	ci := m.CommitIndex
-	if last := n.log.lastIndex(); ci > last {
-		ci = last
+	for _, e := range toAppend {
+		n.log.append(currentTerm, e)
+	}
+	ci := m.LeaderCommit
+	if li := n.log.lastIndex(); ci > li {
+		ci = li
 	}
 	if ci > n.commitIndex {
 		n.commitIndex = ci
 	}
 	n.raftMu.Unlock()
 	n.signalApply()
+
+	_ = n.transport.Send(m.From, Message{
+		Type: MsgAppendResponse, From: n.id, Term: currentTerm,
+		Success: true, MatchIndex: matchIndex,
+	})
 }
 
 // applyLoop applies committed-but-unapplied entries to the memtable.
@@ -184,9 +233,9 @@ func (n *Node) applyCommitted() {
 }
 
 // commit is the leader's commitOverride. It prepares the txn, appends the
-// entry to its log, replicates it, advances the commit index once a quorum
-// has appended it, and waits for its own apply before returning. commitMu
-// serializes commits so PrepareCommit always sees the previous commit applied.
+// entry to its log, wakes the replication goroutines, and waits for its own
+// apply before returning. commitMu serializes commits so PrepareCommit always
+// sees the previous commit applied.
 func (n *Node) commit(t *db.Txn) error {
 	n.commitMu.Lock()
 	defer n.commitMu.Unlock()
@@ -199,46 +248,20 @@ func (n *Node) commit(t *db.Txn) error {
 		return nil // empty txn: nothing to replicate
 	}
 
-	// Append to the leader's own log (WAL + in-memory), assigning index idx.
 	if err := n.store.AppendToLog(entry); err != nil {
 		return fmt.Errorf("cluster: leader append to log: %w", err)
 	}
+
 	n.raftMu.Lock()
 	idx := n.log.append(currentTerm, entry)
+	// Drive the commit index ourselves: for n=1 there are no replication
+	// goroutines to advance it, so this commits immediately; for n>1 the
+	// followers' matchIndex are still behind, so this is a no-op until their
+	// responses arrive.
+	n.maybeAdvanceCommitLocked()
 	n.raftMu.Unlock()
 
-	// Replicate and wait for a quorum to append. Majority of N is
-	// floor(N/2)+1; the leader's own copy counts as one, so it needs
-	// floor((peers+1)/2) follower acks.
-	for _, p := range n.peers {
-		if err := n.transport.Send(p, Message{Type: MsgReplicate, From: n.id, Index: idx, Entry: entry}); err != nil {
-			return fmt.Errorf("cluster: replicate to %d: %w", p, err)
-		}
-	}
-	need := (len(n.peers) + 1) / 2
-	for got := 0; got < need; {
-		select {
-		case m := <-n.ackCh:
-			if m.Type == MsgAck && m.Index == idx && m.OK {
-				got++
-			}
-		case <-n.quit:
-			return errors.New("cluster: node stopped during replication")
-		}
-	}
-
-	// Quorum has the entry. Advance the commit index, wake our own apply
-	// loop, and tell followers to apply.
-	n.raftMu.Lock()
-	if idx > n.commitIndex {
-		n.commitIndex = idx
-	}
-	n.raftMu.Unlock()
-	n.signalApply()
-
-	for _, p := range n.peers {
-		_ = n.transport.Send(p, Message{Type: MsgCommit, From: n.id, CommitIndex: idx})
-	}
+	n.signalReplicators()
 
 	// Wait until our apply loop has applied this entry, so the write is
 	// visible to subsequent reads on the leader before Commit returns.
@@ -290,17 +313,29 @@ func NewWithTransport(n int, dirs []string, opts db.Options, tr Transport) (*Clu
 				peers = append(peers, NodeID(j))
 			}
 		}
-		c.nodes = append(c.nodes, &Node{
+		nd := &Node{
 			id:        NodeID(i),
 			store:     store,
 			transport: tr,
 			peers:     peers,
 			isLeader:  NodeID(i) == c.leader,
 			inbox:     tr.Inbox(NodeID(i)),
-			ackCh:     make(chan Message, inboxBuffer),
 			quit:      make(chan struct{}),
 			log:       NewRaftLog(),
-		})
+		}
+		if nd.isLeader {
+			nd.nextIndex = make(map[NodeID]uint64, len(peers))
+			nd.matchIndex = make(map[NodeID]uint64, len(peers))
+			nd.respCh = make(map[NodeID]chan Message, len(peers))
+			nd.replSignal = make(map[NodeID]chan struct{}, len(peers))
+			for _, p := range peers {
+				nd.nextIndex[p] = nd.log.lastIndex() + 1 // empty log => 1
+				nd.matchIndex[p] = 0
+				nd.respCh[p] = make(chan Message, 1)
+				nd.replSignal[p] = make(chan struct{}, 1)
+			}
+		}
+		c.nodes = append(c.nodes, nd)
 	}
 
 	// Install the leader's commit orchestration, then start every node.

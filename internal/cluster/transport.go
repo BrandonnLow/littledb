@@ -1,9 +1,10 @@
 // Package cluster replicates a db.DB across N in-process nodes: a single
 // fixed leader appends each committed transaction to a Raft-style log,
-// replicates it to followers, and advances a commit index once a quorum has
-// it. Appending to the log and applying to the state machine (the memtable)
-// are separate steps: an entry is appended on receipt but applied only once
-// known committed. Fixed leader, no election.
+// replicates it to followers via AppendEntries, and advances a commit index
+// once a quorum has it. Appending to the log and applying to the state machine
+// (the memtable) are separate steps: an entry is appended on receipt but
+// applied only once known committed (carried by a later AppendEntries'
+// leaderCommit). Fixed leader, no election.
 package cluster
 
 import (
@@ -18,25 +19,34 @@ type NodeID int
 type MsgType int
 
 const (
-	// MsgReplicate carries one log entry (a txn's encoded records, data +
-	// OpCommit) at a given index from the leader to a follower. The follower
-	// appends it to its log but does not apply it yet.
-	MsgReplicate MsgType = iota
-	// MsgAck is a follower's acknowledgement that it appended an entry.
-	MsgAck
-	// MsgCommit advances a follower's commit index, releasing entries up to
-	// it to be applied to the memtable.
-	MsgCommit
+	// MsgAppendEntries is the leader's replication RPC: it carries zero or
+	// more log entries to append after (PrevLogIndex, PrevLogTerm), plus the
+	// leader's commit index. Zero entries makes it a heartbeat that only
+	// propagates LeaderCommit.
+	MsgAppendEntries MsgType = iota
+	// MsgAppendResponse is a follower's reply: Success with the MatchIndex it
+	// now holds, or a rejection with a ConflictHint telling the leader where
+	// to back up.
+	MsgAppendResponse
 )
 
-// Message is a single inter-node message.
+// Message is a single inter-node message. Fields are grouped by direction;
+// only those relevant to Type are set.
 type Message struct {
-	Type        MsgType
-	From        NodeID
-	Index       uint64 // MsgReplicate / MsgAck: the entry's log index
-	Entry       []byte // MsgReplicate: the txn's encoded records
-	CommitIndex uint64 // MsgCommit: the leader's commit index
-	OK          bool   // MsgAck: whether the append succeeded
+	Type MsgType
+	From NodeID
+	Term uint64 // currentTerm; carried for election readiness
+
+	// MsgAppendEntries (leader -> follower):
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      [][]byte // read-only; the follower copies what it keeps
+	LeaderCommit uint64
+
+	// MsgAppendResponse (follower -> leader):
+	Success      bool
+	MatchIndex   uint64 // on success: highest index the follower now holds
+	ConflictHint uint64 // on reject: index the leader should set nextIndex to
 }
 
 // Transport delivers messages between nodes. The Raft invariants are
