@@ -26,8 +26,10 @@ import (
 // assertion is that B.Commit returns ErrConflict and A's write survives.
 func TestLeaderRMWSnapshotConflict(t *testing.T) {
 	const n = 3
-	gate := newGateTransport(0, MsgAck) // hold acks destined for the leader
-	gate.setHolding(false)              // ...but not during setup
+	gate := newGateTransport(func(to NodeID, m Message) bool {
+		return to == 0 && m.Type == MsgAppendResponse // hold responses to the leader
+	})
+	gate.setHolding(false) // ...but not during setup
 
 	c, err := NewWithTransport(n, dirs(t, n), testOpts(), gate)
 	if err != nil {

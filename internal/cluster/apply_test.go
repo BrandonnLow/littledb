@@ -9,32 +9,34 @@ import (
 	"github.com/BrandonnLow/littledb/internal/db"
 )
 
-// gateTransport wraps a ChannelTransport and withholds messages of one type to
-// one target node until released, letting a test pin a follower between
-// "appended" and "applied".
+// gateTransport wraps a ChannelTransport and withholds every message matching
+// a predicate until released, letting a test pin nodes in chosen states.
 type gateTransport struct {
 	*ChannelTransport
-	target NodeID
-	hold   MsgType
+	pred func(to NodeID, m Message) bool
 
 	mu      sync.Mutex
 	holding bool
-	held    []Message
+	held    []heldMsg
 }
 
-func newGateTransport(target NodeID, hold MsgType) *gateTransport {
+type heldMsg struct {
+	to NodeID
+	m  Message
+}
+
+func newGateTransport(pred func(to NodeID, m Message) bool) *gateTransport {
 	return &gateTransport{
 		ChannelTransport: NewChannelTransport(),
-		target:           target,
-		hold:             hold,
+		pred:             pred,
 		holding:          true,
 	}
 }
 
 func (g *gateTransport) Send(to NodeID, msg Message) error {
 	g.mu.Lock()
-	if g.holding && to == g.target && msg.Type == g.hold {
-		g.held = append(g.held, msg)
+	if g.holding && g.pred(to, msg) {
+		g.held = append(g.held, heldMsg{to, msg})
 		g.mu.Unlock()
 		return nil
 	}
@@ -48,8 +50,8 @@ func (g *gateTransport) release() {
 	held := g.held
 	g.held = nil
 	g.mu.Unlock()
-	for _, m := range held {
-		_ = g.ChannelTransport.Send(g.target, m)
+	for _, h := range held {
+		_ = g.ChannelTransport.Send(h.to, h.m)
 	}
 }
 
@@ -76,50 +78,59 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	}
 }
 
-// TestFollowerDefersApplyUntilCommit is the core of stage 2a: a follower
-// appends an entry to its log when it receives it (and acks, letting the
-// leader reach quorum and commit), but does not apply it to its memtable until
-// the leader's commit index reaches it. We hold the MsgCommit destined for one
-// follower and observe it stuck at "appended, not applied", then release it
-// and observe the apply.
+// TestFollowerDefersApplyUntilCommit is the core of the deferred-apply split.
+// Holding every follower response pins the leader's commit index at 0, so its
+// commit blocks — yet the followers still append the entry to their logs on
+// receipt (the AppendEntries carries leaderCommit 0). None of the three nodes
+// applies until the responses are released and the commit index advances.
 func TestFollowerDefersApplyUntilCommit(t *testing.T) {
 	const n = 3
-	const target = NodeID(1)
-
-	gate := newGateTransport(target, MsgCommit)
+	gate := newGateTransport(func(to NodeID, m Message) bool {
+		return to == 0 && m.Type == MsgAppendResponse
+	})
 	c, err := NewWithTransport(n, dirs(t, n), testOpts(), gate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
 
-	// The quorum here is the leader plus one follower's append-ack, so Put
-	// returns even though node 1's commit is being held.
-	if err := c.Put([]byte("k"), []byte("v")); err != nil {
+	// Commit in the background; it will block until a quorum responds.
+	done := make(chan error, 1)
+	go func() { done <- c.Put([]byte("k"), []byte("v")) }()
+
+	// Both followers append the entry but, with leaderCommit pinned at 0, must
+	// not apply it.
+	for _, id := range []int{1, 2} {
+		nd := c.Node(id)
+		waitFor(t, time.Second, func() bool { return nd.lastIndex() >= 1 })
+		if ai := nd.appliedIndex(); ai != 0 {
+			t.Fatalf("follower %d appliedIndex = %d, want 0 (apply deferred)", id, ai)
+		}
+		if _, err := nd.DB().Get([]byte("k")); !errors.Is(err, db.ErrKeyNotFound) {
+			t.Fatalf("follower %d Get err = %v, want ErrKeyNotFound (logged, not applied)", id, err)
+		}
+	}
+	// The leader has it logged too and is blocked pre-apply.
+	if ai := c.Node(0).appliedIndex(); ai != 0 {
+		t.Fatalf("leader appliedIndex = %d, want 0 (commit blocked on quorum)", ai)
+	}
+	select {
+	case <-done:
+		t.Fatal("Put returned before any follower response was delivered")
+	default:
+	}
+
+	// Release: the commit index advances and every node applies.
+	gate.release()
+	if err := <-done; err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := c.Quiesce(time.Second); err != nil {
 		t.Fatal(err)
 	}
-
-	// The leader has applied: readable on it immediately.
-	if got, err := c.Get([]byte("k")); err != nil || string(got) != "v" {
-		t.Fatalf("leader Get = (%q,%v), want v", got, err)
-	}
-
-	// The gated follower appends the entry (MsgReplicate is not held)...
-	tn := c.Node(int(target))
-	waitFor(t, time.Second, func() bool { return tn.lastIndex() >= 1 })
-
-	// ...but must not apply it while its MsgCommit is withheld.
-	if ai := tn.appliedIndex(); ai != 0 {
-		t.Fatalf("gated follower appliedIndex = %d, want 0 (apply withheld)", ai)
-	}
-	if _, err := tn.DB().Get([]byte("k")); !errors.Is(err, db.ErrKeyNotFound) {
-		t.Fatalf("gated follower Get err = %v, want ErrKeyNotFound (logged, not applied)", err)
-	}
-
-	// Release the held commit: the follower now applies and converges.
-	gate.release()
-	waitFor(t, time.Second, func() bool { return tn.appliedIndex() >= 1 })
-	if got, err := tn.DB().Get([]byte("k")); err != nil || string(got) != "v" {
-		t.Fatalf("after release, follower Get = (%q,%v), want v", got, err)
+	for i := 0; i < n; i++ {
+		if got, err := c.Node(i).DB().Get([]byte("k")); err != nil || string(got) != "v" {
+			t.Errorf("node %d after release: Get = (%q,%v), want v", i, got, err)
+		}
 	}
 }
