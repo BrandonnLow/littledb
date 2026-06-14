@@ -238,6 +238,11 @@ func (n *Node) handleAppendEntries(m Message) {
 	n.raftMu.Unlock()
 
 	// Durably append the new suffix (each call takes db.mu) outside raftMu.
+	// A mid-batch failure here (after a conflict truncation) leaves the
+	// in-memory log shorter than the WAL and missing the suffix; we reject so
+	// the leader retries from the hint and re-sends the whole suffix, healing
+	// both. Safe: only uncommitted entries are ever in flight here. (TODO:
+	// On-disk reconciliation of the short-vs-long mismatch.)
 	for _, e := range toAppend {
 		if err := n.store.AppendToLog(e.Data); err != nil {
 			_ = n.transport.Send(m.From, Message{
@@ -249,6 +254,21 @@ func (n *Node) handleAppendEntries(m Message) {
 	}
 
 	n.raftMu.Lock()
+	// A concurrent election can have bumped our term/role between the WAL
+	// append above and here (the election timer may fire the same instant we
+	// reset it). Don't apply under a changed term: reject with our current term
+	// so the now-stale sender steps down. The WAL-appended suffix becomes an
+	// orphan until commitIndex-bounded recovery, exactly as in commit().
+	if n.role != Follower || n.currentTerm != term {
+		hint := n.log.lastIndex() + 1
+		cur := n.currentTerm
+		n.raftMu.Unlock()
+		_ = n.transport.Send(m.From, Message{
+			Type: MsgAppendResponse, From: n.id, Term: cur,
+			Success: false, ConflictHint: hint,
+		})
+		return
+	}
 	for _, e := range toAppend {
 		n.log.append(e.Term, e.Data)
 	}
@@ -335,8 +355,11 @@ func (n *Node) commit(t *db.Txn) error {
 
 	n.raftMu.Lock()
 	// Re-check leadership: we may have stepped down during PrepareCommit /
-	// AppendToLog. (The entry is now an orphan in our WAL; harmless while
-	// running — it is not in the in-memory log — will be reconciled by recovery.)
+	// AppendToLog. The entry is now an orphan in our WAL — durable but absent
+	// from the in-memory log and unreplicated. Harmless while running, but the
+	// current plain-replay db.Open WOULD resurrect it on restart (it is a
+	// complete txn with OpCommit); TODO: recovery must be commitIndex-bounded
+	// to discard it.
 	if n.role != Leader || n.currentTerm != term {
 		n.raftMu.Unlock()
 		return ErrNotLeader
@@ -498,6 +521,12 @@ func (c *Cluster) Delete(key []byte) error {
 }
 
 // Get reads from the current leader, retrying across leadership changes.
+//
+// Not linearizable: currentLeader() inspects every node's role directly, so the
+// in-process harness always finds the true leader — but a real client routed to
+// a partitioned ex-leader (still role==Leader at its stale term until it hears a
+// higher one) could read stale data. Linearizable reads (read-index / leader
+// lease) are future work.
 func (c *Cluster) Get(key []byte) ([]byte, error) {
 	var out []byte
 	err := c.withLeader(func(ld *Node) error {
