@@ -9,20 +9,42 @@ import (
 	"github.com/BrandonnLow/littledb/internal/db"
 )
 
-// Node wraps a db.DB with a Raft-style log and a transport endpoint. Every
-// node keeps an in-memory log (1-based index), a commit index (highest entry
-// known committed), and a last-applied index. Appending to the log and
-// applying to the memtable are separate: a follower appends entries on receipt
-// (AppendEntries) and applies them only once leaderCommit covers them. A
-// per-node apply loop performs the apply. The leader additionally runs one
-// replication goroutine per follower. Roles are fixed at construction (node 0
-// is the leader).
+// ErrNotLeader is returned by a commit routed to a node that is not currently
+// the leader (or that stepped down mid-commit). Clients retry on the new
+// leader; the cluster's own Put/Delete/Get do this automatically.
+var ErrNotLeader = errors.New("cluster: not leader")
+
+const bootstrapLeader NodeID = 0
+
+// routeTimeout bounds how long Put/Delete/Get retry to find a leader (e.g.
+// across an election) before giving up.
+const routeTimeout = 2 * time.Second
+
+// Config tunes the election and heartbeat timers. Heartbeat must be well below
+// ElectionMin (a few heartbeats per election window) or healthy leaders get
+// voted out.
+type Config struct {
+	ElectionMin time.Duration
+	ElectionMax time.Duration
+	Heartbeat   time.Duration
+}
+
+// DefaultConfig returns conservative timers: heartbeat 50ms, election
+// 250–500ms (50 <= 250/3), safe against spurious elections under -race.
+func DefaultConfig() Config {
+	return Config{ElectionMin: 250 * time.Millisecond, ElectionMax: 500 * time.Millisecond, Heartbeat: 50 * time.Millisecond}
+}
+
+// Node wraps a db.DB with a Raft log, an election state machine, and a
+// transport endpoint. Every node runs the same goroutine set; its role gates
+// behavior. Appending to the log and applying to the memtable are separate: an
+// entry is appended on receipt and applied only once leaderCommit covers it.
 type Node struct {
 	id        NodeID
 	store     *db.DB
 	transport Transport
 	peers     []NodeID
-	isLeader  bool
+	cfg       Config
 
 	inbox <-chan Message
 	quit  chan struct{}
@@ -31,25 +53,29 @@ type Node struct {
 	// Raft state, guarded by raftMu. raftMu and the store's db.mu are never
 	// held simultaneously: applies and WAL appends happen outside raftMu.
 	raftMu      sync.Mutex
-	log         *RaftLog // 1-based Raft log (entry bytes + term)
+	role        Role
+	currentTerm uint64
+	votedFor    NodeID // noVote if none this term
+
+	log         *RaftLog
 	commitIndex uint64
 	lastApplied uint64
-	appliedCond *sync.Cond // broadcast when lastApplied advances
+	appliedCond *sync.Cond // broadcast when lastApplied advances or we step down
 
-	// Leader-only replication state, guarded by raftMu. nextIndex/matchIndex
-	// track each follower; respCh routes that follower's responses to its
-	// replication goroutine; replSignal wakes the goroutine when there is new
-	// work (an appended entry or an advanced commit index).
+	votesReceived int // tally for the current election (candidate only)
+
+	// Leader replication state (per peer), guarded by raftMu. Present on every
+	// node since any node can become leader; only acted on while role==Leader.
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
 	respCh     map[NodeID]chan Message
 	replSignal map[NodeID]chan struct{}
 
-	applySignal chan struct{} // coalescing wake for the apply loop
+	applySignal     chan struct{} // coalescing wake for the apply loop
+	electionResetCh chan struct{} // coalescing reset for the election timer
 
-	// commitMu serializes the leader's commits end-to-end, so each commit is
-	// fully applied before the next one's conflict check (in PrepareCommit,
-	// which reads the memtable) runs. Leader-only.
+	// commitMu serializes the leader's commits end-to-end so each commit is
+	// fully applied before the next one's conflict check runs.
 	commitMu sync.Mutex
 }
 
@@ -77,21 +103,39 @@ func (n *Node) commitIndexValue() uint64 {
 	return n.commitIndex
 }
 
+func (n *Node) roleValue() Role {
+	n.raftMu.Lock()
+	defer n.raftMu.Unlock()
+	return n.role
+}
+
+func (n *Node) termValue() uint64 {
+	n.raftMu.Lock()
+	defer n.raftMu.Unlock()
+	return n.currentTerm
+}
+
 func (n *Node) start() {
 	n.appliedCond = sync.NewCond(&n.raftMu)
 	n.applySignal = make(chan struct{}, 1)
-	if n.isLeader {
-		n.wg.Add(2 + len(n.peers))
-		go n.run()
-		go n.applyLoop()
-		for _, p := range n.peers {
-			go n.replicateTo(p)
-		}
-	} else {
-		n.wg.Add(2)
-		go n.run()
-		go n.applyLoop()
+	n.electionResetCh = make(chan struct{}, 1)
+
+	n.wg.Add(4 + len(n.peers))
+	go n.run()
+	go n.applyLoop()
+	go n.electionTimer()
+	go n.heartbeatTicker()
+	for _, p := range n.peers {
+		go n.replicateTo(p)
 	}
+
+	// The bootstrap leader asserts leadership immediately (note: fires the
+	// first heartbeat so followers don't time out at term 2).
+	n.raftMu.Lock()
+	if n.role == Leader {
+		n.becomeLeaderLocked()
+	}
+	n.raftMu.Unlock()
 }
 
 func (n *Node) stop() {
@@ -106,8 +150,10 @@ func (n *Node) signalApply() {
 	}
 }
 
-// run drains the inbox. A follower handles AppendEntries; the leader routes
-// each AppendResponse to the owning follower's replication goroutine.
+// run drains the inbox and dispatches by message type. Every node handles
+// AppendEntries and RequestVote (to follow / vote/ step down); a leader also
+// routes AppendedResponses to the owning follower's replicator; a candidate
+// tallies vote responses.
 func (n *Node) run() {
 	defer n.wg.Done()
 	for {
@@ -118,10 +164,14 @@ func (n *Node) run() {
 			switch m.Type {
 			case MsgAppendEntries:
 				n.handleAppendEntries(m)
+			case MsgRequestVote:
+				n.handleRequestVote(m)
+			case MsgRequestVoteResponse:
+				n.handleVoteResponse(m)
 			case MsgAppendResponse:
-				// Route to the follower's replication goroutine. Reliable
-				// (no drop): with one AppendEntries in flight per follower,
-				// dropping a response would stall that follower forever.
+				// Route to the follower's replicator. Reliable (no drop): with
+				// one AppendEntries in flight per follower, dropping a response
+				// would stall it forever.
 				ch := n.respCh[m.From]
 				if ch == nil {
 					continue
@@ -136,41 +186,63 @@ func (n *Node) run() {
 	}
 }
 
-// handleAppendEntries is the follower side of replication. On a prev-log
-// mismatch it rejects with a back-up hint and touches neither the WAL nor the
-// log. On a match it durably appends only the genuinely-new suffix (so WALs
-// stay byte-identical across nodes), advances its commit index, and wakes its
-// apply loop — apply itself stays deferred to the apply loop.
+// handleAppendEntries is the follower side of replication. It adopts a higher
+// term (stepping down), rejects a stale leader (so that leader steps down),
+// reverts a candidate to follower, and resets its election timer. On a prev-log
+// match it durably appends the genuinely-new suffix — truncating a conflicting
+// suffix first — advances its commit index, and wakes its apply loop.
 func (n *Node) handleAppendEntries(m Message) {
 	n.raftMu.Lock()
+	if m.Term < n.currentTerm {
+		term := n.currentTerm
+		n.raftMu.Unlock()
+		_ = n.transport.Send(m.From, Message{
+			Type: MsgAppendResponse, From: n.id, Term: term, Success: false,
+		})
+		return
+	}
+	if m.Term > n.currentTerm {
+		n.stepDownLocked(m.Term)
+	}
+	n.role = Follower // a current-term leader exists; defer to it
+	n.resetElectionTimer()
+	term := n.currentTerm
+
 	if !n.log.matchesPrev(m.PrevLogIndex, m.PrevLogTerm) {
 		hint := n.log.lastIndex() + 1
 		n.raftMu.Unlock()
 		_ = n.transport.Send(m.From, Message{
-			Type: MsgAppendResponse, From: n.id, Term: currentTerm,
+			Type: MsgAppendResponse, From: n.id, Term: term,
 			Success: false, ConflictHint: hint,
 		})
 		return
 	}
-	// Entries cover indices PrevLogIndex+1, +2, ... Keep only those past our
-	// current end; ones we already hold are skipped (idempotent — under a
-	// fixed leader an existing index always carries the same term).
-	last := n.log.lastIndex()
-	var toAppend [][]byte
+
+	// Genuinely-new suffix, truncating a conflicting one first. Truncation only
+	// ever removes UNCOMMITTED (hence unapplied) entries: the up-to-date vote
+	// rule guarantees a committed entry sits in every future leader's log and
+	// so is never the loser of a conflict. (The on-disk WAL does not yet reflect
+	// truncation; the in-memory log we serve and replicate from is correct.)
+	var toAppend []Entry
 	for i, e := range m.Entries {
-		if m.PrevLogIndex+uint64(i)+1 > last {
-			toAppend = append(toAppend, e)
+		idx := m.PrevLogIndex + uint64(i) + 1
+		if idx <= n.log.lastIndex() {
+			if n.log.term(idx) == e.Term {
+				continue // already have this exact entry (idempotent)
+			}
+			n.log.truncateFrom(idx) // conflict: drop this and everything after
 		}
+		toAppend = append(toAppend, e)
 	}
 	matchIndex := m.PrevLogIndex + uint64(len(m.Entries))
 	n.raftMu.Unlock()
 
 	// Durably append the new suffix (each call takes db.mu) outside raftMu.
 	for _, e := range toAppend {
-		if err := n.store.AppendToLog(e); err != nil {
+		if err := n.store.AppendToLog(e.Data); err != nil {
 			_ = n.transport.Send(m.From, Message{
-				Type: MsgAppendResponse, From: n.id, Term: currentTerm,
-				Success: false, ConflictHint: n.lastIndex() + 1,
+				Type: MsgAppendResponse, From: n.id, Term: term,
+				Success: false, ConflictHint: m.PrevLogIndex + 1,
 			})
 			return
 		}
@@ -178,20 +250,21 @@ func (n *Node) handleAppendEntries(m Message) {
 
 	n.raftMu.Lock()
 	for _, e := range toAppend {
-		n.log.append(currentTerm, e)
+		n.log.append(e.Term, e.Data)
 	}
-	ci := m.LeaderCommit
-	if li := n.log.lastIndex(); ci > li {
-		ci = li
-	}
-	if ci > n.commitIndex {
-		n.commitIndex = ci
+	if ci := m.LeaderCommit; ci > n.commitIndex {
+		if li := n.log.lastIndex(); ci > li {
+			ci = li
+		}
+		if ci > n.commitIndex {
+			n.commitIndex = ci
+		}
 	}
 	n.raftMu.Unlock()
 	n.signalApply()
 
 	_ = n.transport.Send(m.From, Message{
-		Type: MsgAppendResponse, From: n.id, Term: currentTerm,
+		Type: MsgAppendResponse, From: n.id, Term: term,
 		Success: true, MatchIndex: matchIndex,
 	})
 }
@@ -220,7 +293,6 @@ func (n *Node) applyCommitted() {
 		entry := n.log.entryAt(idx)
 		n.raftMu.Unlock()
 
-		// Apply outside raftMu (ApplyEntry takes db.mu).
 		if err := n.store.ApplyEntry(entry); err != nil {
 			panic(fmt.Sprintf("cluster: node %d apply entry %d: %v", n.id, idx, err))
 		}
@@ -232,20 +304,29 @@ func (n *Node) applyCommitted() {
 	}
 }
 
-// commit is the leader's commitOverride. It prepares the txn, appends the
-// entry to its log, wakes the replication goroutines, and waits for its own
-// apply before returning. commitMu serializes commits so PrepareCommit always
-// sees the previous commit applied.
+// commit is the leader's commitOverride (installed on every node, so a write
+// to a non-leader fails cleanly rather than taking the single-node path). It
+// prepares the txn, appends to its log, wakes the replicators, and waits for
+// its own apply. It returns ErrNotLeader if this node is not the leader or
+// stepped down before the entry committed.
 func (n *Node) commit(t *db.Txn) error {
 	n.commitMu.Lock()
 	defer n.commitMu.Unlock()
+
+	n.raftMu.Lock()
+	if n.role != Leader {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	term := n.currentTerm
+	n.raftMu.Unlock()
 
 	entry, _, err := n.store.PrepareCommit(t)
 	if err != nil {
 		return err
 	}
 	if entry == nil {
-		return nil // empty txn: nothing to replicate
+		return nil // empty txn
 	}
 
 	if err := n.store.AppendToLog(entry); err != nil {
@@ -253,42 +334,54 @@ func (n *Node) commit(t *db.Txn) error {
 	}
 
 	n.raftMu.Lock()
-	idx := n.log.append(currentTerm, entry)
-	// Drive the commit index ourselves: for n=1 there are no replication
-	// goroutines to advance it, so this commits immediately; for n>1 the
-	// followers' matchIndex are still behind, so this is a no-op until their
-	// responses arrive.
-	n.maybeAdvanceCommitLocked()
+	// Re-check leadership: we may have stepped down during PrepareCommit /
+	// AppendToLog. (The entry is now an orphan in our WAL; harmless while
+	// running — it is not in the in-memory log — will be reconciled by recovery.)
+	if n.role != Leader || n.currentTerm != term {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	idx := n.log.append(term, entry)
+	n.maybeAdvanceCommitLocked() // commits immediately at n=1; no-op otherwise
 	n.raftMu.Unlock()
 
 	n.signalReplicators()
 
-	// Wait until our apply loop has applied this entry, so the write is
-	// visible to subsequent reads on the leader before Commit returns.
 	n.raftMu.Lock()
-	for n.lastApplied < idx {
+	defer n.raftMu.Unlock()
+	for {
+		if n.lastApplied >= idx {
+			// Quorum'd and applied — a real commit, even if we step down next.
+			return nil
+		}
+		if n.role != Leader {
+			return ErrNotLeader
+		}
 		n.appliedCond.Wait()
 	}
-	n.raftMu.Unlock()
-	return nil
 }
 
-// Cluster is a fixed-leader replication group over a transport.
+// Cluster is a Raft replication group over a transport.
 type Cluster struct {
 	transport Transport
 	nodes     []*Node
-	leader    NodeID
 }
 
-// New creates an n-node cluster with node 0 as the fixed leader, over an
-// in-process channel transport. dirs must have length n.
+// New creates an n-node cluster with default timers over an in-process channel
+// transport. dirs must have length n.
 func New(n int, dirs []string, opts db.Options) (*Cluster, error) {
-	return NewWithTransport(n, dirs, opts, NewChannelTransport())
+	return NewWithTransportConfig(n, dirs, opts, NewChannelTransport(), DefaultConfig())
 }
 
-// NewWithTransport is New with a caller-supplied transport, allowing tests to
-// interpose on message delivery (and, later, a network transport).
+// NewWithTransport is New with a caller-supplied transport and default timers.
 func NewWithTransport(n int, dirs []string, opts db.Options, tr Transport) (*Cluster, error) {
+	return NewWithTransportConfig(n, dirs, opts, tr, DefaultConfig())
+}
+
+// NewWithTransportConfig is the full constructor: caller-supplied transport and
+// timer config. Node 0 bootstraps as leader at term 1; the others start as
+// followers and elect a successor if it fails.
+func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport, cfg Config) (*Cluster, error) {
 	if n < 1 {
 		return nil, errors.New("cluster: need at least one node")
 	}
@@ -300,7 +393,7 @@ func NewWithTransport(n int, dirs []string, opts db.Options, tr Transport) (*Clu
 		tr.Register(NodeID(i))
 	}
 
-	c := &Cluster{transport: tr, leader: 0}
+	c := &Cluster{transport: tr}
 	for i := 0; i < n; i++ {
 		store, err := db.OpenWith(dirs[i], opts)
 		if err != nil {
@@ -314,51 +407,113 @@ func NewWithTransport(n int, dirs []string, opts db.Options, tr Transport) (*Clu
 			}
 		}
 		nd := &Node{
-			id:        NodeID(i),
-			store:     store,
-			transport: tr,
-			peers:     peers,
-			isLeader:  NodeID(i) == c.leader,
-			inbox:     tr.Inbox(NodeID(i)),
-			quit:      make(chan struct{}),
-			log:       NewRaftLog(),
+			id:          NodeID(i),
+			store:       store,
+			transport:   tr,
+			peers:       peers,
+			cfg:         cfg,
+			inbox:       tr.Inbox(NodeID(i)),
+			quit:        make(chan struct{}),
+			log:         NewRaftLog(),
+			role:        Follower,
+			currentTerm: 1,
+			votedFor:    noVote,
+			nextIndex:   make(map[NodeID]uint64, len(peers)),
+			matchIndex:  make(map[NodeID]uint64, len(peers)),
+			respCh:      make(map[NodeID]chan Message, len(peers)),
+			replSignal:  make(map[NodeID]chan struct{}, len(peers)),
 		}
-		if nd.isLeader {
-			nd.nextIndex = make(map[NodeID]uint64, len(peers))
-			nd.matchIndex = make(map[NodeID]uint64, len(peers))
-			nd.respCh = make(map[NodeID]chan Message, len(peers))
-			nd.replSignal = make(map[NodeID]chan struct{}, len(peers))
-			for _, p := range peers {
-				nd.nextIndex[p] = nd.log.lastIndex() + 1 // empty log => 1
-				nd.matchIndex[p] = 0
-				nd.respCh[p] = make(chan Message, 1)
-				nd.replSignal[p] = make(chan struct{}, 1)
-			}
+		for _, p := range peers {
+			nd.nextIndex[p] = 1
+			nd.matchIndex[p] = 0
+			nd.respCh[p] = make(chan Message, 1)
+			nd.replSignal[p] = make(chan struct{}, 1)
 		}
+		if NodeID(i) == bootstrapLeader {
+			nd.role = Leader
+			nd.votedFor = bootstrapLeader // term-1 self-vote
+		}
+		// Every node's DB delegates Txn.Commit to its node, which checks
+		// leadership — so a write to a non-leader fails with ErrNotLeader rather
+		// than silently committing locally.
+		nd.store.SetCommitOverride(nd.commit)
 		c.nodes = append(c.nodes, nd)
 	}
 
-	// Install the leader's commit orchestration, then start every node.
-	leaderNode := c.nodes[c.leader]
-	leaderNode.store.SetCommitOverride(leaderNode.commit)
 	for _, nd := range c.nodes {
 		nd.start()
 	}
 	return c, nil
 }
 
-func (c *Cluster) leaderNode() *Node { return c.nodes[c.leader] }
+// currentLeader returns the node that currently believes it is leader at the
+// highest term, if any.
+func (c *Cluster) currentLeader() (*Node, bool) {
+	var best *Node
+	var bestTerm uint64
+	for _, nd := range c.nodes {
+		nd.raftMu.Lock()
+		isLeader := nd.role == Leader
+		term := nd.currentTerm
+		nd.raftMu.Unlock()
+		if isLeader && (best == nil || term > bestTerm) {
+			best, bestTerm = nd, term
+		}
+	}
+	return best, best != nil
+}
 
-// Put routes a write to the leader, which replicates it before returning.
-func (c *Cluster) Put(key, value []byte) error { return c.leaderNode().store.Put(key, value) }
+func (c *Cluster) leaderNode() *Node {
+	if ld, ok := c.currentLeader(); ok {
+		return ld
+	}
+	return c.nodes[0]
+}
 
-// Delete routes a delete to the leader.
-func (c *Cluster) Delete(key []byte) error { return c.leaderNode().store.Delete(key) }
+// withLeader runs fn against the current leader, retrying (through an election)
+// while there is no leader or fn reports ErrNotLeader, up to routeTimeout.
+func (c *Cluster) withLeader(fn func(*Node) error) error {
+	deadline := time.Now().Add(routeTimeout)
+	for {
+		if ld, ok := c.currentLeader(); ok {
+			if err := fn(ld); !errors.Is(err, ErrNotLeader) {
+				return err
+			}
+		}
+		if time.Now().After(deadline) {
+			return ErrNotLeader
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
 
-// Get reads from the leader (linearizable). Follower reads are a future add.
-func (c *Cluster) Get(key []byte) ([]byte, error) { return c.leaderNode().store.Get(key) }
+// Put routes a write to the current leader, retrying across leadership changes.
+func (c *Cluster) Put(key, value []byte) error {
+	return c.withLeader(func(ld *Node) error { return ld.store.Put(key, value) })
+}
 
-// Begin starts a transaction on the leader; its Commit drives replication.
+// Delete routes a delete to the current leader, retrying across changes.
+func (c *Cluster) Delete(key []byte) error {
+	return c.withLeader(func(ld *Node) error { return ld.store.Delete(key) })
+}
+
+// Get reads from the current leader, retrying across leadership changes.
+func (c *Cluster) Get(key []byte) ([]byte, error) {
+	var out []byte
+	err := c.withLeader(func(ld *Node) error {
+		v, e := ld.store.Get(key)
+		if e != nil {
+			return e
+		}
+		out = v
+		return nil
+	})
+	return out, err
+}
+
+// Begin starts a transaction on the current leader. A user-held Txn that spans
+// a leadership change will get ErrNotLeader from Commit (no transparent retry —
+// the snapshot is tied to the node it began on).
 func (c *Cluster) Begin() *db.Txn { return c.leaderNode().store.Begin() }
 
 // Node returns the i-th node, for inspection and tests.
@@ -367,13 +522,16 @@ func (c *Cluster) Node(i int) *Node { return c.nodes[i] }
 // Size returns the node count.
 func (c *Cluster) Size() int { return len(c.nodes) }
 
-// Leader returns the leader's id.
-func (c *Cluster) Leader() NodeID { return c.leader }
+// Leader returns the current leader's id, or the bootstrap node if none.
+func (c *Cluster) Leader() NodeID {
+	if ld, ok := c.currentLeader(); ok {
+		return ld.id
+	}
+	return bootstrapLeader
+}
 
-// Quiesce waits until every node has applied through the leader's commit
-// index, or the timeout elapses. The leader returns to the client once a
-// majority has the entry logged and it has applied locally, so minority
-// followers may still be draining their inboxes.
+// Quiesce waits until every node has applied through the current leader's
+// commit index, or the timeout elapses.
 func (c *Cluster) Quiesce(timeout time.Duration) error {
 	target := c.leaderNode().commitIndexValue()
 	deadline := time.Now().Add(timeout)

@@ -88,7 +88,7 @@ func TestFollowerDefersApplyUntilCommit(t *testing.T) {
 	gate := newGateTransport(func(to NodeID, m Message) bool {
 		return to == 0 && m.Type == MsgAppendResponse
 	})
-	c, err := NewWithTransport(n, dirs(t, n), testOpts(), gate)
+	c, err := NewWithTransportConfig(n, dirs(t, n), testOpts(), gate, stableConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

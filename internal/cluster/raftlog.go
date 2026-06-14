@@ -1,11 +1,5 @@
 package cluster
 
-// currentTerm is the fixed Raft term: with a single fixed leader and no
-// election, every entry is created in term 1. Real per-entry terms and their
-// persistence (introduced alongside leader election) live behind this
-// constant, so the seam is in one place.
-const currentTerm uint64 = 1
-
 // logEntry is one Raft log entry: a committed transaction's encoded records
 // (data records terminated by an OpCommit marker, all at one timestamp),
 // tagged with the term in which the leader created it.
@@ -27,6 +21,9 @@ func NewRaftLog() *RaftLog { return &RaftLog{} }
 
 // lastIndex returns the highest index present, or 0 if the log is empty.
 func (l *RaftLog) lastIndex() uint64 { return uint64(len(l.entries)) }
+
+// lastTerm returns the term of the last entry, or 0 if the log is empty.
+func (l *RaftLog) lastTerm() uint64 { return l.term(l.lastIndex()) }
 
 // has reports whether idx refers to a present entry (1..lastIndex). Index 0,
 // the empty-log sentinel used by prevLogIndex checks, is always "present".

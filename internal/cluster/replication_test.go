@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,15 +12,16 @@ import (
 // TestReplicationOutOfOrderAcks holds one follower's responses while two
 // writes commit on the leader-plus-other-follower majority. The leader does
 // not wait for the held follower; the majority follower applies via the
-// heartbeat that carries the advanced leaderCommit. When the held responses
-// are finally released — after the commit index has already moved past them
-// — they are absorbed idempotently and the straggler converges.
+// heartbeat that carries the advanced leaderCommit (the new path Option A
+// introduces). When the held responses are finally released — after the commit
+// index has already moved past them — they are absorbed idempotently and the
+// straggler converges.
 func TestReplicationOutOfOrderAcks(t *testing.T) {
 	const n = 3
 	gate := newGateTransport(func(to NodeID, m Message) bool {
 		return to == 0 && m.From == 2 && m.Type == MsgAppendResponse // hold node 2's acks
 	})
-	c, err := NewWithTransport(n, dirs(t, n), testOpts(), gate)
+	c, err := NewWithTransportConfig(n, dirs(t, n), testOpts(), gate, stableConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +67,7 @@ func TestReplicationSlowFollowerCatchUp(t *testing.T) {
 	gate := newGateTransport(func(to NodeID, m Message) bool {
 		return to == 2 && m.Type == MsgAppendEntries // node 2 hears nothing
 	})
-	c, err := NewWithTransport(n, dirs(t, n), testOpts(), gate)
+	c, err := NewWithTransportConfig(n, dirs(t, n), testOpts(), gate, stableConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +101,7 @@ func TestReplicationSlowFollowerCatchUp(t *testing.T) {
 // consistency check directly: an AppendEntries whose prevLogIndex is past the
 // follower's log can't match, so the follower rejects with a back-up hint and
 // touches neither its WAL nor its log. This is the consistency check that
-// becomes load-bearing once elections produce real divergence.
+// becomes load-bearing once Week 3's elections produce real divergence.
 func TestAppendEntriesRejectsAheadPrevLog(t *testing.T) {
 	tr := NewChannelTransport()
 	tr.Register(0) // captures the follower's response
@@ -113,12 +115,15 @@ func TestAppendEntriesRejectsAheadPrevLog(t *testing.T) {
 	f := &Node{
 		id: 1, store: store, transport: tr, peers: []NodeID{0},
 		inbox: tr.Inbox(1), quit: make(chan struct{}), log: NewRaftLog(),
+		role: Follower, currentTerm: term1, votedFor: noVote,
+		electionResetCh: make(chan struct{}, 1),
 	}
+	f.appliedCond = sync.NewCond(&f.raftMu)
 
 	// Empty follower log; prevLogIndex 3 cannot match.
 	f.handleAppendEntries(Message{
-		Type: MsgAppendEntries, From: 0, Term: currentTerm,
-		PrevLogIndex: 3, PrevLogTerm: currentTerm,
+		Type: MsgAppendEntries, From: 0, Term: term1,
+		PrevLogIndex: 3, PrevLogTerm: term1,
 	})
 
 	resp := <-tr.Inbox(0)

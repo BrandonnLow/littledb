@@ -23,9 +23,18 @@ func testOpts() db.Options {
 	return db.Options{SyncOnWrite: false, DisableBackgroundCompaction: true}
 }
 
+// stableConfig keeps the bootstrap leader in charge for the duration of a
+// (short) non-election test: heartbeats are frequent and the election timeout
+// is far longer than any such test runs, so no follower ever stands for
+// election even if a test starves one node of heartbeats. Election behavior is
+// exercised separately with fast timers in election_test.go.
+func stableConfig() Config {
+	return Config{ElectionMin: 10 * time.Second, ElectionMax: 20 * time.Second, Heartbeat: 50 * time.Millisecond}
+}
+
 func newCluster(t *testing.T, n int) *Cluster {
 	t.Helper()
-	c, err := New(n, dirs(t, n), testOpts())
+	c, err := NewWithTransportConfig(n, dirs(t, n), testOpts(), NewChannelTransport(), stableConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,8 +141,9 @@ func TestClusterDeleteReplicates(t *testing.T) {
 
 // TestClusterCommitWaitsForMajority verifies the Raft guarantee on return.
 // Under deferred apply, followers append (and ack) an entry on receipt but
-// apply it only once the leader's commit index reaches them (a later
-// MsgCommit), so the count of nodes that have *applied* the write right after
+// apply it only once the leader's commit index reaches them (carried by a
+// later AppendEntries' leaderCommit), so the count of nodes that have *applied*
+// the write right after
 // Put returns may be only the leader. What a quorum is guaranteed to hold on
 // return is the entry in its *log*; the leader additionally has it applied.
 func TestClusterCommitWaitsForMajority(t *testing.T) {
