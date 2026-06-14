@@ -15,7 +15,7 @@ const walFile = "littledb.log"
 func TestClusterFollowerWALByteIdentical(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
-	c, err := New(n, ds, testOpts())
+	c, err := NewWithTransportConfig(n, ds, testOpts(), NewChannelTransport(), stableConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestClusterFollowerWALByteIdentical(t *testing.T) {
 func TestClusterNodeRecoversFromDisk(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
-	c, err := New(n, ds, db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true})
+	c, err := NewWithTransportConfig(n, ds, db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true}, NewChannelTransport(), stableConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

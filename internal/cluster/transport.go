@@ -1,10 +1,12 @@
-// Package cluster replicates a db.DB across N in-process nodes: a single
-// fixed leader appends each committed transaction to a Raft-style log,
-// replicates it to followers via AppendEntries, and advances a commit index
-// once a quorum has it. Appending to the log and applying to the state machine
-// (the memtable) are separate steps: an entry is appended on receipt but
-// applied only once known committed (carried by a later AppendEntries'
-// leaderCommit). Fixed leader, no election.
+// Package cluster replicates a db.DB across N in-process nodes using Raft.
+// A leader appends each committed transaction to a Raft-style log, replicates
+// it to followers via AppendEntries, and advances a commit index once a quorum
+// has it. Appending to the log and applying to the state machine (the
+// memtable) are separate: an entry is appended on receipt but applied only
+// once known committed (carried by a later AppendEntries' leaderCommit).
+// Leadership is elected: a randomized election timeout makes a follower stand
+// for election, terms order leadership, and a node steps down on seeing a
+// higher term. Node 0 bootstraps as leader at term 1.
 package cluster
 
 import (
@@ -19,34 +21,56 @@ type NodeID int
 type MsgType int
 
 const (
-	// MsgAppendEntries is the leader's replication RPC: it carries zero or
-	// more log entries to append after (PrevLogIndex, PrevLogTerm), plus the
-	// leader's commit index. Zero entries makes it a heartbeat that only
-	// propagates LeaderCommit.
+	// MsgAppendEntries is the leader's replication / heartbeat RPC: zero or
+	// more entries to append after (PrevLogIndex, PrevLogTerm), plus the
+	// leader's commit index. Zero entries makes it a pure heartbeat.
 	MsgAppendEntries MsgType = iota
 	// MsgAppendResponse is a follower's reply: Success with the MatchIndex it
-	// now holds, or a rejection with a ConflictHint telling the leader where
-	// to back up.
+	// now holds, or a rejection with a ConflictHint, or a Term higher than the
+	// leader's (telling the leader to step down).
 	MsgAppendResponse
+	// MsgRequestVote is a candidate's request for a vote.
+	MsgRequestVote
+	// MsgRequestVoteResponse is a voter's reply: VoteGranted or not, plus its
+	// term so a stale candidate steps down.
+	MsgRequestVoteResponse
 )
 
-// Message is a single inter-node message. Fields are grouped by direction;
-// only those relevant to Type are set.
+// Entry is one log entry on the wire: the encoded transaction bytes plus the
+// term in which its leader created it. The term must travel with the entry so
+// a follower can store it correctly and detect a conflicting (same-index,
+// different-term) entry during divergence repair.
+type Entry struct {
+	Term uint64
+	Data []byte
+}
+
+// Message is a single inter-node message. Fields are grouped by message type;
+// only those relevant to Type are set. Term is the sender's currentTerm on
+// every message and drives election / step-down.
 type Message struct {
 	Type MsgType
 	From NodeID
-	Term uint64 // currentTerm; carried for election readiness
+	Term uint64
 
 	// MsgAppendEntries (leader -> follower):
 	PrevLogIndex uint64
 	PrevLogTerm  uint64
-	Entries      [][]byte // read-only; the follower copies what it keeps
+	Entries      []Entry // read-only; the follower copies what it keeps
 	LeaderCommit uint64
 
 	// MsgAppendResponse (follower -> leader):
 	Success      bool
 	MatchIndex   uint64 // on success: highest index the follower now holds
 	ConflictHint uint64 // on reject: index the leader should set nextIndex to
+
+	// MsgRequestVote (candidate -> peers):
+	CandidateID  NodeID
+	LastLogIndex uint64
+	LastLogTerm  uint64
+
+	// MsgRequestVoteResponse (voter -> candidate):
+	VoteGranted bool
 }
 
 // Transport delivers messages between nodes. The Raft invariants are

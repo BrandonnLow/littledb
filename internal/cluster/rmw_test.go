@@ -31,7 +31,7 @@ func TestLeaderRMWSnapshotConflict(t *testing.T) {
 	})
 	gate.setHolding(false) // ...but not during setup
 
-	c, err := NewWithTransport(n, dirs(t, n), testOpts(), gate)
+	c, err := NewWithTransportConfig(n, dirs(t, n), testOpts(), gate, stableConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
