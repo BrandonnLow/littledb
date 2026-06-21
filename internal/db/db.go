@@ -388,8 +388,11 @@ func (db *DB) flushLocked() error {
 
 	// Record the new WAL's base index AFTER the new WAL exists. Ordering
 	// (SSTable -> remove old WAL -> new WAL -> base) keeps recovery's
-	// max(footer, base+walCount) correct in every crash window. A lost base
-	// write is harmless: max() falls back to the footer.
+	// max(footer, base+walCount) correct in every crash window. writeAppliedBase
+	// fsyncs the file and the directory: the base must be durable before any
+	// post-flush commit can append to the new WAL, or recovery under-counts and
+	// re-applies (see writeAppliedBase). This runs under db.mu before flushLocked
+	// returns, so no apply can interleave before the base is on disk.
 	if err := writeAppliedBase(db.dir, db.appliedIndex); err != nil {
 		return err
 	}
@@ -502,17 +505,53 @@ func readAppliedBase(dir string) (uint64, error) {
 	return binary.LittleEndian.Uint64(buf), nil
 }
 
-// writeAppliedBase records the new WAL's base index after a flush. Not
-// safety-critical: a lost write only makes recovery fall back to the SSTable
-// footer via the max(), which is still correct.
+// writeAppliedBase records the new WAL's base index after a flush, durably:
+// write a temp file, fsync it, rename it over the real name, then fsync the
+// directory so the rename survives a crash. Durability is required, not
+// best-effort: once a post-flush commit lands in the new WAL, recovery computes
+// walBase + walOpCommits, so a lost base resolves BELOW the footer, max() picks
+// the footer, and recovery UNDER-counts lastApplied — re-applying entries the
+// data WAL already holds (the duplicate-apply bug). flushLocked calls this
+// before returning, so the base is durable before any later apply can append to
+// the new WAL.
 func writeAppliedBase(dir string, base uint64) error {
 	var buf [8]byte
 	binary.LittleEndian.PutUint64(buf[:], base)
 	tmp := filepath.Join(dir, appliedBaseFilename+".tmp")
-	if err := os.WriteFile(tmp, buf[:], 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return fmt.Errorf("db: write applied base: %w", err)
 	}
-	return os.Rename(tmp, filepath.Join(dir, appliedBaseFilename))
+	if _, err := f.Write(buf[:]); err != nil {
+		f.Close()
+		return fmt.Errorf("db: write applied base: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("db: sync applied base: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("db: close applied base: %w", err)
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, appliedBaseFilename)); err != nil {
+		return fmt.Errorf("db: rename applied base: %w", err)
+	}
+	// The rename creates a new directory entry; fsync the dir to make it durable.
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("db: sync dir after applied base: %w", err)
+	}
+	return nil
+}
+
+// syncDir fsyncs the directory so a just-created or renamed entry within it is
+// durable. Mirrors the helpers in the wal and sstable packages.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // ApplyEntry durably records a committed entry's records to the WAL (identical

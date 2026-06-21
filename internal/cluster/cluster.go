@@ -221,20 +221,27 @@ func (n *Node) handleAppendEntries(m Message) {
 		return
 	}
 
-	// Genuinely-new suffix, truncating a conflicting one first. Truncation only
-	// ever removes UNCOMMITTED (hence unapplied) entries: the §5.4.1 up-to-date
-	// vote rule guarantees a committed entry sits in every future leader's log
-	// and so is never the loser of a conflict. The truncation reaches disk via
-	// the Raft log file (rare path, fsync under raftMu is fine); the data WAL is
-	// untouched because it holds only applied entries, which never truncate.
-	var toAppend []Entry
+	// Append the genuinely-new suffix, truncating a conflicting one first. The
+	// Raft log file and the in-memory log are mutated TOGETHER under raftMu, so
+	// the file can never lead the in-memory log: no orphan tail accumulates and a
+	// retry can't duplicate one — the file's contents are always exactly the
+	// in-memory log. (The earlier design appended the file unlocked, then
+	// re-checked and appended memory; a step-down in that gap left the file one
+	// suffix ahead, and truncation keyed on the in-memory length could never
+	// reach it, so a retry re-appended and the file grew [..4,5,4,5].) The
+	// append/truncate fsync eagerly, so an entry is durable before the commit
+	// index can advance over it and apply it. Truncation only removes UNCOMMITTED
+	// (unapplied) entries: §5.4.1's up-to-date vote rule keeps every committed
+	// entry in every future leader's log, so it never loses a conflict; the data
+	// WAL is untouched, holding only applied entries that never truncate.
 	for i, e := range m.Entries {
 		idx := m.PrevLogIndex + uint64(i) + 1
 		if idx <= n.log.lastIndex() {
 			if n.log.term(idx) == e.Term {
 				continue // already have this exact entry (idempotent)
 			}
-			n.log.truncateFrom(idx) // conflict: drop this and everything after
+			// Conflict: drop this index and everything after from both logs, the
+			// file first so a failure leaves it no shorter than the in-memory log.
 			if n.logFile != nil {
 				if err := n.logFile.truncateFrom(idx); err != nil {
 					cur := n.currentTerm
@@ -246,51 +253,22 @@ func (n *Node) handleAppendEntries(m Message) {
 					return
 				}
 			}
+			n.log.truncateFrom(idx)
 		}
-		toAppend = append(toAppend, e)
-	}
-	matchIndex := m.PrevLogIndex + uint64(len(m.Entries))
-	n.raftMu.Unlock()
-
-	// Durably append the new suffix to the Raft log file outside raftMu — this
-	// is the hot path and its fsync must not serialize Raft progress behind disk
-	// latency. A mid-batch failure here (after a conflict truncation) leaves the
-	// in-memory log shorter than the file and missing the suffix; we reject so
-	// the leader retries from the hint and re-sends the whole suffix, which
-	// re-truncates and re-appends the file, healing both. Safe: only uncommitted
-	// entries are ever in flight here, and the data WAL is untouched.
-	for _, e := range toAppend {
 		if n.logFile != nil {
 			if err := n.logFile.append(e.Term, e.Data); err != nil {
+				cur := n.currentTerm
+				n.raftMu.Unlock()
 				_ = n.transport.Send(m.From, Message{
-					Type: MsgAppendResponse, From: n.id, Term: term,
+					Type: MsgAppendResponse, From: n.id, Term: cur,
 					Success: false, ConflictHint: m.PrevLogIndex + 1,
 				})
 				return
 			}
 		}
-	}
-
-	n.raftMu.Lock()
-	// A concurrent election can have bumped our term/role between the file
-	// append above and here (the election timer may fire the same instant we
-	// reset it). Don't apply under a changed term: reject with our current term
-	// so the now-stale sender steps down. The file-appended suffix stays as an
-	// uncommitted tail (never applied, so absent from the data WAL); a future
-	// leader either commits it or truncates it.
-	if n.role != Follower || n.currentTerm != term {
-		hint := n.log.lastIndex() + 1
-		cur := n.currentTerm
-		n.raftMu.Unlock()
-		_ = n.transport.Send(m.From, Message{
-			Type: MsgAppendResponse, From: n.id, Term: cur,
-			Success: false, ConflictHint: hint,
-		})
-		return
-	}
-	for _, e := range toAppend {
 		n.log.append(e.Term, e.Data)
 	}
+	matchIndex := m.PrevLogIndex + uint64(len(m.Entries))
 	if ci := m.LeaderCommit; ci > n.commitIndex {
 		if li := n.log.lastIndex(); ci > li {
 			ci = li
@@ -368,23 +346,23 @@ func (n *Node) commit(t *db.Txn) error {
 		return nil // empty txn
 	}
 
-	if n.logFile != nil {
-		if err := n.logFile.append(term, entry); err != nil {
-			return fmt.Errorf("cluster: leader append to raft log: %w", err)
-		}
-	}
-
 	n.raftMu.Lock()
-	// Re-check leadership: we may have stepped down during PrepareCommit / the
-	// log append. The entry is then an uncommitted tail in our Raft log file —
-	// durable, but absent from the in-memory log and unreplicated. It is never
-	// applied (commit never advances over it), so it never reaches the data WAL
-	// and cannot be resurrected on restart; a future leader commits or truncates
-	// it. The data WAL holds only applied entries, so recovery is commit-bounded
-	// by construction.
+	// Re-check leadership: we may have stepped down during PrepareCommit. Append
+	// to the Raft log file and the in-memory log TOGETHER under raftMu, so the
+	// file never leads the in-memory log — there is no orphan tail for a later
+	// commit (after a re-election) to blind-append onto and misalign. The append
+	// fsyncs eagerly, so the entry is durable before maybeAdvanceCommit can count
+	// it toward the commit index and apply it. If we stepped down we bail before
+	// touching either log; the entry is simply never created here.
 	if n.role != Leader || n.currentTerm != term {
 		n.raftMu.Unlock()
 		return ErrNotLeader
+	}
+	if n.logFile != nil {
+		if err := n.logFile.append(term, entry); err != nil {
+			n.raftMu.Unlock()
+			return fmt.Errorf("cluster: leader append to raft log: %w", err)
+		}
 	}
 	idx := n.log.append(term, entry)
 	n.maybeAdvanceCommitLocked() // commits immediately at n=1; no-op otherwise

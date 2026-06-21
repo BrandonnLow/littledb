@@ -95,9 +95,13 @@ func (lf *raftLogFile) load() ([]persistedEntry, error) {
 	return entries, nil
 }
 
-// append writes one entry, fsyncing if configured. Called UNLOCKED w.r.t.
-// raftMu: it is the hot replication path and must not serialize Raft progress
-// behind disk latency.
+// append writes one entry, fsyncing if configured. Called under raftMu, paired
+// with the in-memory RaftLog append so the file never diverges from memory. The
+// fsync happens here (eager) so an entry is durable before the commit index can
+// advance over it; this serializes Raft progress behind the fsync, the cost of
+// keeping the two logs trivially consistent. Lifting the fsync off raftMu needs
+// a separately-tracked durable index (matchIndex[self]) so the leader never
+// counts an unsynced entry toward commit — deferred.
 func (lf *raftLogFile) append(term uint64, data []byte) error {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
@@ -121,8 +125,9 @@ func (lf *raftLogFile) append(term uint64, data []byte) error {
 	return nil
 }
 
-// truncateFrom discards entry `index` and everything after it. Rare (divergence
-// repair only), so it may run under raftMu.
+// truncateFrom discards entry `index` and everything after it. Called under
+// raftMu, paired with the in-memory RaftLog truncation, so the file and memory
+// drop the same suffix atomically.
 func (lf *raftLogFile) truncateFrom(index uint64) error {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
