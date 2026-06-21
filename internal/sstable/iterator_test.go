@@ -19,7 +19,7 @@ type ver struct {
 func writeSST(t *testing.T, vers []ver) *Reader {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "000001.sst")
-	w, err := NewWriter(path, len(vers))
+	w, err := NewWriter(path, len(vers), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

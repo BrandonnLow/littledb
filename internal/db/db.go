@@ -1,13 +1,8 @@
 // Package db is the top-level littledb storage engine.
-//
-// MVCC reads. Each Put/Delete is assigned a logical timestamp from a monotonic counter;
-// multiple versions of a userKey coexist; reads ask for "the version as of snapshot T."
-//
-// The single-version Get(k) internally reads as-of the current write-counter value,
-// so it sees the latest committed version of k.
 package db
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -25,19 +20,16 @@ import (
 
 const (
 	walFilename              = "littledb.log"
+	appliedBaseFilename      = "applied.base"
 	defaultMemtableSizeMax   = 4 * 1024 * 1024
 	defaultCompactionTrigger = 4
 )
 
 var (
 	ErrKeyNotFound = errors.New("db: key not found")
-	// ErrConflict is returned by Txn.Commit when a concurrent
-	// transaction committed a write to one of this txn's keys between
-	// Begin and Commit. Snapshot isolation with first-committer-wins:
-	// the loser must Begin a fresh txn and retry. See Txn.Commit.
-	ErrConflict   = errors.New("db: transaction conflict")
-	errClosed     = errors.New("db: closed")
-	sstableNameRE = regexp.MustCompile(`^(\d{6})\.sst$`)
+	ErrConflict    = errors.New("db: transaction conflict")
+	errClosed      = errors.New("db: closed")
+	sstableNameRE  = regexp.MustCompile(`^(\d{6})\.sst$`)
 )
 
 type Options struct {
@@ -55,7 +47,6 @@ func DefaultOptions() Options {
 	}
 }
 
-// DB is an MVCC LSM-tree key-value store.
 type DB struct {
 	mu         sync.RWMutex
 	dir        string
@@ -67,13 +58,20 @@ type DB struct {
 	sstableIDs []int
 	nextID     int
 
-	// nextTimestamp is the next logical timestamp to assign on a write.
-	// Reads use its current value as their snapshot. Bumped on every
-	// Put/Delete while holding the write lock; readers capture it
-	// under the read lock alongside memtable/sstable pointers, which
-	// ensures a Get can never see a counter value > any
-	// not-yet-applied write.
 	nextTimestamp uint64
+
+	// appliedIndex is the highest Raft log index whose entry has been applied
+	// to this DB (memtable + SSTables). The cluster passes it to ApplyEntry; the
+	// DB stamps it into each SSTable footer at flush and into the post-flush WAL
+	// base, so a restart can reconstruct lastApplied across a flush (the LSM
+	// otherwise forgets log indices). Zero outside a replication cluster.
+	appliedIndex uint64
+
+	// recoveredApplied is the applied Raft index reconstructed at Open:
+	// max(highest SSTable footer appliedIndex, walBase + replayed OpCommit
+	// count). The cluster reads it via RecoveredAppliedIndex to seed
+	// commitIndex/lastApplied on restart.
+	recoveredApplied uint64
 
 	// appliedTS is the highest commit timestamp actually applied to the
 	// memtable. On a single-node DB and on followers it equals the highest
@@ -91,11 +89,6 @@ type DB struct {
 	// replication cluster). Set via SetCommitOverride.
 	commitOverride func(*Txn) error
 
-	// activeTxnMu protects activeTxns. It's a leaf mutex — never
-	// acquired while holding db.mu — so the watermark computation has
-	// to sample db.nextTimestamp under db.mu.RLock first and then
-	// iterate activeTxns under activeTxnsMu. The two-phase sampling
-	// is benign for correctness; see computeWaterMark.
 	activeTxnsMu sync.Mutex
 	activeTxns   map[*Txn]struct{}
 
@@ -125,6 +118,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	var ssts []*sstable.Reader
 	var sstIDsRev []int
 	var maxTS uint64
+	var maxFooterApplied uint64
 	for i := len(sstIDs) - 1; i >= 0; i-- {
 		id := sstIDs[i]
 		path := filepath.Join(dir, sstableFilename(id))
@@ -140,6 +134,9 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		if r.MaxTimestamp() > maxTS {
 			maxTS = r.MaxTimestamp()
 		}
+		if r.AppliedIndex() > maxFooterApplied {
+			maxFooterApplied = r.AppliedIndex()
+		}
 	}
 
 	w, err := wal.OpenWith(dir, wal.Options{SyncOnWrite: opts.SyncOnWrite})
@@ -151,12 +148,8 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	}
 
 	mt := memtable.New()
-	// Buffer pending records until we see their Opcommit. Records
-	// without a matching commit marker (an uncommitted partial txn at
-	// the WAL tail) are silently discarded — that's the atomicity
-	// guarantee. All records in `buffer` share a single timestamp,
-	// because txns serialize at commit time under the write lock.
 	var buffer []*record.Record
+	var walOpCommits uint64
 	err = w.Scan(func(offset int64, rec *record.Record) error {
 		if rec.Timestamp > maxTS {
 			maxTS = rec.Timestamp
@@ -165,6 +158,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		case record.OpPut, record.OpDelete:
 			buffer = append(buffer, rec)
 		case record.OpCommit:
+			walOpCommits++
 			for _, br := range buffer {
 				if br.Timestamp != rec.Timestamp {
 					return fmt.Errorf("db: replay: ts mismatch (data %d vs commit %d)",
@@ -201,6 +195,25 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		nextID = sstIDs[len(sstIDs)-1] + 1
 	}
 
+	// Reconstruct the applied Raft index across the flush boundary. walBase is
+	// the appliedIndex folded into SSTables at the last flush; the current WAL
+	// holds walOpCommits applied entries on top of it. The max() with the
+	// footer watermark survives the flush<->WAL-removal crash window, where the
+	// just-flushed entries sit in both the SSTable and the not-yet-removed WAL
+	// and both expressions resolve to the same index.
+	walBase, err := readAppliedBase(dir)
+	if err != nil {
+		w.Close()
+		for _, r := range ssts {
+			r.Close()
+		}
+		return nil, err
+	}
+	recoveredApplied := walBase + walOpCommits
+	if maxFooterApplied > recoveredApplied {
+		recoveredApplied = maxFooterApplied
+	}
+
 	db := &DB{
 		dir:           dir,
 		opts:          opts,
@@ -209,11 +222,19 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		sstables:      ssts,
 		sstableIDs:    sstIDsRev,
 		nextID:        nextID,
-		nextTimestamp: maxTS + 1, // first write gets at least 1
-		appliedTS:     maxTS,
-		activeTxns:    make(map[*Txn]struct{}),
-		compactCh:     make(chan struct{}, 1),
-		compactDoneCh: make(chan struct{}),
+		nextTimestamp: maxTS + 1,
+		// appliedTS is maxTS, not just the highest WAL commit: maxTS folds in
+		// the SSTable footers too, and after apply-all recovery everything
+		// committed is applied. An uncommitted WAL tail (discarded on a torn
+		// commit) can push maxTS past the true watermark, but harmlessly —
+		// nothing is committed in that gap and the next commit allocates a
+		// still-higher ts, so no conflict is missed or spuriously raised.
+		appliedTS:        maxTS,
+		appliedIndex:     recoveredApplied,
+		recoveredApplied: recoveredApplied,
+		activeTxns:       make(map[*Txn]struct{}),
+		compactCh:        make(chan struct{}, 1),
+		compactDoneCh:    make(chan struct{}),
 	}
 
 	if !opts.DisableBackgroundCompaction {
@@ -226,7 +247,6 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	return db, nil
 }
 
-// Put writes (key, value) at a freshly-allocated timestamp.
 func (db *DB) Put(key, value []byte) error {
 	t := db.Begin()
 	if err := t.Put(key, value); err != nil {
@@ -235,7 +255,6 @@ func (db *DB) Put(key, value []byte) error {
 	return t.Commit()
 }
 
-// Delete writes a tombstone at a freshly-allocated timestamp.
 func (db *DB) Delete(key []byte) error {
 	t := db.Begin()
 	if err := t.Delete(key); err != nil {
@@ -244,15 +263,12 @@ func (db *DB) Delete(key []byte) error {
 	return t.Commit()
 }
 
-// Get returns the latest committed version of key. Equivalent to
-// GetAsOf(key, current write counter).
 func (db *DB) Get(key []byte) ([]byte, error) {
 	db.mu.RLock()
 	if db.closed {
 		db.mu.RUnlock()
 		return nil, errClosed
 	}
-	// Capture counter + state under the lock atomically.
 	snapshot := db.nextTimestamp
 	activeMT := db.memtable
 	frozenMT := db.frozen
@@ -262,8 +278,6 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return db.getAsOfSnapshot(key, snapshot, activeMT, frozenMT, ssts)
 }
 
-// GetAsOf returns the version of key visible at snapshot. Exposed for
-// future transaction support and for testing MVCC semantics directly.
 func (db *DB) GetAsOf(key []byte, snapshot uint64) ([]byte, error) {
 	db.mu.RLock()
 	if db.closed {
@@ -325,14 +339,13 @@ func (db *DB) flushLocked() error {
 	id := db.nextID
 	path := filepath.Join(db.dir, sstableFilename(id))
 
-	w, err := sstable.NewWriter(path, db.frozen.Len())
+	w, err := sstable.NewWriter(path, db.frozen.Len(), db.appliedIndex)
 	if err != nil {
 		return err
 	}
 
 	var iterErr error
 	db.frozen.Iterate(func(userKey, value []byte, op memtable.Op, ts uint64) bool {
-		// memtable.Op and record.Op share byte values; the cast is safe.
 		if err := w.Add(record.Op(op), userKey, value, ts); err != nil {
 			iterErr = err
 			return false
@@ -346,12 +359,6 @@ func (db *DB) flushLocked() error {
 	if err := w.Finish(); err != nil {
 		return err
 	}
-
-	// At this point the SSTable (including its MaxTimestamp footer) is
-	// fully durable on disk via Finish's fsync + rename + syncDir.
-	// Only NOW is it safe to touch the WAL — if a crash had happened
-	// before Finish returned, the WAL would still hold the records
-	// and a subsequent Open would re-derive them.
 
 	r, err := sstable.OpenReader(path)
 	if err != nil {
@@ -378,6 +385,14 @@ func (db *DB) flushLocked() error {
 	db.sstableIDs = append([]int{id}, db.sstableIDs...)
 	db.frozen = nil
 	db.nextID++
+
+	// Record the new WAL's base index AFTER the new WAL exists. Ordering
+	// (SSTable -> remove old WAL -> new WAL -> base) keeps recovery's
+	// max(footer, base+walCount) correct in every crash window. A lost base
+	// write is harmless: max() falls back to the footer.
+	if err := writeAppliedBase(db.dir, db.appliedIndex); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -436,9 +451,6 @@ func (db *DB) FlushForTesting() error {
 	return nil
 }
 
-// NextTimestampForTesting returns the current value of the timestamp
-// counter (next-to-assign). Used by tests to capture a snapshot point
-// between writes.
 func (db *DB) NextTimestampForTesting() uint64 {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -470,39 +482,47 @@ func (db *DB) LastAppliedTS() uint64 {
 	return db.nextTimestamp - 1
 }
 
-// AppendToLog durably appends an entry's records to the WAL without applying
-// them to the memtable. This is the "append to the Raft log" half of a
-// replicated write: on the leader, its own committed-pending entry; on a
-// follower, an entry received via replication. The on-disk bytes are
-// identical to the leader's. Apply happens later, via ApplyEntry, once the
-// entry is known committed.
-func (db *DB) AppendToLog(entry []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	if db.closed {
-		return errClosed
+// RecoveredAppliedIndex returns the applied Raft index reconstructed at Open.
+// The cluster seeds commitIndex/lastApplied with it on restart.
+func (db *DB) RecoveredAppliedIndex() uint64 { return db.recoveredApplied }
+
+// readAppliedBase reads the post-flush WAL base index (the appliedIndex folded
+// into SSTables at the last flush). Absent file means no flush yet: base 0.
+func readAppliedBase(dir string) (uint64, error) {
+	buf, err := os.ReadFile(filepath.Join(dir, appliedBaseFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
 	}
-	offset := 0
-	for offset < len(entry) {
-		rec, n, err := record.Decode(entry[offset:])
-		if err != nil {
-			return fmt.Errorf("db: append to log: decode at %d: %w", offset, err)
-		}
-		if _, err := db.wal.Append(rec); err != nil {
-			return fmt.Errorf("db: append to log: wal append: %w", err)
-		}
-		offset += n
+	if err != nil {
+		return 0, fmt.Errorf("db: read applied base: %w", err)
 	}
-	return nil
+	if len(buf) < 8 {
+		return 0, nil // torn write; treat as absent (max() falls back to footer)
+	}
+	return binary.LittleEndian.Uint64(buf), nil
 }
 
-// ApplyEntry applies a committed entry's records to the memtable at their
-// embedded timestamps, advancing nextTimestamp. It does NOT touch the WAL —
-// the entry is already durable there via AppendToLog. This is the "apply to
-// the state machine" half, driven by the commit index. The entry must be a
-// valid txn: data records (OpPut/OpDelete) terminated by an OpCommit marker,
-// all sharing one timestamp.
-func (db *DB) ApplyEntry(entry []byte) error {
+// writeAppliedBase records the new WAL's base index after a flush. Not
+// safety-critical: a lost write only makes recovery fall back to the SSTable
+// footer via the max(), which is still correct.
+func writeAppliedBase(dir string, base uint64) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], base)
+	tmp := filepath.Join(dir, appliedBaseFilename+".tmp")
+	if err := os.WriteFile(tmp, buf[:], 0o644); err != nil {
+		return fmt.Errorf("db: write applied base: %w", err)
+	}
+	return os.Rename(tmp, filepath.Join(dir, appliedBaseFilename))
+}
+
+// ApplyEntry durably records a committed entry's records to the WAL (identical
+// framing to a single-node commit, so node WALs stay byte-identical) and
+// applies them to the memtable, marking this DB applied through Raft index idx.
+// The entry must be a valid txn: data records (OpPut/OpDelete) terminated by an
+// OpCommit marker, all sharing one timestamp. Driven by the commit index, this
+// is the only place a replicated write reaches the data WAL — so the WAL holds
+// only committed state and recovery is commit-bounded by construction.
+func (db *DB) ApplyEntry(idx uint64, entry []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
@@ -532,6 +552,21 @@ func (db *DB) ApplyEntry(entry []byte) error {
 			return fmt.Errorf("db: apply entry: ts mismatch (data %d vs marker %d)",
 				rec.Timestamp, commitTS)
 		}
+		if rec.Op != record.OpPut && rec.Op != record.OpDelete {
+			return fmt.Errorf("db: apply entry: unexpected op %d before marker", rec.Op)
+		}
+	}
+
+	// Durably append every record (data + marker) to the WAL before touching
+	// the memtable, exactly as a single-node commit does, so a follower's WAL is
+	// byte-identical to the leader's.
+	for _, rec := range recs {
+		if _, err := db.wal.Append(rec); err != nil {
+			return fmt.Errorf("db: apply entry: wal append: %w", err)
+		}
+	}
+
+	for _, rec := range recs[:len(recs)-1] {
 		switch rec.Op {
 		case record.OpPut:
 			if err := db.memtable.Put(rec.Key, rec.Value, rec.Timestamp); err != nil {
@@ -541,17 +576,17 @@ func (db *DB) ApplyEntry(entry []byte) error {
 			if err := db.memtable.Delete(rec.Key, rec.Timestamp); err != nil {
 				panic(fmt.Sprintf("db: memtable.Delete on apply entry (ts=%d): %v", rec.Timestamp, err))
 			}
-		default:
-			return fmt.Errorf("db: apply entry: unexpected op %d before marker", rec.Op)
 		}
 	}
 
 	if commitTS >= db.nextTimestamp {
 		db.nextTimestamp = commitTS + 1
 	}
-
 	if commitTS > db.appliedTS {
 		db.appliedTS = commitTS
+	}
+	if idx > db.appliedIndex {
+		db.appliedIndex = idx
 	}
 
 	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
@@ -563,36 +598,18 @@ func (db *DB) ApplyEntry(entry []byte) error {
 	return nil
 }
 
-// registerTxn adds t to the active set. Called from Begin.
 func (db *DB) registerTxn(t *Txn) {
 	db.activeTxnsMu.Lock()
 	db.activeTxns[t] = struct{}{}
 	db.activeTxnsMu.Unlock()
 }
 
-// unregisterTxn removes t from the active set. Called from Commit and
-// Rollback. Idempotent — removing an absent key is a no-op.
 func (db *DB) unregisterTxn(t *Txn) {
 	db.activeTxnsMu.Lock()
 	delete(db.activeTxns, t)
 	db.activeTxnsMu.Unlock()
 }
 
-// computeWatermark returns the minimum read snapshot across all
-// currently-active transactions, clamped above by the most recent
-// committed timestamp (nextTimestamp - 1). Versions of any key with
-// no observable snapshot at or above this watermark are GC candidates
-// at compaction time.
-//
-// Two-phase sampling avoids holding both locks at once. Safety rests
-// on two observations:
-//   - A txn that finished between the phases is gone from our
-//     iteration, but its reads have already returned to the caller
-//     before unregisterTxn ran — they can't be invalidated by any
-//     subsequent GC, so excluding it from the watermark is safe.
-//   - A txn that began between the phases has readSnap ≥ the
-//     nextTimestamp, so it can't pull our watermark below a value
-//     that still protects it.
 func (db *DB) computeWatermark() uint64 {
 	db.mu.RLock()
 	watermark := db.nextTimestamp
@@ -612,13 +629,6 @@ func (db *DB) computeWatermark() uint64 {
 	return watermark
 }
 
-// hasCommitNewerThanLocked reports whether any committed write to
-// userKey has timestamp > readSnap. Caller must hold db.mu in write
-// mode. Used by Txn.Commit to detect write-write conflicts.
-//
-// The implementation walks the active memtable, the frozen memtable
-// (if any), and every SSTable, asking each for the timestamp of
-// userKey's newest version. Short-circuits on the first match.
 func (db *DB) hasCommitNewerThanLocked(userKey []byte, readSnap uint64) (bool, error) {
 	if ts, found := db.memtable.NewestVersionTS(userKey); found && ts > readSnap {
 		return true, nil
@@ -640,9 +650,6 @@ func (db *DB) hasCommitNewerThanLocked(userKey []byte, readSnap uint64) (bool, e
 	return false, nil
 }
 
-// VersionCountForTesting returns the total number of stored versions
-// of userKey across the active memtable, frozen memtable (if any),
-// and all SSTables. Used to verify GC.
 func (db *DB) VersionCountForTesting(userKey []byte) int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()

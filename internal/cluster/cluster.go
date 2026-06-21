@@ -3,6 +3,8 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -58,6 +60,7 @@ type Node struct {
 	votedFor    NodeID // noVote if none this term
 
 	log         *RaftLog
+	logFile     *raftLogFile // durable Raft log; nil for bare-Node white-box tests
 	commitIndex uint64
 	lastApplied uint64
 	appliedCond *sync.Cond // broadcast when lastApplied advances or we step down
@@ -151,8 +154,8 @@ func (n *Node) signalApply() {
 }
 
 // run drains the inbox and dispatches by message type. Every node handles
-// AppendEntries and RequestVote (to follow / vote/ step down); a leader also
-// routes AppendedResponses to the owning follower's replicator; a candidate
+// AppendEntries and RequestVote (to follow / vote / step down); a leader also
+// routes AppendResponses to the owning follower's replicator; a candidate
 // tallies vote responses.
 func (n *Node) run() {
 	defer n.wg.Done()
@@ -219,10 +222,11 @@ func (n *Node) handleAppendEntries(m Message) {
 	}
 
 	// Genuinely-new suffix, truncating a conflicting one first. Truncation only
-	// ever removes UNCOMMITTED (hence unapplied) entries: the up-to-date vote
-	// rule guarantees a committed entry sits in every future leader's log and
-	// so is never the loser of a conflict. (The on-disk WAL does not yet reflect
-	// truncation; the in-memory log we serve and replicate from is correct.)
+	// ever removes UNCOMMITTED (hence unapplied) entries: the §5.4.1 up-to-date
+	// vote rule guarantees a committed entry sits in every future leader's log
+	// and so is never the loser of a conflict. The truncation reaches disk via
+	// the Raft log file (rare path, fsync under raftMu is fine); the data WAL is
+	// untouched because it holds only applied entries, which never truncate.
 	var toAppend []Entry
 	for i, e := range m.Entries {
 		idx := m.PrevLogIndex + uint64(i) + 1
@@ -231,34 +235,49 @@ func (n *Node) handleAppendEntries(m Message) {
 				continue // already have this exact entry (idempotent)
 			}
 			n.log.truncateFrom(idx) // conflict: drop this and everything after
+			if n.logFile != nil {
+				if err := n.logFile.truncateFrom(idx); err != nil {
+					cur := n.currentTerm
+					n.raftMu.Unlock()
+					_ = n.transport.Send(m.From, Message{
+						Type: MsgAppendResponse, From: n.id, Term: cur,
+						Success: false, ConflictHint: m.PrevLogIndex + 1,
+					})
+					return
+				}
+			}
 		}
 		toAppend = append(toAppend, e)
 	}
 	matchIndex := m.PrevLogIndex + uint64(len(m.Entries))
 	n.raftMu.Unlock()
 
-	// Durably append the new suffix (each call takes db.mu) outside raftMu.
-	// A mid-batch failure here (after a conflict truncation) leaves the
-	// in-memory log shorter than the WAL and missing the suffix; we reject so
-	// the leader retries from the hint and re-sends the whole suffix, healing
-	// both. Safe: only uncommitted entries are ever in flight here. (TODO:
-	// On-disk reconciliation of the short-vs-long mismatch.)
+	// Durably append the new suffix to the Raft log file outside raftMu — this
+	// is the hot path and its fsync must not serialize Raft progress behind disk
+	// latency. A mid-batch failure here (after a conflict truncation) leaves the
+	// in-memory log shorter than the file and missing the suffix; we reject so
+	// the leader retries from the hint and re-sends the whole suffix, which
+	// re-truncates and re-appends the file, healing both. Safe: only uncommitted
+	// entries are ever in flight here, and the data WAL is untouched.
 	for _, e := range toAppend {
-		if err := n.store.AppendToLog(e.Data); err != nil {
-			_ = n.transport.Send(m.From, Message{
-				Type: MsgAppendResponse, From: n.id, Term: term,
-				Success: false, ConflictHint: m.PrevLogIndex + 1,
-			})
-			return
+		if n.logFile != nil {
+			if err := n.logFile.append(e.Term, e.Data); err != nil {
+				_ = n.transport.Send(m.From, Message{
+					Type: MsgAppendResponse, From: n.id, Term: term,
+					Success: false, ConflictHint: m.PrevLogIndex + 1,
+				})
+				return
+			}
 		}
 	}
 
 	n.raftMu.Lock()
-	// A concurrent election can have bumped our term/role between the WAL
+	// A concurrent election can have bumped our term/role between the file
 	// append above and here (the election timer may fire the same instant we
 	// reset it). Don't apply under a changed term: reject with our current term
-	// so the now-stale sender steps down. The WAL-appended suffix becomes an
-	// orphan until commitIndex-bounded recovery, exactly as in commit().
+	// so the now-stale sender steps down. The file-appended suffix stays as an
+	// uncommitted tail (never applied, so absent from the data WAL); a future
+	// leader either commits it or truncates it.
 	if n.role != Follower || n.currentTerm != term {
 		hint := n.log.lastIndex() + 1
 		cur := n.currentTerm
@@ -313,7 +332,7 @@ func (n *Node) applyCommitted() {
 		entry := n.log.entryAt(idx)
 		n.raftMu.Unlock()
 
-		if err := n.store.ApplyEntry(entry); err != nil {
+		if err := n.store.ApplyEntry(idx, entry); err != nil {
 			panic(fmt.Sprintf("cluster: node %d apply entry %d: %v", n.id, idx, err))
 		}
 
@@ -349,17 +368,20 @@ func (n *Node) commit(t *db.Txn) error {
 		return nil // empty txn
 	}
 
-	if err := n.store.AppendToLog(entry); err != nil {
-		return fmt.Errorf("cluster: leader append to log: %w", err)
+	if n.logFile != nil {
+		if err := n.logFile.append(term, entry); err != nil {
+			return fmt.Errorf("cluster: leader append to raft log: %w", err)
+		}
 	}
 
 	n.raftMu.Lock()
-	// Re-check leadership: we may have stepped down during PrepareCommit /
-	// AppendToLog. The entry is now an orphan in our WAL — durable but absent
-	// from the in-memory log and unreplicated. Harmless while running, but the
-	// current plain-replay db.Open WOULD resurrect it on restart (it is a
-	// complete txn with OpCommit); TODO: recovery must be commitIndex-bounded
-	// to discard it.
+	// Re-check leadership: we may have stepped down during PrepareCommit / the
+	// log append. The entry is then an uncommitted tail in our Raft log file —
+	// durable, but absent from the in-memory log and unreplicated. It is never
+	// applied (commit never advances over it), so it never reaches the data WAL
+	// and cannot be resurrected on restart; a future leader commits or truncates
+	// it. The data WAL holds only applied entries, so recovery is commit-bounded
+	// by construction.
 	if n.role != Leader || n.currentTerm != term {
 		n.raftMu.Unlock()
 		return ErrNotLeader
@@ -423,6 +445,32 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 			c.Close()
 			return nil, fmt.Errorf("cluster: open node %d: %w", i, err)
 		}
+
+		// Per-node Raft files live in a raft/ subdir, isolated from the DB's
+		// own dir. The log file's prior existence distinguishes a fresh start
+		// (bootstrap) from a restart (reconstruct + re-elect).
+		raftDir := filepath.Join(dirs[i], "raft")
+		if err := os.MkdirAll(raftDir, 0o755); err != nil {
+			store.Close()
+			c.Close()
+			return nil, fmt.Errorf("cluster: mkdir raft dir node %d: %w", i, err)
+		}
+		logPath := filepath.Join(raftDir, raftLogFileName)
+		_, statErr := os.Stat(logPath)
+		fresh := errors.Is(statErr, os.ErrNotExist)
+		logFile, persisted, err := openRaftLogFile(logPath, opts.SyncOnWrite)
+		if err != nil {
+			store.Close()
+			c.Close()
+			return nil, fmt.Errorf("cluster: open raft log node %d: %w", i, err)
+		}
+
+		rlog := NewRaftLog()
+		for _, pe := range persisted {
+			rlog.append(pe.term, pe.data)
+		}
+		recovered := store.RecoveredAppliedIndex()
+
 		var peers []NodeID
 		for j := 0; j < n; j++ {
 			if j != i {
@@ -437,7 +485,10 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 			cfg:         cfg,
 			inbox:       tr.Inbox(NodeID(i)),
 			quit:        make(chan struct{}),
-			log:         NewRaftLog(),
+			log:         rlog,
+			logFile:     logFile,
+			commitIndex: recovered,
+			lastApplied: recovered,
 			role:        Follower,
 			currentTerm: 1,
 			votedFor:    noVote,
@@ -452,9 +503,21 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 			nd.respCh[p] = make(chan Message, 1)
 			nd.replSignal[p] = make(chan struct{}, 1)
 		}
-		if NodeID(i) == bootstrapLeader {
+		switch {
+		case fresh && NodeID(i) == bootstrapLeader:
 			nd.role = Leader
 			nd.votedFor = bootstrapLeader // term-1 self-vote
+		case fresh:
+			// Follower@1, already set.
+		default:
+			// Restart: never bootstrap. Start as follower and re-elect. Derive
+			// currentTerm from the reconstructed log's last term — a safe
+			// under-approximation (our real term was >= this); the node elects
+			// at term+1. votedFor resets, so within a term a restarted node may
+			// vote again: durable term/vote is 3b-1.5. commitIndex/lastApplied
+			// come from the applied watermark, so committed entries are not
+			// re-applied and uncommitted tails wait for a leader.
+			nd.currentTerm = rlog.lastTerm()
 		}
 		// Every node's DB delegates Txn.Commit to its node, which checks
 		// leadership — so a write to a non-leader fails with ErrNotLeader rather
@@ -591,6 +654,11 @@ func (c *Cluster) Close() error {
 	for _, nd := range c.nodes {
 		if err := nd.store.Close(); err != nil && firstErr == nil {
 			firstErr = err
+		}
+		if nd.logFile != nil {
+			if err := nd.logFile.close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
