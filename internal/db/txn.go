@@ -8,17 +8,8 @@ import (
 	"github.com/BrandonnLow/littledb/internal/record"
 )
 
-// ErrTxnFinished is returned by any Txn method called after Commit or
-// Rollback. Once a transaction reaches a terminal state, it cannot be
-// reused.
 var ErrTxnFinished = errors.New("db: transaction already finished")
 
-// Txn is a single transaction with snapshot-isolation reads and
-// atomic multi-key commit. A Txn is intended for use by ONE goroutine
-// at a time; concurrent use of a single Txn is undefined.
-//
-// Concurrent Txns from different goroutines are safe: each holds its
-// own read snapshot and its own write buffer.
 type Txn struct {
 	db       *DB
 	readSnap uint64
@@ -28,19 +19,15 @@ type Txn struct {
 
 type txnWrite struct {
 	op    record.Op
-	value []byte // nil for deletes; defensive copy of user value for puts
+	value []byte
 }
 
-// Begin starts a new transaction. The returned Txn captures a read
-// snapshot at this moment — reads will see all data committed before
-// Begin returned, and nothing committed afterwards (by this Txn or
-// any other writer).
 func (db *DB) Begin() *Txn {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	// Read snapshot is the applied watermark: under deferred apply
-	// (replication leader) nextTimestamp may already count an in-flight
-	// commit whose data is not yet in the memtable. Snapshotting at
+	// Read snapshot is the applied watermark, not nextTimestamp: under
+	// deferred apply (replication leader) nextTimestamp may already count an
+	// in-flight commit whose data is not yet in the memtable. Snapshotting at
 	// appliedTS guarantees everything with ts <= readSnap is visible, so a
 	// read-modify-write txn that misses such a commit will see it as newer at
 	// commit time and conflict, rather than silently overwriting it.
@@ -53,8 +40,6 @@ func (db *DB) Begin() *Txn {
 	return t
 }
 
-// Get returns the value of key visible to this transaction. Local
-// buffered writes shadow committed state (read-your-own-writes).
 func (t *Txn) Get(key []byte) ([]byte, error) {
 	if t.finished {
 		return nil, ErrTxnFinished
@@ -68,8 +53,6 @@ func (t *Txn) Get(key []byte) ([]byte, error) {
 	return t.db.GetAsOf(key, t.readSnap)
 }
 
-// Put buffers a write of (key, value). The change is invisible to
-// any other reader until Commit is called.
 func (t *Txn) Put(key, value []byte) error {
 	if t.finished {
 		return ErrTxnFinished
@@ -81,8 +64,6 @@ func (t *Txn) Put(key, value []byte) error {
 	return nil
 }
 
-// Delete buffers a delete of key. Same semantics as Put: invisible
-// outside the txn until Commit.
 func (t *Txn) Delete(key []byte) error {
 	if t.finished {
 		return ErrTxnFinished
@@ -91,8 +72,6 @@ func (t *Txn) Delete(key []byte) error {
 	return nil
 }
 
-// Rollback discards all buffered writes. After Rollback, the Txn is
-// finished and no other method may be called on it.
 func (t *Txn) Rollback() error {
 	if t.finished {
 		return ErrTxnFinished
@@ -198,15 +177,14 @@ func (t *Txn) Commit() error {
 		t.db.signalCompact()
 	}
 	return nil
-
 }
 
 // PrepareCommit performs the leader-side preparation of a replicated commit:
 // first-committer-wins conflict detection, commit-timestamp allocation, and
 // building the encoded entry (data records + OpCommit). It does NOT touch the
-// WAL or the memtable — the replication layer is responsible for AppendToLog
-// (durability) and ApplyEntry (visibility) once the entry is committed. The
-// txn is marked finished.
+// data WAL or the memtable — the replication layer persists the entry to its
+// Raft log file for replication, and ApplyEntry writes the data WAL and applies
+// to the memtable once the entry is committed. The txn is marked finished.
 //
 // Returns (nil, 0, nil) for an empty txn, ErrConflict on a write-write
 // conflict (without allocating a timestamp), or errClosed if the DB is closed.
@@ -239,6 +217,7 @@ func (db *DB) PrepareCommit(t *Txn) (entry []byte, commitTS uint64, err error) {
 
 	commitTS = db.nextTimestamp
 	db.nextTimestamp++
+
 	keys := make([]string, 0, len(t.writes))
 	for k := range t.writes {
 		keys = append(keys, k)

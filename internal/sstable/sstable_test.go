@@ -18,7 +18,7 @@ func makePath(t *testing.T) string {
 
 func TestRoundTripSingleVersion(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 3)
+	w, _ := NewWriter(path, 3, 0)
 	w.Add(record.OpPut, []byte("alpha"), []byte("1"), 100)
 	w.Add(record.OpPut, []byte("bravo"), []byte("2"), 100)
 	w.Add(record.OpPut, []byte("charlie"), []byte("3"), 100)
@@ -42,7 +42,7 @@ func TestRoundTripSingleVersion(t *testing.T) {
 
 func TestGetAsOfWithMultipleVersions(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 3)
+	w, _ := NewWriter(path, 3, 0)
 	w.Add(record.OpPut, []byte("k"), []byte("v3"), 300)
 	w.Add(record.OpPut, []byte("k"), []byte("v2"), 200)
 	w.Add(record.OpPut, []byte("k"), []byte("v1"), 100)
@@ -81,7 +81,7 @@ func TestGetAsOfWithMultipleVersions(t *testing.T) {
 
 func TestGetAsOfTombstone(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 3)
+	w, _ := NewWriter(path, 3, 0)
 	w.Add(record.OpPut, []byte("k"), []byte("v3"), 300)
 	w.Add(record.OpDelete, []byte("k"), nil, 200)
 	w.Add(record.OpPut, []byte("k"), []byte("v1"), 100)
@@ -106,13 +106,9 @@ func TestGetAsOfTombstone(t *testing.T) {
 	}
 }
 
-// TestBloomMatchesAnyTimestamp is the critical regression test for the
-// "bloom hashes userKey not encoded key" invariant. We store userKey
-// at ts=100 only; a lookup at ts=200 (an encoded key never written)
-// must still find the version at ts=100.
 func TestBloomMatchesAnyTimestamp(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 1)
+	w, _ := NewWriter(path, 1, 0)
 	w.Add(record.OpPut, []byte("k"), []byte("v"), 100)
 	w.Finish()
 
@@ -127,7 +123,7 @@ func TestBloomMatchesAnyTimestamp(t *testing.T) {
 
 func TestGetAsOfMiss(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 2)
+	w, _ := NewWriter(path, 2, 0)
 	w.Add(record.OpPut, []byte("a"), []byte("1"), 100)
 	w.Add(record.OpPut, []byte("c"), []byte("3"), 100)
 	w.Finish()
@@ -145,7 +141,7 @@ func TestGetAsOfMiss(t *testing.T) {
 
 func TestEmptySSTable(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 0)
+	w, _ := NewWriter(path, 0, 0)
 	if err := w.Finish(); err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +160,7 @@ func TestEmptySSTable(t *testing.T) {
 
 func TestMaxTimestampInFooter(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 3)
+	w, _ := NewWriter(path, 3, 0)
 	w.Add(record.OpPut, []byte("a"), []byte("a"), 500)
 	w.Add(record.OpPut, []byte("b"), []byte("b"), 1000)
 	w.Add(record.OpPut, []byte("c"), []byte("c"), 750)
@@ -180,7 +176,7 @@ func TestMaxTimestampInFooter(t *testing.T) {
 func TestMultiBlockSSTableWithMVCC(t *testing.T) {
 	const n = 1000
 	path := makePath(t)
-	w, _ := NewWriter(path, n)
+	w, _ := NewWriter(path, n, 0)
 	value := bytes.Repeat([]byte("x"), 100)
 	for i := 0; i < n; i++ {
 		k := []byte(fmt.Sprintf("k%05d", i))
@@ -209,7 +205,7 @@ func TestMultiBlockSSTableWithMVCC(t *testing.T) {
 }
 
 func TestOutOfOrder(t *testing.T) {
-	w, _ := NewWriter(makePath(t), 2)
+	w, _ := NewWriter(makePath(t), 2, 0)
 	defer w.Abort()
 	w.Add(record.OpPut, []byte("b"), []byte("2"), 100)
 	if err := w.Add(record.OpPut, []byte("b"), []byte("2'"), 100); !errors.Is(err, ErrDuplicate) {
@@ -221,7 +217,7 @@ func TestOutOfOrder(t *testing.T) {
 }
 
 func TestSameUserKeyAscendingTimestampIsOutOfOrder(t *testing.T) {
-	w, _ := NewWriter(makePath(t), 2)
+	w, _ := NewWriter(makePath(t), 2, 0)
 	defer w.Abort()
 	w.Add(record.OpPut, []byte("k"), []byte("v1"), 100)
 	if err := w.Add(record.OpPut, []byte("k"), []byte("v2"), 200); !errors.Is(err, ErrOutOfOrder) {
@@ -231,7 +227,7 @@ func TestSameUserKeyAscendingTimestampIsOutOfOrder(t *testing.T) {
 
 func TestBadMagic(t *testing.T) {
 	path := makePath(t)
-	w, _ := NewWriter(path, 1)
+	w, _ := NewWriter(path, 1, 0)
 	w.Add(record.OpPut, []byte("a"), []byte("1"), 100)
 	w.Finish()
 
@@ -251,7 +247,7 @@ func TestBadMagic(t *testing.T) {
 func TestBloomFilterStillSkipsAbsentKeys(t *testing.T) {
 	const n = 5000
 	path := makePath(t)
-	w, _ := NewWriter(path, n)
+	w, _ := NewWriter(path, n, 0)
 	for i := 0; i < n; i++ {
 		k := []byte(fmt.Sprintf("present-%06d", i))
 		w.Add(record.OpPut, k, []byte("v"), 100)

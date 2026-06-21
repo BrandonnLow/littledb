@@ -1,29 +1,4 @@
 // Package sstable implements immutable sorted-string tables on disk.
-// MVCC: each record's key is MVCC-encoded (userKey + descending timestamp)
-// so multiple versions of a userKey coexist.
-//
-// File layout:
-//
-//	┌─────────────────────────────────────────────────────────┐
-//	│  DATA SECTION                                           │
-//	│    ~4 KB blocks of records with MVCC-encoded keys       │
-//	├─────────────────────────────────────────────────────────┤
-//	│  INDEX SECTION                                          │
-//	│    One record per block: firstKey + offset + size       │
-//	├─────────────────────────────────────────────────────────┤
-//	│  BLOOM SECTION                                          │
-//	│    Filter over userKeys (not encoded keys); a positive  │
-//	│    means "some version of userKey may be in this file." │
-//	├─────────────────────────────────────────────────────────┤
-//	│  FOOTER (48 bytes, fixed)                               │
-//	│    indexOffset, indexSize, bloomOffset, bloomSize,      │
-//	│    maxTimestamp, magic                                  │
-//	└─────────────────────────────────────────────────────────┘
-//
-// Reads work as: bloom check on userKey → binary-search index for the
-// block whose firstKey is the largest ≤ Encode(userKey, snapshot) →
-// scan that block for the first key ≥ target. The first match's
-// userKey tells us whether the file holds a visible version.
 package sstable
 
 import (
@@ -45,7 +20,7 @@ import (
 
 const (
 	blockSize       = 4096
-	footerSize      = 48
+	footerSize      = 56
 	magic           = uint64(0x21424445_4C4C494C) // "LILLEDB!"
 	bloomBitsPerKey = 10
 )
@@ -62,9 +37,6 @@ type indexEntry struct {
 	blockSize   int64
 }
 
-// Writer builds an SSTable. Records must be added in strictly
-// ascending MVCC-encoded-key order — equivalently, ascending userKey
-// and within each userKey descending timestamp.
 type Writer struct {
 	path    string
 	tmpPath string
@@ -81,16 +53,14 @@ type Writer struct {
 
 	lastEncKey   []byte
 	maxTimestamp uint64
+	appliedIndex uint64
 	written      int64
 	count        int
 
 	closed bool
 }
 
-// NewWriter creates a writer for path. expectedKeys sizes the bloom
-// filter; an over-estimate wastes a little memory, an under-estimate
-// raises the false-positive rate above target.
-func NewWriter(path string, expectedKeys int) (*Writer, error) {
+func NewWriter(path string, expectedKeys int, appliedIndex uint64) (*Writer, error) {
 	dir := filepath.Dir(path)
 	tmpPath := path + ".tmp"
 	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -98,20 +68,17 @@ func NewWriter(path string, expectedKeys int) (*Writer, error) {
 		return nil, fmt.Errorf("sstable: open %s: %w", tmpPath, err)
 	}
 	return &Writer{
-		path:     path,
-		tmpPath:  tmpPath,
-		dir:      dir,
-		f:        f,
-		bw:       bufio.NewWriter(f),
-		blockBuf: make([]byte, 0, blockSize),
-		filter:   bloom.New(expectedKeys, bloomBitsPerKey),
+		path:         path,
+		tmpPath:      tmpPath,
+		dir:          dir,
+		f:            f,
+		bw:           bufio.NewWriter(f),
+		blockBuf:     make([]byte, 0, blockSize),
+		filter:       bloom.New(expectedKeys, bloomBitsPerKey),
+		appliedIndex: appliedIndex,
 	}, nil
 }
 
-// Add appends one record. (userKey, ts) must form a strictly
-// ascending MVCC-encoded-key sequence across calls. The bloom filter
-// is updated with userKey (not the encoded key), so any future
-// timestamp query for userKey will look up correctly.
 func (w *Writer) Add(op record.Op, userKey, value []byte, ts uint64) error {
 	if w.closed {
 		return errors.New("sstable: write on closed writer")
@@ -143,9 +110,6 @@ func (w *Writer) Add(op record.Op, userKey, value []byte, ts uint64) error {
 	}
 	w.blockBuf = append(w.blockBuf, encoded...)
 
-	// Bloom filter sees userKey, not encKey. This is the critical
-	// invariant: a Get(userKey, anyTimestamp) needs the filter to
-	// return "maybe" for any version of userKey we've added.
 	w.filter.Add(userKey)
 
 	w.lastEncKey = append(w.lastEncKey[:0], encKey...)
@@ -175,12 +139,6 @@ func (w *Writer) flushBlock() error {
 	return nil
 }
 
-// Finish writes the index, bloom filter, and footer; fsyncs; renames
-// the temp file to the final path; fsyncs the directory.
-//
-// Ordering invariant: by the time this returns, the SSTable file
-// (including its footer with MaxTimestamp) is fully durable on disk.
-// Callers that subsequently truncate or rotate the WAL depend on this.
 func (w *Writer) Finish() error {
 	if w.closed {
 		return errors.New("sstable: finish on closed writer")
@@ -220,7 +178,8 @@ func (w *Writer) Finish() error {
 	binary.LittleEndian.PutUint64(footer[16:24], uint64(bloomOffset))
 	binary.LittleEndian.PutUint64(footer[24:32], uint64(bloomSize))
 	binary.LittleEndian.PutUint64(footer[32:40], w.maxTimestamp)
-	binary.LittleEndian.PutUint64(footer[40:48], magic)
+	binary.LittleEndian.PutUint64(footer[40:48], w.appliedIndex)
+	binary.LittleEndian.PutUint64(footer[48:56], magic)
 	if _, err := w.bw.Write(footer); err != nil {
 		return fmt.Errorf("sstable: write footer: %w", err)
 	}
@@ -257,7 +216,6 @@ func (w *Writer) Abort() error {
 
 func (w *Writer) Count() int { return w.count }
 
-// Reader reads an immutable SSTable. Safe for concurrent reads.
 type Reader struct {
 	path         string
 	f            *os.File
@@ -265,6 +223,7 @@ type Reader struct {
 	index        []indexEntry
 	filter       *bloom.Filter
 	maxTimestamp uint64
+	appliedIndex uint64
 
 	blockReadCount atomic.Int64
 	closed         bool
@@ -291,7 +250,7 @@ func OpenReader(path string) (*Reader, error) {
 		f.Close()
 		return nil, fmt.Errorf("sstable: read footer: %w", err)
 	}
-	gotMagic := binary.LittleEndian.Uint64(footer[40:48])
+	gotMagic := binary.LittleEndian.Uint64(footer[48:56])
 	if gotMagic != magic {
 		f.Close()
 		return nil, fmt.Errorf("%w: got %#x", ErrBadMagic, gotMagic)
@@ -301,6 +260,7 @@ func OpenReader(path string) (*Reader, error) {
 	bloomOffset := int64(binary.LittleEndian.Uint64(footer[16:24]))
 	bloomSize := int64(binary.LittleEndian.Uint64(footer[24:32]))
 	maxTS := binary.LittleEndian.Uint64(footer[32:40])
+	appliedIndex := binary.LittleEndian.Uint64(footer[40:48])
 
 	limit := size - footerSize
 	if indexOffset < 0 || indexSize < 0 || indexOffset+indexSize > limit ||
@@ -357,19 +317,17 @@ func OpenReader(path string) (*Reader, error) {
 		index:        idx,
 		filter:       filter,
 		maxTimestamp: maxTS,
+		appliedIndex: appliedIndex,
 	}, nil
 }
 
-// MaxTimestamp returns the largest timestamp recorded in this file's
-// footer. Used by the DB layer to compute the initial value of its
-// timestamp counter on Open.
 func (r *Reader) MaxTimestamp() uint64 { return r.maxTimestamp }
 
-// GetAsOf returns the version of userKey visible at snapshot.
-//
-//   - (value, OpPut, true,  nil) — a live value
-//   - (nil,   OpDelete, true,  nil) — masked by a tombstone
-//   - (nil,   0,        false, nil) — no visible version
+// AppliedIndex returns the Raft log index represented by this SSTable: the
+// highest index whose applied state is folded into it at flush time. Zero for
+// SSTables written outside a replication cluster.
+func (r *Reader) AppliedIndex() uint64 { return r.appliedIndex }
+
 func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op record.Op, found bool, err error) {
 	if r.closed {
 		return nil, 0, false, errors.New("sstable: read on closed reader")
@@ -377,10 +335,6 @@ func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op reco
 	if len(r.index) == 0 {
 		return nil, 0, false, nil
 	}
-	// Bloom check is on userKey, NOT the encoded key. If we hashed the
-	// encoded key we'd have a separate filter entry per version, and
-	// a lookup at any snapshot other than an exact previous write
-	// timestamp would falsely report "absent."
 	if r.filter != nil && !r.filter.MayContain(userKey) {
 		return nil, 0, false, nil
 	}
@@ -388,8 +342,6 @@ func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op reco
 	target := mvcckey.Encode(userKey, snapshot)
 	n := len(r.index)
 
-	// Largest block N with firstKey <= target. The answer (if any) is
-	// either inside block N or at the start of block N+1.
 	hi := sort.Search(n, func(i int) bool {
 		return bytes.Compare(r.index[i].firstKey, target) > 0
 	})
@@ -414,19 +366,15 @@ func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op reco
 			}
 			offset += int64(decN)
 
-			// Skip records whose encoded key sorts before target
-			// (i.e., versions newer than our snapshot).
 			if bytes.Compare(rec.Key, target) < 0 {
 				continue
 			}
 
-			// First record at-or-after target: check userKey match.
 			recUserKey, _, ok := mvcckey.Decode(rec.Key)
 			if !ok {
 				return nil, 0, false, fmt.Errorf("sstable %s: malformed encoded key", r.path)
 			}
 			if !bytes.Equal(recUserKey, userKey) {
-				// Moved past userKey without a visible version.
 				return nil, 0, false, nil
 			}
 			if rec.Op == record.OpDelete {
@@ -434,22 +382,11 @@ func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op reco
 			}
 			return append([]byte(nil), rec.Value...), record.OpPut, true, nil
 		}
-		// Block exhausted without finding a key >= target — the answer
-		// (if any) is at the start of the next block; loop continues.
 	}
 
 	return nil, 0, false, nil
 }
 
-// NewestVersionTS returns the timestamp of the newest stored version
-// of userKey in this SSTable, or (0, false) if userKey is not present.
-// Used by the DB's commit-time conflict check.
-//
-// Mirrors GetAsOf's structure: bloom check, binary-search the index
-// for the block whose firstKey is the largest ≤ target, scan that
-// block (and possibly the next) for the first key ≥ target. Target is
-// Encode(userKey, ^uint64(0)), which sorts at the position of the
-// newest possible version of userKey.
 func (r *Reader) NewestVersionTS(userKey []byte) (ts uint64, found bool, err error) {
 	if r.closed {
 		return 0, false, errors.New("sstable: read on closed reader")
@@ -505,9 +442,6 @@ func (r *Reader) NewestVersionTS(userKey []byte) (ts uint64, found bool, err err
 	return 0, false, nil
 }
 
-// VersionCountForTesting returns the number of stored versions of
-// userKey in this SSTable. Used to verify GC behaviour. Scans the
-// whole file; slow, fine for tests.
 func (r *Reader) VersionCountForTesting(userKey []byte) int {
 	if r.closed {
 		return 0
@@ -529,9 +463,6 @@ func (r *Reader) VersionCountForTesting(userKey []byte) int {
 	return count
 }
 
-// Iterate yields each record in sorted order (encoded-key ascending).
-// Used by compaction; the encoded key contains both userKey and
-// timestamp.
 func (r *Reader) Iterate(fn func(op record.Op, encKey, value []byte) bool) error {
 	if r.closed {
 		return errors.New("sstable: iterate on closed reader")
