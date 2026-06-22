@@ -61,6 +61,16 @@ func (n *Node) becomeLeaderLocked() {
 	n.signalReplicators() // immediate heartbeat: assert leadership now
 }
 
+// persistHardStateLocked durably records (currentTerm, votedFor). A nil
+// stateFile (bare-Node white-box tests) is a no-op. Must hold raftMu, paired
+// with the in-memory mutation so disk never lags the field the node acts on.
+func (n *Node) persistHardStateLocked() error {
+	if n.stateFile == nil {
+		return nil
+	}
+	return n.stateFile.save(n.currentTerm, n.votedFor)
+}
+
 // stepDownLocked adopts a higher term and reverts to follower. It wakes any
 // commit waiter (a commit in flight can no longer complete here) and resets
 // the election timer. Must hold raftMu.
@@ -68,6 +78,12 @@ func (n *Node) stepDownLocked(term uint64) {
 	n.currentTerm = term
 	n.role = Follower
 	n.votedFor = noVote
+	// Persist the adopted term + reset vote before the node acts on the new
+	// term. A failure here degrades to under-approximation (in-memory term may
+	// exceed the durable term); it never externalizes a vote, only an idempotent
+	// ack, so we proceed rather than panic. A vote cast afterwards re-persists
+	// the full hard state and IS gated on success.
+	_ = n.persistHardStateLocked()
 	n.appliedCond.Broadcast()
 	n.resetElectionTimer()
 }
@@ -107,10 +123,19 @@ func (n *Node) maybeStartElection() {
 		n.raftMu.Unlock()
 		return
 	}
+	prevTerm, prevRole, prevVote, prevVotes := n.currentTerm, n.role, n.votedFor, n.votesReceived
 	n.currentTerm++
 	n.role = Candidate
 	n.votedFor = n.id
 	n.votesReceived = 1 // vote for self
+	// Our own vote must be durable before we solicit others' — the same rule as
+	// a granted vote. On persist failure, roll back every in-memory mutation so
+	// the term cannot run ahead of disk, stay Follower, and retry next timeout.
+	if err := n.persistHardStateLocked(); err != nil {
+		n.currentTerm, n.role, n.votedFor, n.votesReceived = prevTerm, prevRole, prevVote, prevVotes
+		n.raftMu.Unlock()
+		return
+	}
 	term := n.currentTerm
 	lastIndex := n.log.lastIndex()
 	lastTerm := n.log.lastTerm()
@@ -140,9 +165,18 @@ func (n *Node) handleRequestVote(m Message) {
 	if m.Term == n.currentTerm &&
 		(n.votedFor == noVote || n.votedFor == m.CandidateID) &&
 		n.candidateUpToDateLocked(m.LastLogIndex, m.LastLogTerm) {
-		grant = true
+		prevVote := n.votedFor
 		n.votedFor = m.CandidateID
-		n.resetElectionTimer()
+		// The vote must be durable before the grant is sent: a crash between
+		// reply and fsync would re-open the double-vote window. On persist
+		// failure, roll the vote back and decline rather than grant something we
+		// cannot guarantee survived.
+		if err := n.persistHardStateLocked(); err != nil {
+			n.votedFor = prevVote
+		} else {
+			grant = true
+			n.resetElectionTimer()
+		}
 	}
 	term := n.currentTerm
 	n.raftMu.Unlock()

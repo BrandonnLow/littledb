@@ -60,7 +60,8 @@ type Node struct {
 	votedFor    NodeID // noVote if none this term
 
 	log         *RaftLog
-	logFile     *raftLogFile // durable Raft log; nil for bare-Node white-box tests
+	logFile     *raftLogFile   // durable Raft log; nil for bare-Node white-box tests
+	stateFile   *raftStateFile // durable (currentTerm, votedFor); nil for bare-Node tests
 	commitIndex uint64
 	lastApplied uint64
 	appliedCond *sync.Cond // broadcast when lastApplied advances or we step down
@@ -434,13 +435,29 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 			return nil, fmt.Errorf("cluster: mkdir raft dir node %d: %w", i, err)
 		}
 		logPath := filepath.Join(raftDir, raftLogFileName)
-		_, statErr := os.Stat(logPath)
-		fresh := errors.Is(statErr, os.ErrNotExist)
+		statePath := filepath.Join(raftDir, raftStateFileName)
+		// Stat BOTH durable raft files before opening either: openRaftLogFile's
+		// O_CREATE would otherwise erase the freshness signal. A node is fresh
+		// (eligible to bootstrap) only when neither file exists — a node can
+		// persist a vote (writing raft/state) before ever appending a log entry,
+		// so keying freshness on raft.log alone would wrongly bootstrap such a
+		// node and discard its durable vote.
+		_, logStatErr := os.Stat(logPath)
+		_, stateStatErr := os.Stat(statePath)
+		fresh := errors.Is(logStatErr, os.ErrNotExist) && errors.Is(stateStatErr, os.ErrNotExist)
+
 		logFile, persisted, err := openRaftLogFile(logPath, opts.SyncOnWrite)
 		if err != nil {
 			store.Close()
 			c.Close()
 			return nil, fmt.Errorf("cluster: open raft log node %d: %w", i, err)
+		}
+		stateFile, hard, err := openRaftStateFile(statePath, opts.SyncOnWrite)
+		if err != nil {
+			logFile.close()
+			store.Close()
+			c.Close()
+			return nil, fmt.Errorf("cluster: open raft state node %d: %w", i, err)
 		}
 
 		rlog := NewRaftLog()
@@ -465,6 +482,7 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 			quit:        make(chan struct{}),
 			log:         rlog,
 			logFile:     logFile,
+			stateFile:   stateFile,
 			commitIndex: recovered,
 			lastApplied: recovered,
 			role:        Follower,
@@ -488,14 +506,37 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 		case fresh:
 			// Follower@1, already set.
 		default:
-			// Restart: never bootstrap. Start as follower and re-elect. Derive
-			// currentTerm from the reconstructed log's last term — a safe
-			// under-approximation (our real term was >= this); the node elects
-			// at term+1. votedFor resets, so within a term a restarted node may
-			// vote again: durable term/vote is 3b-1.5. commitIndex/lastApplied
-			// come from the applied watermark, so committed entries are not
-			// re-applied and uncommitted tails wait for a leader.
-			nd.currentTerm = rlog.lastTerm()
+			// Restart: never bootstrap. Start as follower and re-elect.
+			// currentTerm is the durable hard state reconciled against the log:
+			// max(state.term, log.lastTerm()). The log term can exceed the saved
+			// term in the degraded window where a higher term was adopted and its
+			// entries were logged but the hard-state fsync was lost; a node
+			// holding a term-T entry has been in term >= T, so we must resume at
+			// least there. votedFor is kept only when the saved term wins or ties;
+			// if the log term strictly wins we are moving to a higher term than
+			// the saved vote belongs to, so that vote is stale and resets. Absent
+			// state reads as (0, noVote), so this same rule is the legacy fallback.
+			// commitIndex/lastApplied come from the applied watermark, so
+			// committed entries are not re-applied and uncommitted tails wait.
+			logTerm := rlog.lastTerm()
+			if logTerm > hard.currentTerm {
+				nd.currentTerm = logTerm
+				nd.votedFor = noVote
+			} else {
+				nd.currentTerm = hard.currentTerm
+				nd.votedFor = hard.votedFor
+			}
+		}
+		// Persist the resolved hard state at construction so disk reflects any
+		// max-load repair or legacy derivation, and so raft/state exists from the
+		// first run (keeping the freshness signal stable across restarts). The
+		// node's goroutines have not started, so no lock is needed and we save
+		// directly rather than through persistHardStateLocked.
+		if err := nd.stateFile.save(nd.currentTerm, nd.votedFor); err != nil {
+			logFile.close()
+			store.Close()
+			c.Close()
+			return nil, fmt.Errorf("cluster: persist raft state node %d: %w", i, err)
 		}
 		// Every node's DB delegates Txn.Commit to its node, which checks
 		// leadership — so a write to a non-leader fails with ErrNotLeader rather
@@ -635,6 +676,11 @@ func (c *Cluster) Close() error {
 		}
 		if nd.logFile != nil {
 			if err := nd.logFile.close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		if nd.stateFile != nil {
+			if err := nd.stateFile.close(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
