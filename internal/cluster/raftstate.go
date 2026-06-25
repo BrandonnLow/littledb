@@ -27,6 +27,17 @@ type hardState struct {
 	present bool
 }
 
+// hardStatePersister is the seam through which a Node persists its hard state.
+// Production uses *raftStateFile; tests inject a fake to exercise persist
+// failures (the rollback/decline and degrade-safe paths). A nil persister is a
+// no-op via persistHardStateLocked's guard — never assign a typed-nil
+// (*raftStateFile)(nil), which would make the interface non-nil and defeat that
+// guard.
+type hardStatePersister interface {
+	save(currentTerm uint64, votedFor NodeID) error
+	close() error
+}
+
 // raftStateFile is the per-node durable home of (currentTerm, votedFor). Every
 // change to either field is written through save before the node externalizes
 // anything that depends on it — a granted-vote reply or a RequestVote broadcast

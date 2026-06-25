@@ -60,8 +60,8 @@ type Node struct {
 	votedFor    NodeID // noVote if none this term
 
 	log         *RaftLog
-	logFile     *raftLogFile   // durable Raft log; nil for bare-Node white-box tests
-	stateFile   *raftStateFile // durable (currentTerm, votedFor); nil for bare-Node tests
+	logFile     *raftLogFile       // durable Raft log; nil for bare-Node white-box tests
+	stateFile   hardStatePersister // durable (currentTerm, votedFor); nil for bare-Node tests
 	commitIndex uint64
 	lastApplied uint64
 	appliedCond *sync.Cond // broadcast when lastApplied advances or we step down
