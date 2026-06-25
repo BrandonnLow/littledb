@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -166,5 +167,125 @@ func TestLeaderNextIndexTransitions(t *testing.T) {
 	n.onAppendRejectLocked(1, 0) // hint below 1
 	if n.nextIndex[1] != 1 {
 		t.Fatalf("after reject(hint=0): next=%d, want 1 (clamped)", n.nextIndex[1])
+	}
+}
+
+// TestAppendEntriesRejectsPrevLogTermMismatch drives the prevLog consistency
+// check at an index the follower HAS but at the wrong term (distinct from the
+// "prevLogIndex past the end" case). The follower rejects with a back-up hint
+// and leaves its log untouched.
+func TestAppendEntriesRejectsPrevLogTermMismatch(t *testing.T) {
+	tr := NewChannelTransport()
+	tr.Register(0)
+	tr.Register(1)
+	log := NewRaftLog()
+	log.append(1, []byte("a"))
+	log.append(2, []byte("b"))
+	f := &Node{
+		id: 1, transport: tr, peers: []NodeID{0},
+		inbox: tr.Inbox(1), quit: make(chan struct{}), log: log,
+		role: Follower, currentTerm: 2, votedFor: noVote,
+		electionResetCh: make(chan struct{}, 1),
+	}
+	f.appliedCond = sync.NewCond(&f.raftMu)
+
+	f.handleAppendEntries(Message{
+		Type: MsgAppendEntries, From: 0, Term: 2,
+		PrevLogIndex: 2, PrevLogTerm: 99, // index 2 exists but at term 2, not 99
+		Entries: []Entry{{2, []byte("c")}},
+	})
+	resp := <-tr.Inbox(0)
+	if resp.Success {
+		t.Fatalf("resp = %+v, want a rejection on prevLogTerm mismatch", resp)
+	}
+	if resp.ConflictHint != 3 {
+		t.Errorf("ConflictHint = %d, want 3 (lastIndex+1)", resp.ConflictHint)
+	}
+	if li := f.log.lastIndex(); li != 2 {
+		t.Errorf("log mutated to %d on reject, want 2 (untouched)", li)
+	}
+}
+
+// TestAppendEntriesMixedSkipThenConflict exercises the per-entry loop with both
+// branches in ONE message: the first entry is already present (idempotent skip)
+// and the second conflicts (truncate + replace), then a third extends. The file
+// must mirror memory after the repair.
+func TestAppendEntriesMixedSkipThenConflict(t *testing.T) {
+	dir := t.TempDir()
+	tr := NewChannelTransport()
+	tr.Register(0)
+	tr.Register(1)
+	logPath := filepath.Join(dir, raftLogFileName)
+	lf, _, err := openRaftLogFile(logPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := NewRaftLog()
+	for _, s := range []string{"a", "b", "c"} { // seed file + memory with [a@1,b@1,c@1]
+		if err := lf.append(1, []byte(s)); err != nil {
+			t.Fatal(err)
+		}
+		log.append(1, []byte(s))
+	}
+	f := &Node{
+		id: 1, transport: tr, peers: []NodeID{0},
+		inbox: tr.Inbox(1), quit: make(chan struct{}),
+		log: log, logFile: lf,
+		role: Follower, currentTerm: 2, votedFor: noVote,
+		electionResetCh: make(chan struct{}, 1), applySignal: make(chan struct{}, 1),
+	}
+	f.appliedCond = sync.NewCond(&f.raftMu)
+	defer f.logFile.close()
+
+	// idx1 a@1 (skip), idx2 b2@2 (conflict: truncate b,c then append), idx3 c2@2.
+	f.handleAppendEntries(Message{
+		Type: MsgAppendEntries, From: 0, Term: 2, PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries: []Entry{{1, []byte("a")}, {2, []byte("b2")}, {2, []byte("c2")}},
+	})
+	resp := <-tr.Inbox(0)
+	if !resp.Success || resp.MatchIndex != 3 {
+		t.Fatalf("resp = %+v, want success with MatchIndex 3", resp)
+	}
+	if f.log.lastIndex() != 3 ||
+		string(f.log.entryAt(1)) != "a" || f.log.term(1) != 1 ||
+		string(f.log.entryAt(2)) != "b2" || f.log.term(2) != 2 ||
+		string(f.log.entryAt(3)) != "c2" || f.log.term(3) != 2 {
+		t.Fatalf("log = [%q@%d,%q@%d,%q@%d], want [a@1,b2@2,c2@2]",
+			f.log.entryAt(1), f.log.term(1), f.log.entryAt(2), f.log.term(2), f.log.entryAt(3), f.log.term(3))
+	}
+	assertFileMirrorsMemory(t, f, logPath)
+}
+
+// TestAppendEntriesRejectsStaleLowerTerm pins the stale-leader path: an
+// AppendEntries whose term is below ours is rejected, and the reply carries OUR
+// higher term so the stale leader steps down. The log is not mutated.
+func TestAppendEntriesRejectsStaleLowerTerm(t *testing.T) {
+	tr := NewChannelTransport()
+	tr.Register(0)
+	tr.Register(1)
+	log := NewRaftLog()
+	log.append(5, []byte("x"))
+	f := &Node{
+		id: 1, transport: tr, peers: []NodeID{0},
+		inbox: tr.Inbox(1), quit: make(chan struct{}), log: log,
+		role: Follower, currentTerm: 5, votedFor: noVote,
+		electionResetCh: make(chan struct{}, 1),
+	}
+	f.appliedCond = sync.NewCond(&f.raftMu)
+
+	f.handleAppendEntries(Message{
+		Type: MsgAppendEntries, From: 0, Term: 3, // stale, below our 5
+		PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries: []Entry{{3, []byte("y")}},
+	})
+	resp := <-tr.Inbox(0)
+	if resp.Success {
+		t.Fatal("stale lower-term AppendEntries must be rejected")
+	}
+	if resp.Term != 5 {
+		t.Errorf("reply Term = %d, want 5 (our higher term, so the stale leader steps down)", resp.Term)
+	}
+	if li := f.log.lastIndex(); li != 1 {
+		t.Errorf("log mutated to %d, want 1 (untouched)", li)
 	}
 }
