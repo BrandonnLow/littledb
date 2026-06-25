@@ -2,9 +2,11 @@ package cluster
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/BrandonnLow/littledb/internal/db"
 )
@@ -129,4 +131,92 @@ func TestRaftLogFileMirrorsInMemoryLog(t *testing.T) {
 		t.Fatalf("extend failed: len=%d e4=%q", f.log.lastIndex(), f.log.entryAt(4))
 	}
 	assertFileMirrorsMemory(t, f, logPath)
+}
+
+// assertFileMirrorsMemoryLive is the live-node analogue of
+// assertFileMirrorsMemory: it snapshots the in-memory log under raftMu (so it
+// does not race the node's goroutines) before independently reloading the file
+// and comparing. The two must match exactly — no orphan or duplicate tail.
+func assertFileMirrorsMemoryLive(t *testing.T, n *Node, logPath string) {
+	t.Helper()
+	n.raftMu.Lock()
+	memLen := n.log.lastIndex()
+	memTerms := make([]uint64, memLen)
+	memData := make([][]byte, memLen)
+	for i := uint64(1); i <= memLen; i++ {
+		memTerms[i-1] = n.log.term(i)
+		memData[i-1] = append([]byte(nil), n.log.entryAt(i)...)
+	}
+	n.raftMu.Unlock()
+
+	lf, entries, err := openRaftLogFile(logPath, false)
+	if err != nil {
+		t.Fatalf("reload raft log: %v", err)
+	}
+	defer lf.close()
+	if uint64(len(entries)) != memLen {
+		t.Fatalf("file has %d entries, in-memory log has %d (orphan or duplicate tail)", len(entries), memLen)
+	}
+	for i, pe := range entries {
+		if pe.term != memTerms[i] {
+			t.Errorf("entry %d: file term %d, memory term %d", i+1, pe.term, memTerms[i])
+		}
+		if !bytes.Equal(pe.data, memData[i]) {
+			t.Errorf("entry %d: file data %q, memory data %q", i+1, pe.data, memData[i])
+		}
+	}
+}
+
+// TestLeaderRaftLogMirrorsAcrossStepDown is the leader-side analogue of
+// TestRaftLogFileMirrorsInMemoryLog. It parks a leader's commit() after it has
+// appended the entry to the raft log (file + memory) but before quorum — by
+// gating away the followers' acks so the commit index never advances — then
+// forces a step-down with a higher-term message. The parked commit must return
+// ErrNotLeader, and the raft log file must still mirror the in-memory log
+// exactly: the leader-path append + a racing step-down leaves no orphan tail.
+func TestLeaderRaftLogMirrorsAcrossStepDown(t *testing.T) {
+	const n = 3
+	ds := dirs(t, n)
+	// Hold every append-response to the leader so it can never reach quorum.
+	gate := newGateTransport(func(to NodeID, m Message) bool {
+		return to == 0 && m.Type == MsgAppendResponse
+	})
+	c, err := NewWithTransportConfig(n, ds,
+		db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true}, gate, stableConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	waitFor(t, time.Second, func() bool { return c.Node(0).roleValue() == Leader })
+	leaderTerm := c.Node(0).termValue()
+
+	// Park a commit: it appends to the raft log, then blocks waiting for a quorum
+	// the gate withholds forever.
+	done := make(chan error, 1)
+	go func() { done <- c.Node(0).store.Put([]byte("k"), []byte("v")) }()
+
+	// Wait until the entry is durably appended (file + memory) — commit() is now
+	// past the append and parked on its apply wait.
+	waitFor(t, 2*time.Second, func() bool { return c.Node(0).lastIndex() >= 1 })
+
+	// Deliver a higher-term AppendEntries (not held by the predicate). The
+	// follower path steps the leader down, which broadcasts the apply cond; the
+	// parked commit wakes, sees role != Leader, and returns ErrNotLeader.
+	_ = gate.Send(0, Message{
+		Type: MsgAppendEntries, From: 1, Term: leaderTerm + 5,
+		PrevLogIndex: 0, PrevLogTerm: 0,
+	})
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("parked Put returned %v, want ErrNotLeader", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("parked Put did not return after step-down")
+	}
+	waitFor(t, time.Second, func() bool { return c.Node(0).roleValue() == Follower })
+
+	assertFileMirrorsMemoryLive(t, c.Node(0), filepath.Join(ds[0], "raft", raftLogFileName))
 }
