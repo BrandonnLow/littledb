@@ -22,12 +22,15 @@ func assertFileMirrorsMemory(t *testing.T, n *Node, logPath string) {
 		t.Fatalf("reload raft log: %v", err)
 	}
 	defer lf2.close()
-	if uint64(len(entries)) != n.log.lastIndex() {
-		t.Fatalf("file has %d entries, in-memory log has %d (orphan or duplicate tail)",
-			len(entries), n.log.lastIndex())
+	if lf2.baseIndex != n.log.baseIndex {
+		t.Fatalf("file base %d, in-memory base %d", lf2.baseIndex, n.log.baseIndex)
+	}
+	if uint64(len(entries)) != n.log.lastIndex()-n.log.baseIndex {
+		t.Fatalf("file has %d entries above base, in-memory log has %d (orphan or duplicate tail)",
+			len(entries), n.log.lastIndex()-n.log.baseIndex)
 	}
 	for i, pe := range entries {
-		idx := uint64(i) + 1
+		idx := lf2.baseIndex + uint64(i) + 1
 		if pe.term != n.log.term(idx) {
 			t.Errorf("entry %d: file term %d, memory term %d", idx, pe.term, n.log.term(idx))
 		}

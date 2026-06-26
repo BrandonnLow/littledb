@@ -93,6 +93,7 @@ func (n *Node) sendLoop(p NodeID) bool {
 		if resp.Success {
 			n.onAppendSuccessLocked(p, prevLogIndex+uint64(len(entries)))
 			n.maybeAdvanceCommitLocked()
+			n.maybeCompactLocked()
 			caughtUp := n.nextIndex[p] > n.log.lastIndex()
 			n.raftMu.Unlock()
 			if caughtUp {
@@ -124,6 +125,14 @@ func (n *Node) onAppendRejectLocked(p NodeID, hint uint64) {
 	if hint < 1 {
 		hint = 1
 	}
+	// Never back up into the compacted prefix: the leader doesn't hold those
+	// entries, and sendLoop's term(prevLogIndex) would index below the base.
+	// An honest follower's hint never reaches here (it retains every
+	// committed entry up to the leader's base); will switch to
+	// InstallSnapshot instead of clamping.
+	if base := n.log.baseIndex; hint <= base {
+		hint = base + 1
+	}
 	n.nextIndex[p] = hint
 }
 
@@ -148,9 +157,48 @@ func (n *Node) maybeAdvanceCommitLocked() {
 	sort.Slice(vals, func(i, j int) bool { return vals[i] > vals[j] })
 	cand := vals[total/2] // highest index a majority (incl. leader) holds
 
+	// cand >= baseIndex whenever term(cand) is evaluated: the guard requires
+	// cand > commitIndex, and commitIndex >= baseIndex always (we only compact
+	// up to safe <= lastApplied <= commitIndex). After a leadership change
+	// resets matchIndex to 0, cand can be < baseIndex, but then cand <=
+	// commitIndex short-circuits the term() call. So term(cand) never indexes
+	// the compacted prefix.
 	if cand > n.commitIndex && n.log.term(cand) == n.currentTerm {
 		n.commitIndex = cand
 		n.signalApply()
 		n.signalReplicators()
 	}
+}
+
+// maybeCompactLocked compacts the Raft log up to the highest index every node is
+// known to hold — min(lastApplied, min over peers matchIndex) — once the
+// in-memory suffix reaches SnapshotThreshold. Leader-only and bounded by the
+// slowest follower's matchIndex, so every discarded entry is one every node
+// already has: plain AppendEntries always suffices to catch a follower up, and
+// any future leader (which had matchIndex >= base) holds every surviving entry,
+// so no node is ever stranded below another's base. A peer that has never acked
+// pins safe at 0, disabling compaction until it catches up. The in-memory
+// compactTo and the file rewrite happen together under raftMu (accepted stall);
+// on a file error the file is unchanged and memory is left uncompacted, so the
+// two stay mirrored. Must hold raftMu.
+func (n *Node) maybeCompactLocked() {
+	if n.cfg.SnapshotThreshold <= 0 || len(n.log.entries) < n.cfg.SnapshotThreshold {
+		return
+	}
+	safe := n.lastApplied
+	for _, p := range n.peers {
+		if n.matchIndex[p] < safe {
+			safe = n.matchIndex[p]
+		}
+	}
+	if safe <= n.log.baseIndex {
+		return
+	}
+	newBaseTerm := n.log.term(safe)
+	if n.logFile != nil {
+		if err := n.logFile.compact(safe, newBaseTerm, n.log.entriesAfter(safe)); err != nil {
+			return // file unchanged; leave memory uncompacted to stay mirrored
+		}
+	}
+	n.log.compactTo(safe, newBaseTerm)
 }
