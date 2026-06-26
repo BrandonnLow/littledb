@@ -29,12 +29,16 @@ type Config struct {
 	ElectionMin time.Duration
 	ElectionMax time.Duration
 	Heartbeat   time.Duration
+	// SnapshotThreshold is the in-memory Raft-log entry count above which the
+	// leader compacts (leader-only, bounded by the slowest follower's matchIndex).
+	// <= 0 disables compaction.
+	SnapshotThreshold int
 }
 
 // DefaultConfig returns conservative timers: heartbeat 50ms, election
 // 250–500ms (50 <= 250/3), safe against spurious elections under -race.
 func DefaultConfig() Config {
-	return Config{ElectionMin: 250 * time.Millisecond, ElectionMax: 500 * time.Millisecond, Heartbeat: 50 * time.Millisecond}
+	return Config{ElectionMin: 250 * time.Millisecond, ElectionMax: 500 * time.Millisecond, Heartbeat: 50 * time.Millisecond, SnapshotThreshold: 1024}
 }
 
 // Node wraps a db.DB with a Raft log, an election state machine, and a
@@ -93,6 +97,13 @@ func (n *Node) lastIndex() uint64 {
 	n.raftMu.Lock()
 	defer n.raftMu.Unlock()
 	return n.log.lastIndex()
+}
+
+// baseIndexValue returns the Raft log's compaction base under raftMu.
+func (n *Node) baseIndexValue() uint64 {
+	n.raftMu.Lock()
+	defer n.raftMu.Unlock()
+	return n.log.baseIndex
 }
 
 func (n *Node) appliedIndex() uint64 {
@@ -237,6 +248,9 @@ func (n *Node) handleAppendEntries(m Message) {
 	// WAL is untouched, holding only applied entries that never truncate.
 	for i, e := range m.Entries {
 		idx := m.PrevLogIndex + uint64(i) + 1
+		if idx <= n.log.baseIndex {
+			continue // already compacted (committed); we have it durably
+		}
 		if idx <= n.log.lastIndex() {
 			if n.log.term(idx) == e.Term {
 				continue // already have this exact entry (idempotent)
@@ -460,11 +474,23 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 			return nil, fmt.Errorf("cluster: open raft state node %d: %w", i, err)
 		}
 
-		rlog := NewRaftLog()
+		rlog := NewRaftLogWithBase(logFile.baseIndex, logFile.baseTerm)
 		for _, pe := range persisted {
 			rlog.append(pe.term, pe.data)
 		}
 		recovered := store.RecoveredAppliedIndex()
+		// Everything at-or-below baseIndex was applied and made durable in the
+		// data WAL before we compacted past it, so recovery must reconstruct an
+		// applied index at least baseIndex. A lower value means the compacted
+		// prefix outran durable applied state — corruption; refuse to start
+		// rather than silently apply into a compacted region.
+		if recovered < logFile.baseIndex {
+			logFile.close()
+			stateFile.close()
+			store.Close()
+			c.Close()
+			return nil, fmt.Errorf("cluster: node %d recovered applied index %d below raft log base %d (corruption)", i, recovered, logFile.baseIndex)
+		}
 
 		var peers []NodeID
 		for j := 0; j < n; j++ {

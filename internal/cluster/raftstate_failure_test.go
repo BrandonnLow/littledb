@@ -24,11 +24,11 @@ func (f *fakePersister) save(currentTerm uint64, votedFor NodeID) error {
 
 func (f *fakePersister) close() error { return nil }
 
-// TestHandleRequestVotePersistFailureDeclines pins decision-6's vote-cast rule:
-// if persisting a granted vote fails, the node rolls votedFor back and replies
-// NOT granted (rather than externalizing a vote it can't guarantee survived).
-// It then confirms the rollback left clean state — once the persister recovers,
-// the same candidate is granted normally.
+// TestHandleRequestVotePersistFailureDeclines vote-cast rule: if persisting a
+// granted vote fails, the node rolls votedFor back and replies NOT granted
+// (rather than externalizing a vote it can't guarantee survived). It then
+// confirms the rollback left clean state — once the persister recovers,the
+// same candidate is granted normally.
 func TestHandleRequestVotePersistFailureDeclines(t *testing.T) {
 	tr := NewChannelTransport()
 	tr.Register(0) // voter
@@ -108,12 +108,12 @@ func TestMaybeStartElectionPersistFailureAborts(t *testing.T) {
 	}
 }
 
-// TestStepDownPersistFailureProceeds pins decision-6's asymmetry: a term
-// adoption whose persist fails still proceeds in memory (adopt term, revert to
-// follower) rather than panicking or rolling back. This path only ever
-// externalizes an idempotent ack, so the degraded (memory term > durable term)
-// window is the bounded risk the design accepts. A vote response carrying a
-// higher term is the cleanest trigger (step-down without a following vote).
+// TestStepDownPersistFailureProceeds asymmetry: a term adoption whose persist
+// fails still proceeds in memory (adopt term, revert to follower) rather than
+// panicking or rolling back. This path only ever externalizes an idempotent
+// ack, so the degraded (memory term > durable term) window is the bounded risk
+// the design accepts. A vote response carrying a higher term is the cleanest
+// trigger (step-down without a following vote).
 func TestStepDownPersistFailureProceeds(t *testing.T) {
 	fp := &fakePersister{failErr: errInjected}
 	n := &Node{

@@ -148,6 +148,7 @@ func TestLeaderNextIndexTransitions(t *testing.T) {
 		peers:      []NodeID{1},
 		nextIndex:  map[NodeID]uint64{1: 1},
 		matchIndex: map[NodeID]uint64{1: 0},
+		log:        NewRaftLog(), // base 0: clamp leaves the assertions unchanged
 	}
 	n.raftMu.Lock()
 	defer n.raftMu.Unlock()
