@@ -319,6 +319,31 @@ func (lf *raftLogFile) compact(newBaseIndex, newBaseTerm uint64, survivors []per
 	return nil
 }
 
+// resetToBase rewrites the live file to an EMPTY log based at (newBaseIndex,
+// newBaseTerm), discarding every frame — the durable side of RaftLog.resetToBase
+// for InstallSnapshot. It reuses compact's crash-atomic tmp->fsync->rename->
+// fsync-dir path with no survivors, so a crash before the rename leaves the old
+// file intact (the install is gated by a marker that re-runs completion).
+func (lf *raftLogFile) resetToBase(newBaseIndex, newBaseTerm uint64) error {
+	return lf.compact(newBaseIndex, newBaseTerm, nil)
+}
+
+// resetRaftLogFileTo rewrites the raft log at path to an empty log based at
+// (idx, term) without an already-open handle, for InstallSnapshot completion
+// during Open — which must run before the log file is opened for normal use and
+// before the recovered-vs-base guard. Crash-atomic via raftLogFile.compact.
+func resetRaftLogFileTo(path string, idx, term uint64, sync bool) error {
+	lf, _, err := openRaftLogFile(path, sync)
+	if err != nil {
+		return err
+	}
+	if err := lf.compact(idx, term, nil); err != nil {
+		lf.close()
+		return err
+	}
+	return lf.close()
+}
+
 func (lf *raftLogFile) close() error {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()

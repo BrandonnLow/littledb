@@ -117,6 +117,19 @@ func (l *RaftLog) compactTo(newBaseIndex, newBaseTerm uint64) {
 	l.baseTerm = newBaseTerm
 }
 
+// resetToBase discards ALL entries and sets the base to (newBaseIndex,
+// newBaseTerm) — an index this log need not currently hold. It is the snapshot
+// analogue of compactTo: compactTo trims to an index the log has (reading its
+// term from the surviving entry), whereas resetToBase installs a base learned
+// from a leader's snapshot, where the node has none of the prefix. After it the
+// log is empty above the new base and the next AppendEntries appends from
+// newBaseIndex+1. Used only on the InstallSnapshot path.
+func (l *RaftLog) resetToBase(newBaseIndex, newBaseTerm uint64) {
+	l.entries = nil
+	l.baseIndex = newBaseIndex
+	l.baseTerm = newBaseTerm
+}
+
 // entriesAfter returns the entries with index > idx (idx in [baseIndex,
 // lastIndex]) as persistedEntry values, in index order — for rewriting the
 // compacted Raft log file. The data slices are shared (not copied); the caller
