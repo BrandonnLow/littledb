@@ -279,6 +279,64 @@ func (db *DB) Scan(start, end []byte, snapshot uint64) (*Iterator, error) {
 	return it, nil
 }
 
+// SnapshotScan captures the applied frontier and a pinned, snapshot-consistent
+// iterator over all live keys as of that frontier, for building a Raft snapshot
+// to ship to a far-behind follower. It returns the iterator plus the applied
+// Raft index and the timestamp the snapshot is taken at.
+//
+// lastIncludedIndex (= appliedIndex) and snapshotTS (= appliedTS) are read in
+// the SAME read-lock section that captures the layer set, so the pair is exactly
+// consistent: snapshotTS is the commit timestamp of the entry at
+// lastIncludedIndex (ts is monotonic with applied index), never a later one.
+// This is what makes the snapshot content match the base index precisely — a
+// follower that installs it and sets base = lastIncludedIndex will not have
+// entries beyond the base re-driven through ApplyEntry.
+//
+// Pinning at appliedTS is also what makes the scan complete and GC-immune:
+// every stored version has ts <= appliedTS = snapshotTS, GC never drops a key's
+// newest stored version, and the captured SSTable readers keep their (possibly
+// later unlinked) files alive for the iterator's lifetime. So a long stream off
+// this iterator stays consistent under concurrent flush and compaction with no
+// read-lease. (Deriving snapshotTS from the log entry instead would leave
+// snapshotTS < appliedTS at scan time and reopen that gap.)
+func (db *DB) SnapshotScan() (it *Iterator, lastIncludedIndex, snapshotTS uint64, err error) {
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return nil, 0, 0, errClosed
+	}
+	lastIncludedIndex = db.appliedIndex
+	snapshotTS = db.appliedTS
+	activeMT := db.memtable
+	frozenMT := db.frozen
+	ssts := make([]*sstable.Reader, len(db.sstables))
+	copy(ssts, db.sstables)
+	db.mu.RUnlock()
+
+	cursors := []versionCursor{
+		&sliceCursor{entries: activeMT.RangeSnapshot(nil, nil)},
+	}
+	if frozenMT != nil {
+		cursors = append(cursors, &sliceCursor{entries: frozenMT.RangeSnapshot(nil, nil)})
+	}
+	for _, r := range ssts {
+		c, cerr := r.NewIterator(nil, nil)
+		if cerr != nil {
+			for _, cc := range cursors {
+				cc.Close()
+			}
+			return nil, 0, 0, fmt.Errorf("db: snapshot scan: %w", cerr)
+		}
+		cursors = append(cursors, c)
+	}
+
+	it = &Iterator{merge: newMergeIterator(cursors), snapshot: snapshotTS}
+	if it.merge.err != nil {
+		it.err = it.merge.err
+	}
+	return it, lastIncludedIndex, snapshotTS, nil
+}
+
 // ScanNow returns a Scan at the latest committed snapshot
 // (nextTimestamp - 1) — the range-scan analogue of Get.
 func (db *DB) ScanNow(start, end []byte) (*Iterator, error) {
