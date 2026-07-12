@@ -12,11 +12,13 @@ func snapshotOpts() db.Options {
 	return db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true}
 }
 
-// TestLeaderCompactionBoundedByMinMatchIndex: a leader only compacts up to
-// the slowest follower's matchIndex. A partitioned follower pins safe at 0
-// (no compaction), and on reconnect it catches up via plain AppendEntries
-// — no InstallSnapshot — after which compaction proceeds.
-func TestLeaderCompactionBoundedByMinMatchIndex(t *testing.T) {
+// TestLaggingFollowerGetsSnapshot pins decision 6 (aggressive compaction) and
+// the InstallSnapshot path. With the min-matchIndex bound dropped, a leader
+// compacts to its own lastApplied even while a follower is partitioned — past
+// that follower's matchIndex. On reconnect the follower's nextIndex sits in the
+// compacted prefix, so the leader catches it up with a snapshot (not
+// AppendEntries), after which it holds every key.
+func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
 	pt := newPartitionTransport()
@@ -30,36 +32,50 @@ func TestLeaderCompactionBoundedByMinMatchIndex(t *testing.T) {
 
 	waitFor(t, time.Second, func() bool { return c.Node(0).roleValue() == Leader })
 
-	// Partition follower 2 so its matchIndex stays 0.
+	// Partition follower 2 so its matchIndex stays 0, then write past the
+	// threshold so the leader compacts past it.
 	pt.disconnect(2)
 	for i := 0; i < 8; i++ {
 		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), []byte(fmt.Sprintf("v%d", i))); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
-	waitFor(t, 2*time.Second, func() bool { return c.Node(0).lastIndex() >= 8 })
-	// Every successful ack from follower 1 ran maybeCompactLocked with
-	// safe=min(lastApplied, matchIndex[1], matchIndex[2]=0)=0, so the base must
-	// still be 0.
-	time.Sleep(150 * time.Millisecond)
-	if base := c.Node(0).baseIndexValue(); base != 0 {
-		t.Fatalf("leader compacted to base %d with follower 2 partitioned; want 0 (minMatchIndex bound)", base)
-	}
+	// Aggressive compaction: the leader's base advances past follower 2's
+	// matchIndex (0) — the exact opposite of the old min-matchIndex bound.
+	waitFor(t, 3*time.Second, func() bool { return c.Node(0).baseIndexValue() > 0 })
+	leaderBase := c.Node(0).baseIndexValue()
+	t.Logf("leader compacted to base %d while follower 2 partitioned", leaderBase)
 
-	// Reconnect follower 2: it catches up by ordinary replication, matchIndex[2]
-	// rises, and the leader can finally compact.
+	// Reconnect follower 2: its nextIndex is in the compacted prefix, so it must
+	// be caught up by InstallSnapshot.
 	pt.reconnect(2)
-	waitFor(t, 5*time.Second, func() bool { return c.Node(0).baseIndexValue() > 0 })
+	waitFor(t, 5*time.Second, func() bool { return c.Node(2).InstallsForTesting() >= 1 })
+
+	// After install, follower 2's base equals the snapshot's lastIncludedIndex
+	// (> 0) and it holds every key. Use DB() (storeMu-guarded): the install
+	// swapped the store out from under the node.
+	if base := c.Node(2).baseIndexValue(); base == 0 {
+		t.Fatalf("follower 2 base still 0 after install")
+	}
 	waitFor(t, 2*time.Second, func() bool {
-		v, err := c.Node(2).store.Get([]byte("k7"))
+		v, err := c.Node(2).DB().Get([]byte("k7"))
 		return err == nil && string(v) == "v7"
 	})
-	t.Logf("after reconnect: leader base=%d, follower 2 caught up via AppendEntries", c.Node(0).baseIndexValue())
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("k%d", i)
+		want := fmt.Sprintf("v%d", i)
+		v, err := c.Node(2).DB().Get([]byte(key))
+		if err != nil || string(v) != want {
+			t.Errorf("follower 2 Get(%s) = (%q,%v), want %s", key, v, err, want)
+		}
+	}
+	t.Logf("follower 2 caught up via InstallSnapshot (installs=%d, base=%d)",
+		c.Node(2).InstallsForTesting(), c.Node(2).baseIndexValue())
 }
 
-// TestRestartAfterCompaction: a compacted raft.log persists its base across a
-// full cluster restart, the in-memory log is reconstructed as base+suffix, and
-// all applied data survives.
+// TestRestartAfterCompaction pins decision 9: a compacted raft.log persists its
+// base across a full cluster restart, the in-memory log is reconstructed as
+// base+suffix, and all applied data survives.
 func TestRestartAfterCompaction(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
@@ -107,9 +123,12 @@ func TestRestartAfterCompaction(t *testing.T) {
 
 // TestLeadershipChangeAfterCompaction is the across-elections correctness pin: a
 // leader compacts (base > 0), then fails; a full-log follower takes over and,
-// when the ex-leader rejoins, serves it from the compaction boundary
-// (prevLogIndex == ex-leader.baseIndex, matched against baseTerm) via plain
-// AppendEntries. No node is stranded below another's base; all converge.
+// when the ex-leader rejoins, brings it current. With aggressive compaction the
+// ex-leader may now reconverge either by AppendEntries from the compaction
+// boundary OR by InstallSnapshot if its nextIndex has fallen into the new
+// leader's compacted prefix; the test asserts convergence and data integrity
+// either way (it no longer requires the snapshot-free path). No node is stranded
+// below another's base; all converge.
 func TestLeadershipChangeAfterCompaction(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
@@ -152,18 +171,19 @@ func TestLeadershipChangeAfterCompaction(t *testing.T) {
 	}
 
 	// Reconnect the ex-leader: it converges on both new and pre-compaction data
-	// without ever receiving a snapshot RPC.
+	// (via AppendEntries or InstallSnapshot). Read through DB() since an install
+	// would swap the store.
 	pt.reconnect(oldID)
 	waitFor(t, 6*time.Second, func() bool {
-		v, err := c.Node(int(oldID)).store.Get([]byte("after"))
+		v, err := c.Node(int(oldID)).DB().Get([]byte("after"))
 		if err != nil || string(v) != "compact" {
 			return false
 		}
-		v7, err := c.Node(int(oldID)).store.Get([]byte("k7"))
+		v7, err := c.Node(int(oldID)).DB().Get([]byte("k7"))
 		return err == nil && string(v7) == "v7"
 	})
 	for _, nd := range []int{0, 1, 2} {
-		if v, err := c.Node(nd).store.Get([]byte("k0")); err != nil || string(v) != "v0" {
+		if v, err := c.Node(nd).DB().Get([]byte("k0")); err != nil || string(v) != "v0" {
 			t.Errorf("node %d Get(k0) = (%q,%v), want v0", nd, v, err)
 		}
 	}
