@@ -52,6 +52,24 @@ func (n *Node) sendLoop(p NodeID) bool {
 		}
 		term := n.currentTerm
 		next := n.nextIndex[p]
+		base := n.log.baseIndex
+		if next-1 < base {
+			// p's nextIndex has fallen into our compacted prefix — we no longer
+			// hold the entry to continue from. Catch it up with a snapshot instead
+			// of AppendEntries (term(prevLogIndex) below would index the compacted
+			// prefix and panic).
+			n.raftMu.Unlock()
+			if !n.sendSnapshot(p, term) {
+				return false
+			}
+			n.raftMu.Lock()
+			caughtUp := n.nextIndex[p] > n.log.lastIndex() || n.role != Leader
+			n.raftMu.Unlock()
+			if caughtUp {
+				return true
+			}
+			continue
+		}
 		last := n.log.lastIndex()
 		prevLogIndex := next - 1
 		prevLogTerm := n.log.term(prevLogIndex)
@@ -120,18 +138,13 @@ func (n *Node) onAppendSuccessLocked(p NodeID, matchIndex uint64) {
 }
 
 // onAppendRejectLocked backs p's nextIndex up to the follower's hint (clamped
-// to >= 1) after a prevLog mismatch. Must hold raftMu.
+// to >= 1) after a prevLog mismatch. If the hint lands in our compacted prefix,
+// sendLoop detects nextIndex-1 < baseIndex on the next round and switches to
+// InstallSnapshot — the hint is no longer clamped up to the base here. Must
+// hold raftMu.
 func (n *Node) onAppendRejectLocked(p NodeID, hint uint64) {
 	if hint < 1 {
 		hint = 1
-	}
-	// Never back up into the compacted prefix: the leader doesn't hold those
-	// entries, and sendLoop's term(prevLogIndex) would index below the base.
-	// An honest follower's hint never reaches here (it retains every
-	// committed entry up to the leader's base); will switch to
-	// InstallSnapshot instead of clamping.
-	if base := n.log.baseIndex; hint <= base {
-		hint = base + 1
 	}
 	n.nextIndex[p] = hint
 }
@@ -170,27 +183,21 @@ func (n *Node) maybeAdvanceCommitLocked() {
 	}
 }
 
-// maybeCompactLocked compacts the Raft log up to the highest index every node is
-// known to hold — min(lastApplied, min over peers matchIndex) — once the
-// in-memory suffix reaches SnapshotThreshold. Leader-only and bounded by the
-// slowest follower's matchIndex, so every discarded entry is one every node
-// already has: plain AppendEntries always suffices to catch a follower up, and
-// any future leader (which had matchIndex >= base) holds every surviving entry,
-// so no node is ever stranded below another's base. A peer that has never acked
-// pins safe at 0, disabling compaction until it catches up. The in-memory
-// compactTo and the file rewrite happen together under raftMu (accepted stall);
-// on a file error the file is unchanged and memory is left uncompacted, so the
-// two stay mirrored. Must hold raftMu.
+// maybeCompactLocked compacts the Raft log up to lastApplied once the in-memory
+// suffix reaches SnapshotThreshold. It is no longer bounded by the slowest
+// follower's matchIndex: a peer that falls below the new base is caught up via
+// InstallSnapshot (sendLoop switches to a snapshot when its nextIndex enters the
+// compacted prefix), so discarding entries a lagging follower still needs is
+// safe. Runs on every node — the leader (from the replication path) and
+// followers (from the apply loop) — each compacting its own applied prefix. The
+// in-memory compactTo and the file rewrite happen together under raftMu; on a
+// file error the file is unchanged and memory is left uncompacted, so the two
+// stay mirrored. Must hold raftMu.
 func (n *Node) maybeCompactLocked() {
 	if n.cfg.SnapshotThreshold <= 0 || len(n.log.entries) < n.cfg.SnapshotThreshold {
 		return
 	}
 	safe := n.lastApplied
-	for _, p := range n.peers {
-		if n.matchIndex[p] < safe {
-			safe = n.matchIndex[p]
-		}
-	}
 	if safe <= n.log.baseIndex {
 		return
 	}

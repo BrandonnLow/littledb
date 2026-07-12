@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BrandonnLow/littledb/internal/db"
@@ -30,8 +31,8 @@ type Config struct {
 	ElectionMax time.Duration
 	Heartbeat   time.Duration
 	// SnapshotThreshold is the in-memory Raft-log entry count above which the
-	// leader compacts (leader-only, bounded by the slowest follower's matchIndex).
-	// <= 0 disables compaction.
+	// leader compacts (leader-only, bounded by the slowest follower's
+	// matchIndex). <= 0 disables compaction.
 	SnapshotThreshold int
 }
 
@@ -51,6 +52,22 @@ type Node struct {
 	transport Transport
 	peers     []NodeID
 	cfg       Config
+
+	// dir is the node's DB data dir; raftDir (dir/raft) holds the Raft log,
+	// state, and InstallSnapshot staging/marker. opts reopens the store after a
+	// snapshot install. storeMu guards store-call sites against the install swap
+	// (RLock to use the store, exclusive Lock to replace it); it is strictly
+	// OUTER to raftMu.
+	dir     string
+	raftDir string
+	opts    db.Options
+	storeMu sync.RWMutex
+
+	// installing (raftMu) is set while an InstallSnapshot is being applied: the
+	// apply loop parks, and the node defers elections, until the swap completes.
+	// installsApplied counts completed installs, for tests.
+	installing      bool
+	installsApplied atomic.Uint64
 
 	inbox <-chan Message
 	quit  chan struct{}
@@ -91,7 +108,11 @@ type Node struct {
 func (n *Node) ID() NodeID { return n.id }
 
 // DB returns the node's underlying store (for inspection and tests).
-func (n *Node) DB() *db.DB { return n.store }
+func (n *Node) DB() *db.DB {
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
+	return n.store
+}
 
 func (n *Node) lastIndex() uint64 {
 	n.raftMu.Lock()
@@ -129,6 +150,10 @@ func (n *Node) termValue() uint64 {
 	defer n.raftMu.Unlock()
 	return n.currentTerm
 }
+
+// InstallsForTesting reports how many InstallSnapshot installs this node has
+// completed.
+func (n *Node) InstallsForTesting() uint64 { return n.installsApplied.Load() }
 
 func (n *Node) start() {
 	n.appliedCond = sync.NewCond(&n.raftMu)
@@ -183,10 +208,12 @@ func (n *Node) run() {
 				n.handleRequestVote(m)
 			case MsgRequestVoteResponse:
 				n.handleVoteResponse(m)
-			case MsgAppendResponse:
+			case MsgInstallSnapshot:
+				n.handleInstallSnapshot(m)
+			case MsgAppendResponse, MsgInstallSnapshotResponse:
 				// Route to the follower's replicator. Reliable (no drop): with
-				// one AppendEntries in flight per follower, dropping a response
-				// would stall it forever.
+				// one AppendEntries / InstallSnapshot in flight per follower,
+				// dropping a response would stall it forever.
 				ch := n.respCh[m.From]
 				if ch == nil {
 					continue
@@ -316,9 +343,15 @@ func (n *Node) applyLoop() {
 
 func (n *Node) applyCommitted() {
 	for {
+		// storeMu (shared) is held across the whole iteration so an install swap
+		// (exclusive) can only interpose BETWEEN iterations, never mid-apply, and
+		// never re-drives an entry the swapped-in snapshot already covers. It is
+		// strictly outer to raftMu.
+		n.storeMu.RLock()
 		n.raftMu.Lock()
-		if n.lastApplied >= n.commitIndex {
+		if n.installing || n.lastApplied >= n.commitIndex {
 			n.raftMu.Unlock()
+			n.storeMu.RUnlock()
 			return
 		}
 		idx := n.lastApplied + 1
@@ -326,13 +359,20 @@ func (n *Node) applyCommitted() {
 		n.raftMu.Unlock()
 
 		if err := n.store.ApplyEntry(idx, entry); err != nil {
+			n.storeMu.RUnlock()
 			panic(fmt.Sprintf("cluster: node %d apply entry %d: %v", n.id, idx, err))
 		}
 
 		n.raftMu.Lock()
 		n.lastApplied = idx
 		n.appliedCond.Broadcast()
+		// Followers self-compact once their applied suffix is long enough; safe
+		// now that a far-behind peer is caught up via InstallSnapshot rather than
+		// AppendEntries. The leader compacts on the replication path too; this
+		// call is harmless there (it recomputes the same safe point).
+		n.maybeCompactLocked()
 		n.raftMu.Unlock()
+		n.storeMu.RUnlock()
 	}
 }
 
@@ -353,7 +393,9 @@ func (n *Node) commit(t *db.Txn) error {
 	term := n.currentTerm
 	n.raftMu.Unlock()
 
+	n.storeMu.RLock()
 	entry, _, err := n.store.PrepareCommit(t)
+	n.storeMu.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -433,21 +475,32 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 
 	c := &Cluster{transport: tr}
 	for i := 0; i < n; i++ {
+		// Per-node Raft files live in a raft/ subdir, isolated from the DB's own
+		// dir. Create it first so install completion (below) can find a pending
+		// marker, and so the freshness stat further down sees a stable dir.
+		raftDir := filepath.Join(dirs[i], "raft")
+		if err := os.MkdirAll(raftDir, 0o755); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("cluster: mkdir raft dir node %d: %w", i, err)
+		}
+		// Finish any interrupted InstallSnapshot BEFORE opening the store and
+		// BEFORE the recovered-vs-base guard: a mid-install crash leaves the data
+		// dir possibly mid-swap and the recovered applied index below the snapshot
+		// base until the swap lands. Completion is idempotent (re-runs from the
+		// staged dir until the marker clears).
+		if err := completeInstallIfPending(dirs[i], raftDir, opts.SyncOnWrite); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("cluster: complete pending install node %d: %w", i, err)
+		}
+
 		store, err := db.OpenWith(dirs[i], opts)
 		if err != nil {
 			c.Close()
 			return nil, fmt.Errorf("cluster: open node %d: %w", i, err)
 		}
 
-		// Per-node Raft files live in a raft/ subdir, isolated from the DB's
-		// own dir. The log file's prior existence distinguishes a fresh start
-		// (bootstrap) from a restart (reconstruct + re-elect).
-		raftDir := filepath.Join(dirs[i], "raft")
-		if err := os.MkdirAll(raftDir, 0o755); err != nil {
-			store.Close()
-			c.Close()
-			return nil, fmt.Errorf("cluster: mkdir raft dir node %d: %w", i, err)
-		}
+		// The log file's prior existence distinguishes a fresh start (bootstrap)
+		// from a restart (reconstruct + re-elect).
 		logPath := filepath.Join(raftDir, raftLogFileName)
 		statePath := filepath.Join(raftDir, raftStateFileName)
 		// Stat BOTH durable raft files before opening either: openRaftLogFile's
@@ -504,6 +557,9 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 			transport:   tr,
 			peers:       peers,
 			cfg:         cfg,
+			dir:         dirs[i],
+			raftDir:     raftDir,
+			opts:        opts,
 			inbox:       tr.Inbox(NodeID(i)),
 			quit:        make(chan struct{}),
 			log:         rlog,
@@ -620,12 +676,12 @@ func (c *Cluster) withLeader(fn func(*Node) error) error {
 
 // Put routes a write to the current leader, retrying across leadership changes.
 func (c *Cluster) Put(key, value []byte) error {
-	return c.withLeader(func(ld *Node) error { return ld.store.Put(key, value) })
+	return c.withLeader(func(ld *Node) error { return ld.storePut(key, value) })
 }
 
 // Delete routes a delete to the current leader, retrying across changes.
 func (c *Cluster) Delete(key []byte) error {
-	return c.withLeader(func(ld *Node) error { return ld.store.Delete(key) })
+	return c.withLeader(func(ld *Node) error { return ld.storeDelete(key) })
 }
 
 // Get reads from the current leader, retrying across leadership changes.
@@ -638,7 +694,7 @@ func (c *Cluster) Delete(key []byte) error {
 func (c *Cluster) Get(key []byte) ([]byte, error) {
 	var out []byte
 	err := c.withLeader(func(ld *Node) error {
-		v, e := ld.store.Get(key)
+		v, e := ld.storeGet(key)
 		if e != nil {
 			return e
 		}
@@ -651,7 +707,34 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 // Begin starts a transaction on the current leader. A user-held Txn that spans
 // a leadership change will get ErrNotLeader from Commit (no transparent retry —
 // the snapshot is tied to the node it began on).
-func (c *Cluster) Begin() *db.Txn { return c.leaderNode().store.Begin() }
+func (c *Cluster) Begin() *db.Txn { return c.leaderNode().storeBegin() }
+
+// storePut/storeDelete/storeGet/storeBegin reach the node's store under storeMu
+// (shared), so an in-flight InstallSnapshot swap (exclusive) never tears a read
+// or write across the store replacement.
+func (n *Node) storePut(key, value []byte) error {
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
+	return n.store.Put(key, value)
+}
+
+func (n *Node) storeDelete(key []byte) error {
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
+	return n.store.Delete(key)
+}
+
+func (n *Node) storeGet(key []byte) ([]byte, error) {
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
+	return n.store.Get(key)
+}
+
+func (n *Node) storeBegin() *db.Txn {
+	n.storeMu.RLock()
+	defer n.storeMu.RUnlock()
+	return n.store.Begin()
+}
 
 // Node returns the i-th node, for inspection and tests.
 func (c *Cluster) Node(i int) *Node { return c.nodes[i] }

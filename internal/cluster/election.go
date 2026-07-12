@@ -123,6 +123,13 @@ func (n *Node) maybeStartElection() {
 		n.raftMu.Unlock()
 		return
 	}
+	if n.installing {
+		// Mid-install: we are deliberately behind and catching up via a snapshot.
+		// Standing for election now would be wrong (and our log is in flux), so
+		// defer — the install resets the timer on completion.
+		n.raftMu.Unlock()
+		return
+	}
 	prevTerm, prevRole, prevVote, prevVotes := n.currentTerm, n.role, n.votedFor, n.votesReceived
 	n.currentTerm++
 	n.role = Candidate

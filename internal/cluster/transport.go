@@ -34,7 +34,25 @@ const (
 	// MsgRequestVoteResponse is a voter's reply: VoteGranted or not, plus its
 	// term so a stale candidate steps down.
 	MsgRequestVoteResponse
+	// MsgInstallSnapshot carries a leader's snapshot to a follower whose
+	// nextIndex has fallen into the leader's compacted prefix (so plain
+	// AppendEntries can no longer reach it). It ships the complete logical state
+	// as of (LastIncludedIndex, LastIncludedTerm), every pair stamped SnapshotTS.
+	// Single-message in this stage; chunking is a later refinement.
+	MsgInstallSnapshot
+	// MsgInstallSnapshotResponse is the follower's ack: Success once the snapshot
+	// is durably installed (MatchIndex = LastIncludedIndex), or a higher Term so
+	// a stale leader steps down.
+	MsgInstallSnapshotResponse
 )
+
+// KVPair is one live key/value pair on the wire in an InstallSnapshot. Keys are
+// in ascending order; the follower copies what it keeps (the channel transport
+// shares slices in-process).
+type KVPair struct {
+	Key   []byte
+	Value []byte
+}
 
 // Entry is one log entry on the wire: the encoded transaction bytes plus the
 // term in which its leader created it. The term must travel with the entry so
@@ -71,6 +89,12 @@ type Message struct {
 
 	// MsgRequestVoteResponse (voter -> candidate):
 	VoteGranted bool
+
+	// MsgInstallSnapshot (leader -> far-behind follower):
+	LastIncludedIndex uint64
+	LastIncludedTerm  uint64
+	SnapshotTS        uint64
+	Snapshot          []KVPair // read-only; the follower copies what it keeps
 }
 
 // Transport delivers messages between nodes. The Raft invariants are

@@ -29,3 +29,6 @@ Thumbs.db
 vendor/
 go.work
 go.work.sum
+
+# Claude
+.claude/ 
