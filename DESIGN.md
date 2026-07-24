@@ -759,6 +759,254 @@ an entry is committed, and applying it to the state machine. Pull them apart.
   leader lock.
 - **Guarantee on return.** A quorum has the entry logged and the leader has
   applied it; minority followers apply slightly later (on their `MsgCommit`).
-- **Deferred.** Crash recovery still replays the whole WAL (apply-all); a
-  persisted commit index is left. Term is constant 1, in memory. Per-follower
-  nextIndex/matchIndex, prevLog checks, and slow-follower catch-up are next.
+- **Since delivered.** What this section left as "next" now exists and is
+  documented below: real leader election, per-follower `nextIndex`/`matchIndex`
+  with prevLog checks and conflict-hint backup, durable hard state and a durable
+  Raft log with commit-bounded recovery, leader-and-follower log compaction, and
+  InstallSnapshot for far-behind followers. The one item still open is
+  linearizable reads (read-index / leader lease); Phase 5 stands up a checker
+  that makes that gap visible and measurable.
+
+### Leader election
+
+A fixed leader was a scaffold. Real Raft elects one: each node runs a randomized
+election timer in `[ElectionMin, ElectionMax]`; a follower that hears no leader
+before it fires increments its term, becomes a candidate, votes for itself, and
+solicits votes. A candidate that collects a majority becomes leader and
+immediately heartbeats so no peer times out into a competing election; any node
+that sees a higher term on any message steps down. Node 0 still bootstraps as
+leader at term 1 so a fresh cluster is immediately writable without an election
+round.
+
+**Heartbeat must sit well under the election floor.** The config comment pins the
+rule — a few heartbeats per election window (e.g. 50ms heartbeat vs. a 250ms
+floor) — or a healthy leader whose heartbeat is merely late gets voted out. Test
+configs that tighten the timers keep the same ratio; the linearizability soaks
+(Phase 5) deliberately relax them, because under `-race` contention a
+scheduling-delayed heartbeat must not trip an election or the cluster thrashes
+leaders and never converges.
+
+**The up-to-date restriction (§5.4.1).** A vote is granted only to a candidate
+whose log is at least as up-to-date as the voter's: a higher last-log term wins,
+otherwise an equal last term with an index at least as high. This is what keeps a
+committed entry in every future leader's log, so a leader never has to erase a
+committed entry to reconcile — the property the follower's conflict-truncation
+relies on.
+
+### Durable hard state (currentTerm, votedFor)
+
+The election-safety proof assumes a node never forgets, across a crash, the term
+it is in or the vote it cast in that term — otherwise a restarted node could vote
+twice in one term and split-brain two leaders. So `(currentTerm, votedFor)` is
+persisted to a 16-byte `raft/state` file, crash-atomically (temp → fsync →
+rename → fsync-dir), the same pattern the WAL's applied-base uses: the visible
+file is always a complete prior or new value, so no CRC or version field is
+needed.
+
+**The ordering is the invariant: durable before externalized.** A vote is written
+before the grant is sent; a candidate's self-vote (and term bump) is written
+before it solicits others — exactly as a log entry is made durable before it can
+be committed. On a persist failure the in-memory mutation is *rolled back* (vote
+declined, or candidacy abandoned and every field restored) so the in-memory term
+can never run ahead of disk. Step-down is the one asymmetric case: it persists
+the adopted term but proceeds even on failure, because a lost step-down only
+under-approximates (the in-memory term may exceed the durable one) and never
+externalizes anything but an idempotent ack; a subsequent vote re-persists the
+full state and *is* gated on success. The persister is an interface seam
+(`hardStatePersister`) so tests inject failures and exercise these rollback and
+degrade-safe paths.
+
+### Durable Raft log and commit-bounded recovery
+
+The in-memory Raft log is mirrored to a `raft/raft.log` file so a restarted node
+reconstructs exactly what it had logged. The file is a self-describing header
+(magic, `baseIndex`, `baseTerm`) followed by append-only-with-truncation frames
+`{term, len, bytes}`; the magic lets a pre-snapshot or foreign file be rejected
+loudly rather than misparsed, and the base header carries the compaction point
+(below). A torn trailing frame — a crash mid-append — is truncated on load, the
+same "expected torn tail" contract the data WAL has.
+
+**The file and the in-memory log are mutated together under `raftMu`, and the
+file fsyncs eagerly.** Both decisions cost throughput and buy a simple, provable
+invariant. Mutating together means the file can never lead memory: an earlier
+design appended the file outside the lock and then re-checked and appended
+memory, and a step-down in that gap left the file one suffix ahead — truncation
+keyed on the in-memory length could never reach it, so a retry re-appended and
+the file grew a duplicated tail (`..4,5,4,5`). Fsyncing eagerly means an entry is
+durable before the commit index can advance over it and apply it; lifting the
+fsync off the lock would need a separately tracked durable index so the leader
+never counts an unsynced entry toward commit — deferred.
+
+**Recovery is commit-bounded by the applied watermark.** The data WAL holds only
+*applied* (committed) entries — `ApplyEntry` is the single path from the Raft log
+to the data WAL — so on restart the store's recovered applied index is exactly
+how far the state machine got. The node seeds both `commitIndex` and
+`lastApplied` from it: committed entries are not re-applied, and any uncommitted
+tail in `raft.log` waits to be committed (or truncated by a future leader) rather
+than being applied on sight. A guard refuses to start if the recovered applied
+index is *below* the log's compaction base — that would mean the compacted prefix
+outran durable applied state, i.e. corruption.
+
+### Per-follower replication and the commit rule
+
+The leader keeps a `nextIndex` and `matchIndex` per follower. `AppendEntries`
+carries `(prevLogIndex, prevLogTerm)`; a follower that can't match them rejects
+with a `ConflictHint` (its own `lastIndex+1`) so the leader backs `nextIndex` up
+in one round instead of decrementing by one. On success the follower reports the
+`MatchIndex` it now holds, which only ever moves forward, so a stale or
+out-of-order success can't regress it. Replication is stop-and-wait per follower
+(one `AppendEntries` in flight, bounded by a response timeout so a lost reply is
+retried on the next heartbeat rather than stalling the follower forever);
+pipelining is a deferred optimization.
+
+**The commit rule is §5.4.2, and it is subtle.** The leader advances `commitIndex`
+to the highest index a majority holds — but only if the entry at that index is
+from the leader's *current* term. An entry from an earlier term is never
+committed by replica count alone; it commits indirectly the moment a current-term
+entry above it commits (committing index N commits everything ≤ N). Skipping this
+is the classic Raft bug where a replicated-but-not-yet-committed prior-term entry
+gets overwritten after a leader change. A consequence surfaced in Phase 5: with
+no new writes after a chaotic run, a freshly elected leader can sit on an
+uncommitted prior-term tail indefinitely, so the soak forces a definite
+convergence point by committing one fresh current-term write before quiescing.
+
+### Restart: reconstruction and re-election
+
+A node distinguishes a fresh start from a restart by whether *either* durable raft
+file exists (a node can persist a vote before ever logging an entry, so keying on
+`raft.log` alone would wrongly bootstrap a node that holds a durable vote). A
+restart never bootstraps: it comes up a follower and re-elects. Its resumed term
+is `max(state.currentTerm, log.lastTerm())` — the log term can exceed the saved
+term in the degraded window where a higher term was adopted and its entries
+logged but the hard-state fsync was lost, and a node holding a term-T entry has
+demonstrably been in term ≥ T. The saved vote is kept only when the saved term
+wins or ties; if the log term strictly wins, the node is moving to a higher term
+than the vote belongs to, so the vote resets. Absent state reads as `(0, noVote)`,
+making this same rule the legacy fallback.
+
+### Log compaction and InstallSnapshot
+
+An unbounded Raft log is a leak. Once the in-memory suffix crosses
+`SnapshotThreshold`, a node compacts it up to `lastApplied`: the in-memory log and
+the durable `raft.log` are rewritten together (the file atomically, tmp → rename
+→ fsync-dir), discarding the applied prefix, which is already durable in the data
+WAL. Both the leader (on the replication path) and followers (on the apply loop)
+self-compact their own applied prefix. Compaction is deliberately *not* bounded by
+the slowest follower's `matchIndex`: a follower that falls below the new base is
+caught up with a snapshot instead of `AppendEntries`.
+
+**InstallSnapshot ships logical state, not log bytes.** When a follower's
+`nextIndex` falls into the leader's compacted prefix — the leader no longer holds
+the entries to continue from — the leader streams a consistent, pinned scan of the
+live key/value set (as of a committed index), and the follower *wipes* its store
+and rebuilds from that set. It must wipe, not merge: deletes are absent from a
+live-set stream, so an in-place merge would leave stale live versions of keys
+deleted before the snapshot. The install is crash-atomic via a durable marker:
+the follower stages a new store, writes the marker (the commit point), then swaps
+it in and resets its Raft log to the snapshot base. `ApplyEntry` is not idempotent
+on re-apply — it double-appends to the data WAL, inflating the recovered applied
+index — so the marker gates trust in the live dir, and completion re-runs
+idempotently from the staged dir on the next open until the marker clears; it must
+run before the recovered-vs-base guard, since a legitimate mid-install crash
+leaves the recovered index below the base until the swap lands. The snapshot is a
+single message in this stage; chunking and an async (off the follower's
+message-handling goroutine) install are deferred.
+
+## Phase 5 — Linearizability checking
+
+Everything above is an *argument* that the store is correct. Phase 5 is a machine
+that tries to *falsify* it: concurrent clients drive a real cluster under fault
+injection, every operation is recorded with its real-time window and observed
+result, and a checker decides whether the whole history could have happened on a
+single correct register. It is the capstone the correctness-first goal has been
+building toward, and it is stood up early — before the remaining features — so it
+can validate what already exists and serve as the oracle for what comes next.
+
+### The checker (`internal/lincheck`)
+
+The checker is the Wing & Gong linearization search with the backtracking and
+memoization refinements popularized by Porcupine: walk an event list in real-time
+order; at a call the register spec accepts, provisionally linearize it, lift it
+out, and recurse; reaching a return whose call is not yet linearized is a dead
+end, so undo the last choice and try the next. Linearizability is NP-complete in
+general, so two things keep it tractable: a memoization cache keyed on the
+(linearized-set, register-state) pair prunes frontiers already proven futile, and
+the history is **partitioned by key** — operations on distinct keys are
+independent in a KV, so each single-register sub-history is checked on its own,
+keeping every search small.
+
+**Written from scratch, zero dependencies.** Importing a checker would have been
+faster to a first result, but the project's whole `go.mod` has no external
+imports, and a correctness tool you don't understand is a poor foundation for a
+correctness-first project. The cost is that the checker itself must be trusted, so
+it carries its own proof: a battery of hand-built histories with known verdicts
+(stale reads, lost writes, real-time-forced orderings, `Infinity` returns,
+multi-key independence) plus two property tests over 1000 seeds — every faithfully
+recorded *sequential* history must check linearizable, and corrupting a single
+read in one must always be caught.
+
+### History model and outcome mapping
+
+An operation is recorded with a call tick and a return tick drawn from one atomic
+counter shared by all clients, so the ticks impose the real-time partial order the
+checker needs across clients (if A returns before B is called, A must linearize
+first). The register model is `(value, present)`; a read is the only operation the
+model can reject.
+
+The delicate part is mapping a distributed outcome to the model. A committed write
+gets a finite return — it *must* linearize. A write that definitely did not happen
+(a first-committer-wins conflict) is dropped — an operation with no effect
+constrains nothing. A write whose fate is *unknown* — a leadership change or a
+client-side timeout that may have committed anyway — is recorded with an
+`Infinity` return, meaning it may linearize at any point at or after its call, or
+effectively not at all; it can justify a later read but never forces a violation
+on its own. A read that errored is dropped as unobserved, but a not-found result
+is a real observation (absent), not an error.
+
+### The realistic client, and why not omniscient routing
+
+`Cluster.Put/Get` route via `currentLeader()`, which inspects every node's role
+directly. That is fine for in-process convenience but impossible over a wire, and
+it *masks the very bug the checker exists to find*: it always locates the true
+leader, so a partitioned ex-leader is never contacted. The harness therefore uses
+a **realistic client** that holds a *believed* leader, sends there, and is
+redirected only on `ErrNotLeader`. That is what lets a read land on a partitioned
+ex-leader — still `role==Leader` at its stale term — and observe stale state. A
+write to such a node blocks in `commit()` forever (it never reaches quorum and
+never hears a higher term to step down), so each write attempt runs under a
+deadline, exactly like an RPC timeout.
+
+### Fault injection: partitions and crash/restart
+
+Partitions reuse the transport-level drop (a disconnected node's messages, in and
+out, vanish) — the node keeps running and keeps believing whatever it last
+believed. Crash/restart is stronger: it stops a node, drops its store and durable
+files, and rebuilds a fresh node over the same dir, so *all* volatile Raft state —
+role, commit index, in-flight votes — is lost and reconstructed from disk. This is
+what actually exercises the durable-log / hard-state / applied-watermark recovery
+paths that partitions leave untouched. Node construction was extracted into
+`buildNode` so creation and crash-rebuild share one faithful cold-start path, and
+the live-node slice is guarded (`nodesMu`) for the swap.
+
+**An in-process crash is fiddly precisely because there is no process boundary:**
+the "crashed" node shares its address space with the client goroutines still
+calling it. So the teardown steps the old node down first (releasing any client
+commit parked in its wait loop, and stopping any late write from appending to the
+raft log about to be closed), then closes the store and files under the same
+exclusive `storeMu` the InstallSnapshot swap uses, so no in-flight read or write
+races the close. Reused, this is a reminder that the store's existing swap
+machinery already had the right fence.
+
+### What it validates, and the one gap it makes visible
+
+On a healthy cluster, hundreds of concurrent operations check linearizable — the
+whole loop works. Under partitions and under crashes, every node still converges
+to identical committed state, which is the write-path guarantee: no committed
+write lost, none re-applied, across leader changes and cold restarts. And a
+deterministic test pins the open gap exactly: a client pinned to a partitioned
+ex-leader reads a stale value while the new leader holds a newer one, and the
+checker flags the history non-linearizable. That is not a checker false positive —
+it is the documented **non-linearizable reads** gap (`Cluster.Get` serves at the
+applied index of whoever thinks it is leader). Read-index or a leader lease will
+close it, and when it does, the soaks' logged verdicts become hard assertions. The
+checker is now the oracle every subsequent feature is measured against.

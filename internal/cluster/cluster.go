@@ -444,7 +444,24 @@ func (n *Node) commit(t *db.Txn) error {
 // Cluster is a Raft replication group over a transport.
 type Cluster struct {
 	transport Transport
-	nodes     []*Node
+
+	// nodesMu guards the nodes slice's contents. Its length is fixed at
+	// construction, but an element is swapped when a node is rebuilt after a
+	// simulated crash (see the linearizability harness), so readers snapshot the
+	// slice header under RLock and the swap takes the write lock.
+	nodesMu sync.RWMutex
+	nodes   []*Node
+}
+
+// snapshotNodes returns a copy of the nodes slice header under RLock, so callers
+// can iterate a stable set of node pointers while a crash-rebuild may be swapping
+// an element. The node structs themselves are internally synchronized.
+func (c *Cluster) snapshotNodes() []*Node {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+	out := make([]*Node, len(c.nodes))
+	copy(out, c.nodes)
+	return out
 }
 
 // New creates an n-node cluster with default timers over an in-process channel
@@ -475,155 +492,11 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 
 	c := &Cluster{transport: tr}
 	for i := 0; i < n; i++ {
-		// Per-node Raft files live in a raft/ subdir, isolated from the DB's own
-		// dir. Create it first so install completion (below) can find a pending
-		// marker, and so the freshness stat further down sees a stable dir.
-		raftDir := filepath.Join(dirs[i], "raft")
-		if err := os.MkdirAll(raftDir, 0o755); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("cluster: mkdir raft dir node %d: %w", i, err)
-		}
-		// Finish any interrupted InstallSnapshot BEFORE opening the store and
-		// BEFORE the recovered-vs-base guard: a mid-install crash leaves the data
-		// dir possibly mid-swap and the recovered applied index below the snapshot
-		// base until the swap lands. Completion is idempotent (re-runs from the
-		// staged dir until the marker clears).
-		if err := completeInstallIfPending(dirs[i], raftDir, opts.SyncOnWrite); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("cluster: complete pending install node %d: %w", i, err)
-		}
-
-		store, err := db.OpenWith(dirs[i], opts)
+		nd, err := buildNode(NodeID(i), n, dirs[i], opts, tr, cfg)
 		if err != nil {
 			c.Close()
-			return nil, fmt.Errorf("cluster: open node %d: %w", i, err)
+			return nil, err
 		}
-
-		// The log file's prior existence distinguishes a fresh start (bootstrap)
-		// from a restart (reconstruct + re-elect).
-		logPath := filepath.Join(raftDir, raftLogFileName)
-		statePath := filepath.Join(raftDir, raftStateFileName)
-		// Stat BOTH durable raft files before opening either: openRaftLogFile's
-		// O_CREATE would otherwise erase the freshness signal. A node is fresh
-		// (eligible to bootstrap) only when neither file exists — a node can
-		// persist a vote (writing raft/state) before ever appending a log entry,
-		// so keying freshness on raft.log alone would wrongly bootstrap such a
-		// node and discard its durable vote.
-		_, logStatErr := os.Stat(logPath)
-		_, stateStatErr := os.Stat(statePath)
-		fresh := errors.Is(logStatErr, os.ErrNotExist) && errors.Is(stateStatErr, os.ErrNotExist)
-
-		logFile, persisted, err := openRaftLogFile(logPath, opts.SyncOnWrite)
-		if err != nil {
-			store.Close()
-			c.Close()
-			return nil, fmt.Errorf("cluster: open raft log node %d: %w", i, err)
-		}
-		stateFile, hard, err := openRaftStateFile(statePath, opts.SyncOnWrite)
-		if err != nil {
-			logFile.close()
-			store.Close()
-			c.Close()
-			return nil, fmt.Errorf("cluster: open raft state node %d: %w", i, err)
-		}
-
-		rlog := NewRaftLogWithBase(logFile.baseIndex, logFile.baseTerm)
-		for _, pe := range persisted {
-			rlog.append(pe.term, pe.data)
-		}
-		recovered := store.RecoveredAppliedIndex()
-		// Everything at-or-below baseIndex was applied and made durable in the
-		// data WAL before we compacted past it, so recovery must reconstruct an
-		// applied index at least baseIndex. A lower value means the compacted
-		// prefix outran durable applied state — corruption; refuse to start
-		// rather than silently apply into a compacted region.
-		if recovered < logFile.baseIndex {
-			logFile.close()
-			stateFile.close()
-			store.Close()
-			c.Close()
-			return nil, fmt.Errorf("cluster: node %d recovered applied index %d below raft log base %d (corruption)", i, recovered, logFile.baseIndex)
-		}
-
-		var peers []NodeID
-		for j := 0; j < n; j++ {
-			if j != i {
-				peers = append(peers, NodeID(j))
-			}
-		}
-		nd := &Node{
-			id:          NodeID(i),
-			store:       store,
-			transport:   tr,
-			peers:       peers,
-			cfg:         cfg,
-			dir:         dirs[i],
-			raftDir:     raftDir,
-			opts:        opts,
-			inbox:       tr.Inbox(NodeID(i)),
-			quit:        make(chan struct{}),
-			log:         rlog,
-			logFile:     logFile,
-			stateFile:   stateFile,
-			commitIndex: recovered,
-			lastApplied: recovered,
-			role:        Follower,
-			currentTerm: 1,
-			votedFor:    noVote,
-			nextIndex:   make(map[NodeID]uint64, len(peers)),
-			matchIndex:  make(map[NodeID]uint64, len(peers)),
-			respCh:      make(map[NodeID]chan Message, len(peers)),
-			replSignal:  make(map[NodeID]chan struct{}, len(peers)),
-		}
-		for _, p := range peers {
-			nd.nextIndex[p] = 1
-			nd.matchIndex[p] = 0
-			nd.respCh[p] = make(chan Message, 1)
-			nd.replSignal[p] = make(chan struct{}, 1)
-		}
-		switch {
-		case fresh && NodeID(i) == bootstrapLeader:
-			nd.role = Leader
-			nd.votedFor = bootstrapLeader // term-1 self-vote
-		case fresh:
-			// Follower@1, already set.
-		default:
-			// Restart: never bootstrap. Start as follower and re-elect.
-			// currentTerm is the durable hard state reconciled against the log:
-			// max(state.term, log.lastTerm()). The log term can exceed the saved
-			// term in the degraded window where a higher term was adopted and its
-			// entries were logged but the hard-state fsync was lost; a node
-			// holding a term-T entry has been in term >= T, so we must resume at
-			// least there. votedFor is kept only when the saved term wins or ties;
-			// if the log term strictly wins we are moving to a higher term than
-			// the saved vote belongs to, so that vote is stale and resets. Absent
-			// state reads as (0, noVote), so this same rule is the legacy fallback.
-			// commitIndex/lastApplied come from the applied watermark, so
-			// committed entries are not re-applied and uncommitted tails wait.
-			logTerm := rlog.lastTerm()
-			if logTerm > hard.currentTerm {
-				nd.currentTerm = logTerm
-				nd.votedFor = noVote
-			} else {
-				nd.currentTerm = hard.currentTerm
-				nd.votedFor = hard.votedFor
-			}
-		}
-		// Persist the resolved hard state at construction so disk reflects any
-		// max-load repair or legacy derivation, and so raft/state exists from the
-		// first run (keeping the freshness signal stable across restarts). The
-		// node's goroutines have not started, so no lock is needed and we save
-		// directly rather than through persistHardStateLocked.
-		if err := nd.stateFile.save(nd.currentTerm, nd.votedFor); err != nil {
-			logFile.close()
-			store.Close()
-			c.Close()
-			return nil, fmt.Errorf("cluster: persist raft state node %d: %w", i, err)
-		}
-		// Every node's DB delegates Txn.Commit to its node, which checks
-		// leadership — so a write to a non-leader fails with ErrNotLeader rather
-		// than silently committing locally.
-		nd.store.SetCommitOverride(nd.commit)
 		c.nodes = append(c.nodes, nd)
 	}
 
@@ -633,12 +506,167 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 	return c, nil
 }
 
+// buildNode constructs — but does not start — a single node with id over dir,
+// reconstructing its durable Raft state (log, hard state, applied watermark) and
+// resolving its startup role. size is the cluster's node count (for the peer
+// set). It is used both at cluster creation and to rebuild a node over the same
+// dir after a simulated crash, so it must be a faithful cold-start: the durable
+// files alone decide fresh-bootstrap vs. restart-and-re-elect. On any error it
+// releases whatever it had already opened. The caller registers the id with the
+// transport and starts the node.
+func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, cfg Config) (*Node, error) {
+	// Per-node Raft files live in a raft/ subdir, isolated from the DB's own dir.
+	// Create it first so install completion (below) can find a pending marker, and
+	// so the freshness stat further down sees a stable dir.
+	raftDir := filepath.Join(dir, "raft")
+	if err := os.MkdirAll(raftDir, 0o755); err != nil {
+		return nil, fmt.Errorf("cluster: mkdir raft dir node %d: %w", id, err)
+	}
+	// Finish any interrupted InstallSnapshot BEFORE opening the store and BEFORE
+	// the recovered-vs-base guard: a mid-install crash leaves the data dir possibly
+	// mid-swap and the recovered applied index below the snapshot base until the
+	// swap lands. Completion is idempotent (re-runs from the staged dir until the
+	// marker clears).
+	if err := completeInstallIfPending(dir, raftDir, opts.SyncOnWrite); err != nil {
+		return nil, fmt.Errorf("cluster: complete pending install node %d: %w", id, err)
+	}
+
+	store, err := db.OpenWith(dir, opts)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: open node %d: %w", id, err)
+	}
+
+	// The log file's prior existence distinguishes a fresh start (bootstrap) from a
+	// restart (reconstruct + re-elect).
+	logPath := filepath.Join(raftDir, raftLogFileName)
+	statePath := filepath.Join(raftDir, raftStateFileName)
+	// Stat BOTH durable raft files before opening either: openRaftLogFile's
+	// O_CREATE would otherwise erase the freshness signal. A node is fresh
+	// (eligible to bootstrap) only when neither file exists — a node can persist a
+	// vote (writing raft/state) before ever appending a log entry, so keying
+	// freshness on raft.log alone would wrongly bootstrap such a node and discard
+	// its durable vote.
+	_, logStatErr := os.Stat(logPath)
+	_, stateStatErr := os.Stat(statePath)
+	fresh := errors.Is(logStatErr, os.ErrNotExist) && errors.Is(stateStatErr, os.ErrNotExist)
+
+	logFile, persisted, err := openRaftLogFile(logPath, opts.SyncOnWrite)
+	if err != nil {
+		store.Close()
+		return nil, fmt.Errorf("cluster: open raft log node %d: %w", id, err)
+	}
+	stateFile, hard, err := openRaftStateFile(statePath, opts.SyncOnWrite)
+	if err != nil {
+		logFile.close()
+		store.Close()
+		return nil, fmt.Errorf("cluster: open raft state node %d: %w", id, err)
+	}
+
+	rlog := NewRaftLogWithBase(logFile.baseIndex, logFile.baseTerm)
+	for _, pe := range persisted {
+		rlog.append(pe.term, pe.data)
+	}
+	recovered := store.RecoveredAppliedIndex()
+	// Everything at-or-below baseIndex was applied and made durable in the data WAL
+	// before we compacted past it, so recovery must reconstruct an applied index at
+	// least baseIndex. A lower value means the compacted prefix outran durable
+	// applied state — corruption; refuse to start rather than silently apply into a
+	// compacted region.
+	if recovered < logFile.baseIndex {
+		logFile.close()
+		stateFile.close()
+		store.Close()
+		return nil, fmt.Errorf("cluster: node %d recovered applied index %d below raft log base %d (corruption)", id, recovered, logFile.baseIndex)
+	}
+
+	var peers []NodeID
+	for j := 0; j < size; j++ {
+		if NodeID(j) != id {
+			peers = append(peers, NodeID(j))
+		}
+	}
+	nd := &Node{
+		id:          id,
+		store:       store,
+		transport:   tr,
+		peers:       peers,
+		cfg:         cfg,
+		dir:         dir,
+		raftDir:     raftDir,
+		opts:        opts,
+		inbox:       tr.Inbox(id),
+		quit:        make(chan struct{}),
+		log:         rlog,
+		logFile:     logFile,
+		stateFile:   stateFile,
+		commitIndex: recovered,
+		lastApplied: recovered,
+		role:        Follower,
+		currentTerm: 1,
+		votedFor:    noVote,
+		nextIndex:   make(map[NodeID]uint64, len(peers)),
+		matchIndex:  make(map[NodeID]uint64, len(peers)),
+		respCh:      make(map[NodeID]chan Message, len(peers)),
+		replSignal:  make(map[NodeID]chan struct{}, len(peers)),
+	}
+	for _, p := range peers {
+		nd.nextIndex[p] = 1
+		nd.matchIndex[p] = 0
+		nd.respCh[p] = make(chan Message, 1)
+		nd.replSignal[p] = make(chan struct{}, 1)
+	}
+	switch {
+	case fresh && id == bootstrapLeader:
+		nd.role = Leader
+		nd.votedFor = bootstrapLeader // term-1 self-vote
+	case fresh:
+		// Follower@1, already set.
+	default:
+		// Restart: never bootstrap. Start as follower and re-elect.
+		// currentTerm is the durable hard state reconciled against the log:
+		// max(state.term, log.lastTerm()). The log term can exceed the saved term
+		// in the degraded window where a higher term was adopted and its entries
+		// were logged but the hard-state fsync was lost; a node holding a term-T
+		// entry has been in term >= T, so we must resume at least there. votedFor is
+		// kept only when the saved term wins or ties; if the log term strictly wins
+		// we are moving to a higher term than the saved vote belongs to, so that
+		// vote is stale and resets. Absent state reads as (0, noVote), so this same
+		// rule is the legacy fallback. commitIndex/lastApplied come from the applied
+		// watermark, so committed entries are not re-applied and uncommitted tails
+		// wait.
+		logTerm := rlog.lastTerm()
+		if logTerm > hard.currentTerm {
+			nd.currentTerm = logTerm
+			nd.votedFor = noVote
+		} else {
+			nd.currentTerm = hard.currentTerm
+			nd.votedFor = hard.votedFor
+		}
+	}
+	// Persist the resolved hard state at construction so disk reflects any max-load
+	// repair or legacy derivation, and so raft/state exists from the first run
+	// (keeping the freshness signal stable across restarts). The node's goroutines
+	// have not started, so no lock is needed and we save directly rather than
+	// through persistHardStateLocked.
+	if err := nd.stateFile.save(nd.currentTerm, nd.votedFor); err != nil {
+		logFile.close()
+		stateFile.close()
+		store.Close()
+		return nil, fmt.Errorf("cluster: persist raft state node %d: %w", id, err)
+	}
+	// Every node's DB delegates Txn.Commit to its node, which checks leadership — so
+	// a write to a non-leader fails with ErrNotLeader rather than silently
+	// committing locally.
+	nd.store.SetCommitOverride(nd.commit)
+	return nd, nil
+}
+
 // currentLeader returns the node that currently believes it is leader at the
 // highest term, if any.
 func (c *Cluster) currentLeader() (*Node, bool) {
 	var best *Node
 	var bestTerm uint64
-	for _, nd := range c.nodes {
+	for _, nd := range c.snapshotNodes() {
 		nd.raftMu.Lock()
 		isLeader := nd.role == Leader
 		term := nd.currentTerm
@@ -654,7 +682,7 @@ func (c *Cluster) leaderNode() *Node {
 	if ld, ok := c.currentLeader(); ok {
 		return ld
 	}
-	return c.nodes[0]
+	return c.Node(0)
 }
 
 // withLeader runs fn against the current leader, retrying (through an election)
@@ -737,10 +765,18 @@ func (n *Node) storeBegin() *db.Txn {
 }
 
 // Node returns the i-th node, for inspection and tests.
-func (c *Cluster) Node(i int) *Node { return c.nodes[i] }
+func (c *Cluster) Node(i int) *Node {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+	return c.nodes[i]
+}
 
-// Size returns the node count.
-func (c *Cluster) Size() int { return len(c.nodes) }
+// Size returns the node count. The count is fixed at construction.
+func (c *Cluster) Size() int {
+	c.nodesMu.RLock()
+	defer c.nodesMu.RUnlock()
+	return len(c.nodes)
+}
 
 // Leader returns the current leader's id, or the bootstrap node if none.
 func (c *Cluster) Leader() NodeID {
@@ -757,7 +793,7 @@ func (c *Cluster) Quiesce(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		caughtUp := true
-		for _, nd := range c.nodes {
+		for _, nd := range c.snapshotNodes() {
 			if nd.appliedIndex() < target {
 				caughtUp = false
 				break
@@ -775,11 +811,12 @@ func (c *Cluster) Quiesce(timeout time.Duration) error {
 
 // Close stops all node loops and closes their stores. Call once.
 func (c *Cluster) Close() error {
-	for _, nd := range c.nodes {
+	nodes := c.snapshotNodes()
+	for _, nd := range nodes {
 		nd.stop()
 	}
 	var firstErr error
-	for _, nd := range c.nodes {
+	for _, nd := range nodes {
 		if err := nd.store.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
