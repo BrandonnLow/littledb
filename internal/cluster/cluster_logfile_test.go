@@ -175,8 +175,9 @@ func assertFileMirrorsMemoryLive(t *testing.T, n *Node, logPath string) {
 // appended the entry to the raft log (file + memory) but before quorum — by
 // gating away the followers' acks so the commit index never advances — then
 // forces a step-down with a higher-term message. The parked commit must return
-// ErrNotLeader, and the raft log file must still mirror the in-memory log
-// exactly: the leader-path append + a racing step-down leaves no orphan tail.
+// ErrMaybeCommitted (the entry was appended and replicated, so its fate is
+// unknown), and the raft log file must still mirror the in-memory log exactly:
+// the leader-path append + a racing step-down leaves no orphan tail.
 func TestLeaderRaftLogMirrorsAcrossStepDown(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
@@ -205,7 +206,9 @@ func TestLeaderRaftLogMirrorsAcrossStepDown(t *testing.T) {
 
 	// Deliver a higher-term AppendEntries (not held by the predicate). The
 	// follower path steps the leader down, which broadcasts the apply cond; the
-	// parked commit wakes, sees role != Leader, and returns ErrNotLeader.
+	// parked commit wakes, sees role != Leader, and returns ErrMaybeCommitted — the
+	// entry was already appended and replicated, so its fate is unknown (a later
+	// leader may commit or truncate it), distinct from a never-proposed write.
 	_ = gate.Send(0, Message{
 		Type: MsgAppendEntries, From: 1, Term: leaderTerm + 5,
 		PrevLogIndex: 0, PrevLogTerm: 0,
@@ -213,8 +216,8 @@ func TestLeaderRaftLogMirrorsAcrossStepDown(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, ErrNotLeader) {
-			t.Fatalf("parked Put returned %v, want ErrNotLeader", err)
+		if !errors.Is(err, ErrMaybeCommitted) {
+			t.Fatalf("parked Put returned %v, want ErrMaybeCommitted", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("parked Put did not return after step-down")

@@ -23,8 +23,10 @@
 package lincheck
 
 import (
+	"fmt"
 	"math"
 	"sort"
+	"strings"
 )
 
 // Infinity is the return tick of an operation that never completed: one still
@@ -104,10 +106,12 @@ func stepRegister(s regState, op Op) (regState, bool) {
 
 // Result reports the outcome of a linearizability check. Linearizable is the
 // verdict; on a violation, Key names the register whose sub-history could not be
-// linearized, so a caller can print just the relevant operations.
+// linearized and Witness holds that register's operations, sorted by call time,
+// as a counterexample a caller can print or render.
 type Result struct {
 	Linearizable bool
 	Key          string // set when !Linearizable: the offending key
+	Witness      []Op   // set when !Linearizable: the offending key's ops, call-ordered
 }
 
 // Check reports whether history is linearizable. It partitions the operations
@@ -131,8 +135,48 @@ func Check(history []Op) Result {
 
 	for _, k := range keys {
 		if !linearizableRegister(byKey[k]) {
-			return Result{Linearizable: false, Key: k}
+			return Result{Linearizable: false, Key: k, Witness: sortedByCall(byKey[k])}
 		}
 	}
 	return Result{Linearizable: true}
+}
+
+// sortedByCall returns a copy of ops ordered by call tick (return tick breaks
+// ties), so a witness reads in real-time order.
+func sortedByCall(ops []Op) []Op {
+	out := make([]Op, len(ops))
+	copy(out, ops)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Call != out[j].Call {
+			return out[i].Call < out[j].Call
+		}
+		return out[i].Return < out[j].Return
+	})
+	return out
+}
+
+// FormatWitness renders a list of operations as one line each, in the given
+// order, for logging a counterexample: client, operation, and the real-time
+// window, with reads showing what was observed.
+func FormatWitness(ops []Op) string {
+	var b strings.Builder
+	for _, op := range ops {
+		ret := fmt.Sprintf("%d", op.Return)
+		if op.Return == Infinity {
+			ret = "inf"
+		}
+		switch op.Kind {
+		case Put:
+			fmt.Fprintf(&b, "  c%d [%d..%s] put %s=%q\n", op.Client, op.Call, ret, op.Key, op.Value)
+		case Delete:
+			fmt.Fprintf(&b, "  c%d [%d..%s] del %s\n", op.Client, op.Call, ret, op.Key)
+		case Get:
+			obs := "<absent>"
+			if op.Found {
+				obs = fmt.Sprintf("%q", op.Value)
+			}
+			fmt.Fprintf(&b, "  c%d [%d..%s] get %s -> %s\n", op.Client, op.Call, ret, op.Key, obs)
+		}
+	}
+	return b.String()
 }

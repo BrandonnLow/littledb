@@ -2,6 +2,8 @@ package lincheck
 
 import (
 	"math/rand"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -262,6 +264,79 @@ func TestCheckerCorruptedReadNonLinearizable(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no histories exercised a corrupted read")
+	}
+}
+
+// TestCheckWitness verifies the counterexample a violation reports: the offending
+// key, that key's operations in call order, and a non-empty rendering — and that a
+// linearizable result carries no witness.
+func TestCheckWitness(t *testing.T) {
+	res := Check([]Op{
+		put(0, "x", "1", 0, 1),
+		getAbsent(1, "x", 2, 3), // stale: x is 1 by now
+	})
+	if res.Linearizable {
+		t.Fatal("expected non-linearizable")
+	}
+	if res.Key != "x" {
+		t.Fatalf("witness key = %q, want x", res.Key)
+	}
+	if len(res.Witness) != 2 {
+		t.Fatalf("witness has %d ops, want 2", len(res.Witness))
+	}
+	if res.Witness[0].Call > res.Witness[1].Call {
+		t.Fatal("witness is not call-ordered")
+	}
+	if FormatWitness(res.Witness) == "" {
+		t.Fatal("FormatWitness returned empty")
+	}
+
+	if r := Check([]Op{
+		put(0, "x", "1", 0, 1),
+		getVal(1, "x", "1", 2, 3),
+	}); !r.Linearizable || r.Witness != nil {
+		t.Fatalf("linearizable result: linearizable=%v witness=%v, want true/nil", r.Linearizable, r.Witness)
+	}
+}
+
+// TestRenderHistoryHTML checks the timeline renderer produces a self-contained
+// page and highlights the witness on a violation. Set LINCHECK_HTML_OUT to a path
+// to also dump a sample rendering for eyeballing.
+func TestRenderHistoryHTML(t *testing.T) {
+	// A realistic-looking stale read: a write completes, then a later read on a
+	// different client misses it — the anomaly a partitioned ex-leader produces.
+	bad := []Op{
+		put(0, "x", "a", 0, 5),
+		getVal(1, "x", "a", 6, 11),
+		put(0, "x", "b", 12, 17),
+		getVal(2, "x", "b", 18, 23),
+		Op{Client: 3, Kind: Put, Key: "y", Value: "1", Call: 8, Return: Infinity}, // uncertain write
+		getAbsent(1, "x", 30, 35), // stale: x is "b" by now
+	}
+	res := Check(bad)
+	if res.Linearizable {
+		t.Fatal("fixture should be non-linearizable")
+	}
+	html := RenderHistoryHTML(bad, res)
+	// `witness"` matches the class APPLIED to an op group (not the CSS rule
+	// `.bar.witness`), confirming the counterexample is highlighted.
+	for _, want := range []string{"<!doctype html>", "<svg", "</svg>", "NOT linearizable", "witness\""} {
+		if !strings.Contains(html, want) {
+			t.Errorf("rendered HTML missing %q", want)
+		}
+	}
+
+	// A linearizable history shows the ok verdict and highlights nothing.
+	good := []Op{put(0, "x", "a", 0, 1), getVal(1, "x", "a", 2, 3)}
+	if h := RenderHistoryHTML(good, Check(good)); !strings.Contains(h, "verdict ok") || strings.Contains(h, "NOT linearizable") || strings.Contains(h, "witness\"") {
+		t.Error("linearizable render should show the ok verdict and no applied witness class")
+	}
+
+	if out := os.Getenv("LINCHECK_HTML_OUT"); out != "" {
+		if err := os.WriteFile(out, []byte(html), 0o644); err != nil {
+			t.Fatalf("dump html: %v", err)
+		}
+		t.Logf("wrote sample timeline to %s", out)
 	}
 }
 

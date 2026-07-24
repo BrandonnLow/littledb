@@ -1010,3 +1010,73 @@ it is the documented **non-linearizable reads** gap (`Cluster.Get` serves at the
 applied index of whoever thinks it is leader). Read-index or a leader lease will
 close it, and when it does, the soaks' logged verdicts become hard assertions. The
 checker is now the oracle every subsequent feature is measured against.
+
+## Phase 6 — Linearizable reads (read-index)
+
+The gap Phase 5 made visible is now closed. A read is served through a **read-index
+barrier**: the leader drives a no-op entry through the ordinary quorum-commit path,
+waits until it has applied it, and only then reads local state. Committing a
+current-term entry requires a majority to replicate it at this term, so a
+successful barrier is itself proof that this node is still the leader as of an
+index that post-dates the read's arrival — a partitioned ex-leader cannot commit
+the no-op, so it blocks rather than serving stale data. After the barrier, local
+state reflects every write committed before the read, and the read is
+linearizable. `TestReadBarrierRefusesStaleReadOnExLeader` is the "after" to
+Phase 5's `TestStaleReadIsCaught`, and both soaks now **assert** linearizability
+rather than logging a verdict.
+
+This is the simple read-index variant — one no-op per read. The heartbeat-only
+optimization (confirm leadership with an empty AppendEntries round instead of a
+logged entry, avoiding the log growth and the quorum write) is deferred.
+
+### The no-op log entry
+
+The barrier's prerequisite — a leader must commit an entry in its *own* term
+before it can trust its commit index (§6.4/§5.4.2) — reuses machinery already
+present. `PrepareNoop` builds a standalone `OpCommit` record with no data records;
+`ApplyEntry` already treats it as a no-op that appends one `OpCommit` to the data
+WAL and mutates no key. That last detail is the subtle one: because the applied
+index is reconstructed on restart as `walBase + (OpCommits in the WAL)`, the no-op
+*must* leave an `OpCommit` in the WAL, or a restart would miscount and re-drive a
+real entry. It does, so the Raft index and the recovered applied index stay in
+lockstep. The no-op is committed lazily — only when a read needs a current-term
+entry the leader has not otherwise produced — so ordinary write workloads (and the
+existing tests' log indices) are undisturbed.
+
+### ErrMaybeCommitted, and the exactly-once finding
+
+Wiring reads through the barrier made the partition soaks linearizable, but the
+crash soaks still failed — and the checker's witness pinned why in seconds: a read
+observed a value (`k1="c2-4"`) that the history contained no write for. The cause
+was not the database but an honesty gap in how a write's outcome was reported. A
+write whose leader crashed *after* appending and replicating the entry, but before
+confirming it applied, had been reported as a plain `ErrNotLeader`. The client
+retried on the new leader with the same transaction, and the retry **self-
+conflicted** with its own committed-but-unacked entry (first-committer-wins), so
+the harness recorded the write as "did not happen" — while its value sat in the
+store, readable.
+
+The fix is a distinct, honest outcome: `ErrMaybeCommitted`, returned when a write
+stepped down after its entry was appended and replicated. The entry may yet be
+committed by a later leader or truncated as an uncommitted tail; the caller cannot
+know. A faithful history records such a write with an `Infinity` return (it may or
+may not have happened, and may be linearized wherever a later read observed it),
+and a conflict following such an attempt is treated as a possible self-conflict,
+not a clean loss. With faithful recording the register is linearizable under
+crashes too — because it always was; the register never lost or duplicated an
+observable value, only the *client's knowledge* of its own write was uncertain.
+
+That uncertainty is the real, remaining gap, and it is exactly what exactly-once
+**client sessions** exist to close: per-client session IDs and sequence numbers,
+deduplicated at apply time, so a retried committed write returns success instead of
+self-conflicting, and a client always learns its write's true fate. That is the
+next track; `ErrMaybeCommitted` is its foundation.
+
+### Diagnosing violations: witness and timeline
+
+Two aids turn a bare "not linearizable" into something legible. The checker returns
+a **witness** — the offending key's operations in real-time order — which is what
+pinned the exactly-once finding above. And `RenderHistoryHTML` renders any history
+as a self-contained, dependency-free timeline (one row per client, bars spanning
+[call, return], `Infinity` returns running to the edge), coloring by key and
+outlining the witness in red, so a violation is visible at a glance.

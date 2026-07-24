@@ -235,3 +235,24 @@ func (db *DB) PrepareCommit(t *Txn) (entry []byte, commitTS uint64, err error) {
 	t.finished = true
 	return entry, commitTS, nil
 }
+
+// PrepareNoop allocates a fresh commit timestamp and returns the encoding of a
+// standalone OpCommit marker with no data records — a no-op log entry. Applied
+// via ApplyEntry it appends one OpCommit to the data WAL (so the recovered
+// applied index stays in lockstep with the Raft index) and mutates no key. Its
+// purpose is Raft's read-index prerequisite: a newly elected leader commits an
+// entry in its OWN term so its commit index is trustworthy, without having to
+// wait for a client write. Like PrepareCommit it touches neither the WAL nor the
+// memtable here — the replication layer logs the entry and ApplyEntry applies it
+// once committed.
+func (db *DB) PrepareNoop() (entry []byte, commitTS uint64, err error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, 0, errClosed
+	}
+	commitTS = db.nextTimestamp
+	db.nextTimestamp++
+	commitRec := &record.Record{Op: record.OpCommit, Timestamp: commitTS}
+	return record.Encode(commitRec), commitTS, nil
+}

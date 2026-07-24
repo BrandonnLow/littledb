@@ -64,13 +64,17 @@ func (h *history) snapshot() []lincheck.Op {
 }
 
 // client is one logical client: it remembers a believed leader, redirects on
-// ErrNotLeader, and records every operation's real-time window and outcome.
+// ErrNotLeader, and records every operation's real-time window and outcome. When
+// linearizable is set, reads route through the leader's read-index barrier
+// (redirecting like writes); otherwise they read the believed node's local state
+// directly, which can be stale on a partitioned ex-leader.
 type client struct {
-	id       int
-	c        *Cluster
-	believed NodeID
-	rng      *rand.Rand
-	h        *history
+	id           int
+	c            *Cluster
+	believed     NodeID
+	rng          *rand.Rand
+	h            *history
+	linearizable bool
 }
 
 // order returns the node ids to try, believed leader first, then the rest in a
@@ -90,8 +94,9 @@ type writeOutcome int
 
 const (
 	wroteOK       writeOutcome = iota // committed: must linearize (finite return)
-	wroteNotHere                      // ErrNotLeader: try elsewhere
-	wroteConflict                     // ErrConflict: definitely did not apply
+	wroteNotHere                      // ErrNotLeader: not proposed here, try elsewhere
+	wroteConflict                     // ErrConflict: did not apply (unless self-conflict)
+	wroteMaybe                        // ErrMaybeCommitted: appended, fate unknown
 	wroteTimeout                      // blocked past the deadline: fate unknown
 	wroteOther                        // some other error (e.g. closed): fate unknown
 )
@@ -111,6 +116,8 @@ func (cl *client) tryWrite(id NodeID, apply func(*Node) error) writeOutcome {
 			return wroteNotHere
 		case errors.Is(err, db.ErrConflict):
 			return wroteConflict
+		case errors.Is(err, ErrMaybeCommitted):
+			return wroteMaybe
 		default:
 			return wroteOther
 		}
@@ -136,14 +143,28 @@ func (cl *client) write(op lincheck.OpKind, key, value string, apply func(*Node)
 				cl.believed = id
 				cl.record(op, key, value, false, call, cl.h.now())
 				return
+			case wroteMaybe:
+				// Appended and replicated, but the leader stepped down before
+				// confirming: the write may have committed. Record it as uncertain
+				// (Infinity) and stop — retrying could self-conflict with (or
+				// double-apply) the earlier entry. Faithfully recording this is what
+				// keeps a later read of the value from looking like a read of thin air.
+				cl.recordUncertain(op, key, value, call)
+				return
 			case wroteConflict:
-				// First-committer-wins rejected it: a definite no-op. Drop it from
-				// the history entirely — an operation with no effect constrains
-				// nothing.
-				cl.h.now() // consume a return tick for ordering hygiene
+				// A conflict AFTER an uncertain attempt can be this write
+				// self-conflicting with its own committed-but-unacked entry, so it
+				// did take effect: record it uncertain. A conflict on an otherwise
+				// clean write is a genuine first-committer-wins loser: it did not
+				// apply, so drop it (an operation with no effect constrains nothing).
+				if uncertain {
+					cl.recordUncertain(op, key, value, call)
+				} else {
+					cl.h.now() // consume a return tick for ordering hygiene
+				}
 				return
 			case wroteNotHere:
-				progressed = true // redirect and keep probing
+				progressed = true // not proposed here; redirect and keep probing
 			case wroteTimeout, wroteOther:
 				uncertain = true
 			}
@@ -152,9 +173,9 @@ func (cl *client) write(op lincheck.OpKind, key, value string, apply func(*Node)
 			time.Sleep(5 * time.Millisecond) // mid-election: back off, retry
 		}
 	}
-	// Never got a definite commit. If any attempt blocked or errored, the write
-	// may have taken effect; record it with an Infinity return so it can justify a
-	// later read but never forces a violation on its own.
+	// Never got a definite commit. If any attempt left the write's fate unknown,
+	// record it with an Infinity return so it can justify a later read but never
+	// forces a violation on its own.
 	if uncertain {
 		cl.recordUncertain(op, key, value, call)
 	} else {
@@ -182,13 +203,21 @@ func (cl *client) del(key string) {
 	})
 }
 
-// get reads from the believed leader and records the observation. Reads do not
-// redirect: a real read-heavy client stays pinned to the server it believes is
-// leader, so when that server is a partitioned ex-leader the read observes stale
-// state — which is exactly the anomaly to catch. A plain local read never
-// blocks, so no timeout is needed. ErrKeyNotFound is a valid observation
-// (absent), not a failure; any other error is dropped as unobserved.
 func (cl *client) get(key string) {
+	if cl.linearizable {
+		cl.getLinearizable(key)
+		return
+	}
+	cl.getRaw(key)
+}
+
+// getRaw reads the believed node's local state directly and records the
+// observation. It does not redirect: a real read-heavy client stays pinned to the
+// server it believes is leader, so when that server is a partitioned ex-leader the
+// read observes stale state — the anomaly the checker catches without a read
+// barrier. A plain local read never blocks. ErrKeyNotFound is a valid observation
+// (absent), not a failure; any other error is dropped as unobserved.
+func (cl *client) getRaw(key string) {
 	call := cl.h.now()
 	v, err := cl.c.Node(int(cl.believed)).storeGet([]byte(key))
 	ret := cl.h.now()
@@ -202,17 +231,87 @@ func (cl *client) get(key string) {
 	}
 }
 
+type readOutcome int
+
+const (
+	readObserved readOutcome = iota // a value or a definite absence was read
+	readNotHere                     // ErrNotLeader: redirect
+	readBlocked                     // barrier timed out / other error: try elsewhere
+)
+
+// tryRead runs a linearizable read against node id under a deadline. Like a write,
+// the barrier can block on a partitioned ex-leader (no quorum to commit the
+// no-op), so it runs in its own goroutine and is abandoned on timeout.
+func (cl *client) tryRead(id NodeID, key string) (v []byte, found bool, outcome readOutcome) {
+	type rr struct {
+		v   []byte
+		err error
+	}
+	done := make(chan rr, 1)
+	go func() {
+		val, err := cl.c.Node(int(id)).linearizableGet([]byte(key))
+		done <- rr{val, err}
+	}()
+	select {
+	case r := <-done:
+		switch {
+		case r.err == nil:
+			return r.v, true, readObserved
+		case errors.Is(r.err, db.ErrKeyNotFound):
+			return nil, false, readObserved // absence is a valid observation
+		case errors.Is(r.err, ErrNotLeader):
+			return nil, false, readNotHere
+		default:
+			return nil, false, readBlocked
+		}
+	case <-time.After(writeAttemptTimeout):
+		return nil, false, readBlocked
+	}
+}
+
+// getLinearizable performs a linearizable read as one logical operation: it stamps
+// the call, probes nodes until one confirms the read through its barrier
+// (updating the believed leader), stamps the return, and records the observation.
+// A read that never confirms within the deadline is dropped as unobserved — a
+// real client would surface an error, which constrains nothing.
+func (cl *client) getLinearizable(key string) {
+	call := cl.h.now()
+	deadline := time.Now().Add(writeOverallTimeout)
+	for time.Now().Before(deadline) {
+		progressed := false
+		for _, id := range cl.order() {
+			v, found, outcome := cl.tryRead(id, key)
+			switch outcome {
+			case readObserved:
+				cl.believed = id
+				cl.record(lincheck.Get, key, string(v), found, call, cl.h.now())
+				return
+			case readNotHere:
+				progressed = true
+			case readBlocked:
+				// try the next node
+			}
+		}
+		if !progressed {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	cl.h.now() // no confirmed read; unobserved
+}
+
 // runWorkload spawns clients that each issue opsPerClient random operations over
 // a small key space, values unique per (client, sequence) so a read pins which
-// write it observed. It returns the recorded history.
-func runWorkload(c *Cluster, clients, opsPerClient, numKeys int, seed int64) *history {
+// write it observed. With linearizableReads set, reads route through the
+// read-index barrier; otherwise they read believed-leader-local state. It returns
+// the recorded history.
+func runWorkload(c *Cluster, clients, opsPerClient, numKeys int, seed int64, linearizableReads bool) *history {
 	h := &history{}
 	var wg sync.WaitGroup
 	for ci := 0; ci < clients; ci++ {
 		wg.Add(1)
 		go func(ci int) {
 			defer wg.Done()
-			cl := &client{id: ci, c: c, believed: bootstrapLeader, rng: rand.New(rand.NewSource(seed + int64(ci)))}
+			cl := &client{id: ci, c: c, believed: bootstrapLeader, rng: rand.New(rand.NewSource(seed + int64(ci))), linearizable: linearizableReads}
 			cl.h = h
 			for seq := 0; seq < opsPerClient; seq++ {
 				key := fmt.Sprintf("k%d", cl.rng.Intn(numKeys))
@@ -244,7 +343,7 @@ func TestClusterLinearizableNoFaults(t *testing.T) {
 	}
 	defer c.Close()
 
-	h := runWorkload(c, 6, 150, 5, 42)
+	h := runWorkload(c, 6, 150, 5, 42, true)
 	hist := h.snapshot()
 	t.Logf("recorded %d operations", len(hist))
 
@@ -372,10 +471,11 @@ func (fi *faultInjector) run(seed int64, stop <-chan struct{}, done chan<- struc
 // from the old (still role==Leader) node — and asserts the read observes the
 // stale "1" AND that lincheck flags the history as non-linearizable.
 //
-// This is a characterization test of the CURRENT behavior. When linearizable
-// reads (ReadIndex / leader lease) land, the pinned read will instead redirect
-// or block until confirmed, the stale observation disappears, and this test
-// flips to asserting linearizable. Until then it pins the gap precisely.
+// This characterizes the RAW (non-barrier) read path — reading believed-leader-
+// local state directly — which stays deliberately available and deliberately
+// non-linearizable: it is the "before" that motivates the read barrier. The
+// "after" is TestReadBarrierRefusesStaleReadOnExLeader, where the same scenario
+// routed through linearizableGet refuses the stale read.
 func TestStaleReadIsCaught(t *testing.T) {
 	const n = 3
 	pt := newPartitionTransport()
@@ -480,8 +580,11 @@ func settleConvergeCheck(t *testing.T, c *Cluster, h *history, label string) {
 
 	hist := h.snapshot()
 	res := lincheck.Check(hist)
-	t.Logf("%s: recorded %d operations; lincheck linearizable=%v (offending key %q)",
-		label, len(hist), res.Linearizable, res.Key)
+	t.Logf("%s: recorded %d operations; lincheck linearizable=%v", label, len(hist), res.Linearizable)
+	if !res.Linearizable {
+		t.Fatalf("%s: history is NOT linearizable (offending key %q):\n%s",
+			label, res.Key, lincheck.FormatWitness(res.Witness))
+	}
 }
 
 // TestClusterConvergesUnderPartitions runs the randomized workload while faults
@@ -511,7 +614,7 @@ func TestClusterConvergesUnderPartitions(t *testing.T) {
 	fi := &faultInjector{t: t, c: c, pt: pt, opts: opts, cfg: cfg, maxDown: (n - 1) / 2}
 	go fi.run(7, stop, done)
 
-	h := runWorkload(c, 6, 50, 5, 99)
+	h := runWorkload(c, 6, 50, 5, 99, true)
 
 	close(stop)
 	<-done // faults healed
@@ -568,7 +671,7 @@ func TestClusterConvergesUnderCrashes(t *testing.T) {
 	fi := &faultInjector{t: t, c: c, pt: pt, opts: opts, cfg: cfg, maxDown: (n - 1) / 2, crashes: true}
 	go fi.run(11, stop, done)
 
-	h := runWorkload(c, 6, 40, 5, 123)
+	h := runWorkload(c, 6, 40, 5, 123, true)
 
 	close(stop)
 	<-done // faults healed, all nodes restarted-and-reconnected
