@@ -71,12 +71,17 @@ func TestClusterFullRestartPreservesData(t *testing.T) {
 	}
 	defer c2.Close()
 
+	// Capture the leader inside the poll: re-querying after the wait can race a
+	// leadership change under the tight election timers and return nil.
+	var ld *Node
 	waitFor(t, 3*time.Second, func() bool {
-		_, ok := c2.currentLeader()
+		l, ok := c2.currentLeader()
+		if ok {
+			ld = l
+		}
 		return ok
 	})
 
-	ld, _ := c2.currentLeader()
 	if got := nodeTerm(ld); got <= term1 {
 		t.Errorf("re-election term %d, want > %d (restart must not bootstrap a leader)", got, term1)
 	}

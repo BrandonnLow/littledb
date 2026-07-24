@@ -11,8 +11,8 @@ Under active construction. This is a learning project — not for production use
 - **Phase 1** — Append-only KV store, write-ahead log, crash recovery
 - **Phase 2** — SSTables, compaction, bloom filters
 - **Phase 3** — MVCC, transactions, snapshot isolation
-- **Phase 4** — Replication, leader election simulation (Raft)
-- **Phase 5** — Visual debugger UI, event timeline, failure injection
+- **Phase 4** — Replication and consensus (Raft: elections, durable log, snapshots)
+- **Phase 5** — Correctness verification (linearizability checker, fault injection)
 
 ## Design
 
