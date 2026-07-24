@@ -13,6 +13,7 @@ Under active construction. This is a learning project — not for production use
 - **Phase 3** — MVCC, transactions, snapshot isolation
 - **Phase 4** — Replication and consensus (Raft: elections, durable log, snapshots)
 - **Phase 5** — Correctness verification (linearizability checker, fault injection)
+- **Phase 6** — Linearizable reads (read-index); client sessions next
 
 ## Design
 

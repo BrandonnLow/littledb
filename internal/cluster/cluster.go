@@ -13,9 +13,19 @@ import (
 )
 
 // ErrNotLeader is returned by a commit routed to a node that is not currently
-// the leader (or that stepped down mid-commit). Clients retry on the new
-// leader; the cluster's own Put/Delete/Get do this automatically.
+// the leader, or that stepped down BEFORE appending the entry (so it definitely
+// did not commit). Clients retry on the new leader; the cluster's own
+// Put/Delete/Get do this automatically.
 var ErrNotLeader = errors.New("cluster: not leader")
+
+// ErrMaybeCommitted is returned by a write whose entry was appended and
+// replicated but whose leader stepped down before confirming it applied. The
+// write may or may not have committed: a later leader may commit the replicated
+// entry, or truncate it as an uncommitted tail. Without exactly-once client
+// sessions the caller cannot tell, and a naive retry may self-conflict with (or
+// double-apply) the earlier entry — so this is a distinct, honest outcome rather
+// than a plain ErrNotLeader. Deduplicating retries is the client-sessions track.
+var ErrMaybeCommitted = errors.New("cluster: write may or may not have committed")
 
 const bootstrapLeader NodeID = 0
 
@@ -378,9 +388,9 @@ func (n *Node) applyCommitted() {
 
 // commit is the leader's commitOverride (installed on every node, so a write
 // to a non-leader fails cleanly rather than taking the single-node path). It
-// prepares the txn, appends to its log, wakes the replicators, and waits for
-// its own apply. It returns ErrNotLeader if this node is not the leader or
-// stepped down before the entry committed.
+// prepares the txn, then replicates and applies the entry via proposeAndAwait.
+// It returns ErrNotLeader if this node is not the leader or stepped down before
+// the entry committed.
 func (n *Node) commit(t *db.Txn) error {
 	n.commitMu.Lock()
 	defer n.commitMu.Unlock()
@@ -402,15 +412,67 @@ func (n *Node) commit(t *db.Txn) error {
 	if entry == nil {
 		return nil // empty txn
 	}
+	return n.proposeAndAwait(term, entry)
+}
+
+// readBarrier drives a no-op entry through the ordinary quorum-commit path and
+// blocks until the leader has applied it. Committing a current-term entry
+// requires a majority to replicate it at this term, so a successful return is
+// itself proof that this node is still the leader as of an index that post-dates
+// the call — the read-index guarantee. A partitioned ex-leader cannot commit the
+// no-op (no quorum) and blocks until it steps down or the caller's deadline
+// fires, so it can never serve a stale read. After a nil return, a local read of
+// the store reflects every write committed before the barrier, and is
+// linearizable.
+//
+// This is the simple ReadIndex variant — one no-op per read. The heartbeat-only
+// optimization (confirm leadership with an empty AppendEntries round instead of a
+// logged entry) is deferred; it trades this scheme's log growth and quorum
+// round-trip for extra bookkeeping.
+func (n *Node) readBarrier() error {
+	n.commitMu.Lock()
+	defer n.commitMu.Unlock()
 
 	n.raftMu.Lock()
-	// Re-check leadership: we may have stepped down during PrepareCommit. Append
-	// to the Raft log file and the in-memory log TOGETHER under raftMu, so the
-	// file never leads the in-memory log — there is no orphan tail for a later
-	// commit (after a re-election) to blind-append onto and misalign. The append
-	// fsyncs eagerly, so the entry is durable before maybeAdvanceCommit can count
-	// it toward the commit index and apply it. If we stepped down we bail before
-	// touching either log; the entry is simply never created here.
+	if n.role != Leader {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	term := n.currentTerm
+	n.raftMu.Unlock()
+
+	n.storeMu.RLock()
+	entry, _, err := n.store.PrepareNoop()
+	n.storeMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	// A no-op that "maybe committed" is irrelevant — it changes nothing — but it
+	// means we lost leadership before confirming, so the read did not clear the
+	// barrier here. Report ErrNotLeader so the caller cleanly redirects.
+	if err := n.proposeAndAwait(term, entry); err != nil {
+		if errors.Is(err, ErrMaybeCommitted) {
+			return ErrNotLeader
+		}
+		return err
+	}
+	return nil
+}
+
+// proposeAndAwait appends entry (created in `term`) to the leader's log,
+// replicates it, and waits until the leader has applied it. It is the shared core
+// of client commits and read barriers. The caller holds commitMu, has verified
+// leadership at `term`, and has built the entry outside raftMu. Returns
+// ErrNotLeader if leadership was lost before the entry committed.
+func (n *Node) proposeAndAwait(term uint64, entry []byte) error {
+	n.raftMu.Lock()
+	// Re-check leadership: we may have stepped down while building the entry. Append
+	// to the Raft log file and the in-memory log TOGETHER under raftMu, so the file
+	// never leads the in-memory log — there is no orphan tail for a later commit
+	// (after a re-election) to blind-append onto and misalign. The append fsyncs
+	// eagerly, so the entry is durable before maybeAdvanceCommit can count it toward
+	// the commit index and apply it. If we stepped down we bail before touching
+	// either log; the entry is simply never created here.
 	if n.role != Leader || n.currentTerm != term {
 		n.raftMu.Unlock()
 		return ErrNotLeader
@@ -435,7 +497,10 @@ func (n *Node) commit(t *db.Txn) error {
 			return nil
 		}
 		if n.role != Leader {
-			return ErrNotLeader
+			// The entry was already appended and replicated; a later leader may yet
+			// commit it or truncate it. Its fate is unknown, which is materially
+			// different from never having been proposed (ErrNotLeader).
+			return ErrMaybeCommitted
 		}
 		n.appliedCond.Wait()
 	}
@@ -712,17 +777,16 @@ func (c *Cluster) Delete(key []byte) error {
 	return c.withLeader(func(ld *Node) error { return ld.storeDelete(key) })
 }
 
-// Get reads from the current leader, retrying across leadership changes.
-//
-// Not linearizable: currentLeader() inspects every node's role directly, so the
-// in-process harness always finds the true leader — but a real client routed to
-// a partitioned ex-leader (still role==Leader at its stale term until it hears a
-// higher one) could read stale data. Linearizable reads (read-index / leader
-// lease) are future work.
+// Get performs a linearizable read on the current leader, retrying across
+// leadership changes. It routes through the leader's read-index barrier
+// (linearizableGet), so the result reflects every write that completed before the
+// call: a partitioned ex-leader cannot confirm leadership and returns ErrNotLeader
+// (or blocks until it steps down), so this never observes stale data. The barrier
+// costs a quorum round-trip per read; the heartbeat-only optimization is deferred.
 func (c *Cluster) Get(key []byte) ([]byte, error) {
 	var out []byte
 	err := c.withLeader(func(ld *Node) error {
-		v, e := ld.storeGet(key)
+		v, e := ld.linearizableGet(key)
 		if e != nil {
 			return e
 		}
@@ -762,6 +826,18 @@ func (n *Node) storeBegin() *db.Txn {
 	n.storeMu.RLock()
 	defer n.storeMu.RUnlock()
 	return n.store.Begin()
+}
+
+// linearizableGet runs a read-index barrier and then reads the key from the local
+// store, so the result reflects every write that completed before the call. It
+// returns ErrNotLeader if this node cannot confirm leadership (e.g. a partitioned
+// ex-leader), so the caller redirects rather than reading stale state;
+// db.ErrKeyNotFound is returned for an absent key.
+func (n *Node) linearizableGet(key []byte) ([]byte, error) {
+	if err := n.readBarrier(); err != nil {
+		return nil, err
+	}
+	return n.storeGet(key)
 }
 
 // Node returns the i-th node, for inspection and tests.
