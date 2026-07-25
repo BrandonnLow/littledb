@@ -1080,3 +1080,89 @@ pinned the exactly-once finding above. And `RenderHistoryHTML` renders any histo
 as a self-contained, dependency-free timeline (one row per client, bars spanning
 [call, return], `Infinity` returns running to the edge), coloring by key and
 outlining the witness in red, so a violation is visible at a glance.
+
+## Phase 7 — Client sessions / exactly-once
+
+Phase 6 left one gap open and honest: a write whose leader stepped down after
+appending could return `ErrMaybeCommitted`, and a client that retried it might
+self-conflict with its own committed-but-unacked entry (first-committer-wins) or,
+for a non-idempotent operation, apply it twice. The register stayed linearizable,
+but the *client* could not learn its write's true fate. Client sessions close that
+gap: each client has a session id and stamps every command with a monotonically
+increasing sequence number, and the state machine dedups by `(session, seq)`, so a
+retried command applies at most once and a retry of an already-applied command
+returns success.
+
+### Carrying (session, seq) on the OpCommit marker
+
+The dedup key rides on the transaction's `OpCommit` marker: `Key = session`,
+`Value = seq`. Those fields are otherwise unused on a commit marker, and `OpCommit`
+lives only in the WAL and the Raft entry — never in an SSTable — so this needs no
+record-format change and touches only the prepare/apply/recovery paths (the same
+"overload a record's unused fields" move the SSTable sparse index already makes). A
+plain, session-less write leaves them empty and is never deduped, so the change is
+fully backward-compatible.
+
+### The table lives with the memtable, which is why there is no self-conflict
+
+The session table (`map[session]→lastSeq`) is updated in `ApplyEntry` inside the
+same `db.mu` critical section that applies the write to the memtable. That single
+fact removes the self-conflict without any special casing. `PrepareCommit` runs its
+dedup check and its conflict check under the *same* lock, so it sees a consistent
+view:
+
+- If the first attempt is already applied, the table has its seq, so the retry
+  short-circuits to success (a nil entry, no new proposal) *before* the conflict
+  check runs.
+- If the first attempt is not yet applied — e.g. a just-elected leader with apply
+  lag — then its write is not in the memtable either, so the conflict check cannot
+  see it and cannot reject the retry; the retry is proposed and **deduped as a
+  no-op at apply**.
+
+There is no window in which the memtable reflects the first attempt but the session
+table does not, so a retry never spuriously conflicts. Either path returns success,
+and the command applies exactly once.
+
+### Dedup is a no-op that still counts
+
+A duplicate reaching `ApplyEntry` is applied as a no-op: it writes only its marker
+(no data) to the WAL and touches neither the memtable nor the table. Writing the
+marker keeps the one-`OpCommit`-per-Raft-entry accounting that the recovered applied
+index depends on (`walBase + OpCommit count`), exactly like the read-index no-op —
+so a restart still reconstructs the right index. Recovery needs no dedup logic of
+its own: duplicates left only bare markers in the WAL, so replaying the data that is
+actually present can never double-apply, and the table is rebuilt as the max seq per
+session seen.
+
+### Durability across a flush
+
+A flush truncates the WAL, discarding the `OpCommit`s that carried pre-flush session
+state, so the table is persisted to a `sessions` file at flush time — crash-atomic
+via the same temp → fsync → rename → fsync-dir dance `applied.base` uses. On open
+the file seeds the table and the post-flush WAL layers newer sequences on top, so
+the full table survives a WAL-truncating flush. Durability is required, not
+best-effort: a lost table would let a post-restart retry of a pre-flush write
+double-apply.
+
+### Read-modify-write needs the read-index barrier
+
+A counter increment is a read-modify-write, and reading a stale value defeats
+exactly-once as surely as double-applying does. So `commitSessioned` runs the RMW
+behind a read-index barrier: the barrier confirms leadership *and* drains the apply
+queue, so the transaction reads current committed state — not a freshly-elected
+leader's lagging view — and `PrepareCommit`'s dedup table is current when it decides.
+
+### Validation, and the v1 limits
+
+`TestExactlyOnceCounterUnderCrashes` is the proof: a single client increments a
+counter 25 times under crash + partition churn, retrying each increment (reusing its
+seq) until a definitive success. A read-modify-write is not idempotent, so without
+dedup a retried increment over-counts; the final counter landing on exactly 25, run
+after run, is exactly-once demonstrated.
+
+Deliberately deferred for v1: session ids are client-chosen and the table is never
+expired (unbounded — LRU / timeout-based expiry is a later refinement), and
+`InstallSnapshot` does not yet transfer the session table, so exactly-once is not
+preserved across a snapshot install (the exactly-once tests keep compaction off to
+avoid that path). `ErrMaybeCommitted` remains the honest signal a client without a
+session still gets.

@@ -21,6 +21,7 @@ import (
 const (
 	walFilename              = "littledb.log"
 	appliedBaseFilename      = "applied.base"
+	sessionsFilename         = "sessions"
 	defaultMemtableSizeMax   = 4 * 1024 * 1024
 	defaultCompactionTrigger = 4
 )
@@ -81,6 +82,13 @@ type DB struct {
 	// txn's read snapshot from this, not nextTimestamp, so a snapshot never
 	// claims to include a commit whose data is not yet visible.
 	appliedTS uint64
+
+	// sessions maps a client session id to the highest per-session sequence
+	// number applied, for exactly-once dedup. Updated in ApplyEntry together with
+	// the memtable (same db.mu critical section), so PrepareCommit's dedup check
+	// and its conflict check see a consistent view. Reconstructed at Open from the
+	// sessions file plus the WAL's OpCommit markers. Not expired yet (v1).
+	sessions map[string]uint64
 
 	closed bool
 
@@ -150,6 +158,17 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	mt := memtable.New()
 	var buffer []*record.Record
 	var walOpCommits uint64
+	// Seed the dedup table from the last flush's snapshot, then let the WAL replay
+	// layer post-flush OpCommits on top (max wins). Together they reconstruct the
+	// full table across a WAL-truncating flush, mirroring applied.base.
+	sessions, err := readSessionsFile(dir)
+	if err != nil {
+		w.Close()
+		for _, r := range ssts {
+			r.Close()
+		}
+		return nil, err
+	}
 	err = w.Scan(func(offset int64, rec *record.Record) error {
 		if rec.Timestamp > maxTS {
 			maxTS = rec.Timestamp
@@ -159,6 +178,14 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 			buffer = append(buffer, rec)
 		case record.OpCommit:
 			walOpCommits++
+			// A sessioned commit carries (session, seq) on its marker; rebuild the
+			// dedup table from it. Duplicates were written as bare markers with no
+			// data, so simply applying the buffered data (below) never double-applies.
+			if len(rec.Key) > 0 {
+				if s := decodeSeq(rec.Value); s > sessions[string(rec.Key)] {
+					sessions[string(rec.Key)] = s
+				}
+			}
 			for _, br := range buffer {
 				if br.Timestamp != rec.Timestamp {
 					return fmt.Errorf("db: replay: ts mismatch (data %d vs commit %d)",
@@ -232,6 +259,7 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		appliedTS:        maxTS,
 		appliedIndex:     recoveredApplied,
 		recoveredApplied: recoveredApplied,
+		sessions:         sessions,
 		activeTxns:       make(map[*Txn]struct{}),
 		compactCh:        make(chan struct{}, 1),
 		compactDoneCh:    make(chan struct{}),
@@ -396,6 +424,12 @@ func (db *DB) flushLocked() error {
 	if err := writeAppliedBase(db.dir, db.appliedIndex); err != nil {
 		return err
 	}
+	// Persist the session dedup table too: the truncated WAL no longer carries its
+	// pre-flush OpCommits, so without this a restart would forget those sessions.
+	// Durable before flushLocked returns, so no post-flush commit races it.
+	if err := writeSessionsFile(db.dir, db.sessions); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -489,6 +523,30 @@ func (db *DB) LastAppliedTS() uint64 {
 // The cluster seeds commitIndex/lastApplied with it on restart.
 func (db *DB) RecoveredAppliedIndex() uint64 { return db.recoveredApplied }
 
+// SessionLastSeq returns the highest sequence number applied for a session (0 if
+// none), for inspection and tests.
+func (db *DB) SessionLastSeq(session []byte) uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.sessions[string(session)]
+}
+
+// encodeSeq / decodeSeq (de)serialize a session sequence number carried in the
+// OpCommit marker's Value field: 8 bytes, little-endian. A short/absent slice
+// decodes to 0 (no sequence).
+func encodeSeq(seq uint64) []byte {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], seq)
+	return b[:]
+}
+
+func decodeSeq(b []byte) uint64 {
+	if len(b) < 8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(b)
+}
+
 // readAppliedBase reads the post-flush WAL base index (the appliedIndex folded
 // into SSTables at the last flush). Absent file means no flush yet: base 0.
 func readAppliedBase(dir string) (uint64, error) {
@@ -554,6 +612,85 @@ func syncDir(dir string) error {
 	return d.Sync()
 }
 
+// readSessionsFile loads the persisted session dedup table (map session->lastSeq)
+// written at the last flush. A missing file yields an empty table (no flush yet, or
+// no sessions). A torn/short file is treated as absent: the atomic rename
+// guarantees a complete file otherwise, and the WAL replay reconstructs post-flush
+// state on top regardless. Format: count(8) then count records of keyLen(4)|key|seq(8).
+func readSessionsFile(dir string) (map[string]uint64, error) {
+	out := map[string]uint64{}
+	buf, err := os.ReadFile(filepath.Join(dir, sessionsFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("db: read sessions: %w", err)
+	}
+	if len(buf) < 8 {
+		return out, nil // torn; treat as absent
+	}
+	n := binary.LittleEndian.Uint64(buf)
+	off := 8
+	for i := uint64(0); i < n; i++ {
+		if off+4 > len(buf) {
+			return map[string]uint64{}, nil // torn: discard, WAL replay recovers post-flush
+		}
+		klen := int(binary.LittleEndian.Uint32(buf[off:]))
+		off += 4
+		if off+klen+8 > len(buf) {
+			return map[string]uint64{}, nil
+		}
+		key := string(buf[off : off+klen])
+		off += klen
+		out[key] = binary.LittleEndian.Uint64(buf[off:])
+		off += 8
+	}
+	return out, nil
+}
+
+// writeSessionsFile durably records the session dedup table after a flush, with
+// the same crash-atomic temp -> fsync -> rename -> fsync-dir dance writeAppliedBase
+// uses. Durability is required, not best-effort: a flush truncates the WAL, so the
+// OpCommits that carried pre-flush session state are gone; if this file were lost,
+// a restart would forget those sessions and a post-restart retry could double-apply.
+func writeSessionsFile(dir string, sessions map[string]uint64) error {
+	buf := make([]byte, 8, 8+len(sessions)*24)
+	binary.LittleEndian.PutUint64(buf, uint64(len(sessions)))
+	for k, seq := range sessions {
+		var hdr [4]byte
+		binary.LittleEndian.PutUint32(hdr[:], uint32(len(k)))
+		buf = append(buf, hdr[:]...)
+		buf = append(buf, k...)
+		var s [8]byte
+		binary.LittleEndian.PutUint64(s[:], seq)
+		buf = append(buf, s[:]...)
+	}
+
+	tmp := filepath.Join(dir, sessionsFilename+".tmp")
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("db: write sessions: %w", err)
+	}
+	if _, err := f.Write(buf); err != nil {
+		f.Close()
+		return fmt.Errorf("db: write sessions: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("db: sync sessions: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("db: close sessions: %w", err)
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, sessionsFilename)); err != nil {
+		return fmt.Errorf("db: rename sessions: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("db: sync dir after sessions: %w", err)
+	}
+	return nil
+}
+
 // ApplyEntry durably records a committed entry's records to the WAL (identical
 // framing to a single-node commit, so node WALs stay byte-identical) and
 // applies them to the memtable, marking this DB applied through Raft index idx.
@@ -596,25 +733,45 @@ func (db *DB) ApplyEntry(idx uint64, entry []byte) error {
 		}
 	}
 
-	// Durably append every record (data + marker) to the WAL before touching
-	// the memtable, exactly as a single-node commit does, so a follower's WAL is
-	// byte-identical to the leader's.
-	for _, rec := range recs {
-		if _, err := db.wal.Append(rec); err != nil {
-			return fmt.Errorf("db: apply entry: wal append: %w", err)
-		}
+	// Exactly-once dedup. A sessioned commit carries (session, seq) on its marker.
+	// If this seq is already applied for the session, the entry is a duplicate
+	// retry (e.g. the leader proposed it before applying the original): apply it as
+	// a no-op — write only the marker to the WAL, keeping the one-OpCommit-per-entry
+	// applied-index accounting in lockstep, and touch neither the memtable nor the
+	// session table. This runs under db.mu, the same lock PrepareCommit checks the
+	// table under, so the dedup and conflict views never disagree.
+	session := string(commitRec.Key)
+	var seq uint64
+	if session != "" {
+		seq = decodeSeq(commitRec.Value)
 	}
-
-	for _, rec := range recs[:len(recs)-1] {
-		switch rec.Op {
-		case record.OpPut:
-			if err := db.memtable.Put(rec.Key, rec.Value, rec.Timestamp); err != nil {
-				panic(fmt.Sprintf("db: memtable.Put on apply entry (ts=%d): %v", rec.Timestamp, err))
+	if session != "" && seq <= db.sessions[session] {
+		if _, err := db.wal.Append(commitRec); err != nil {
+			return fmt.Errorf("db: apply entry: wal append (dedup marker): %w", err)
+		}
+	} else {
+		// New commit: durably append every record (data + marker) to the WAL before
+		// touching the memtable, exactly as a single-node commit does, so a
+		// follower's WAL is byte-identical to the leader's.
+		for _, rec := range recs {
+			if _, err := db.wal.Append(rec); err != nil {
+				return fmt.Errorf("db: apply entry: wal append: %w", err)
 			}
-		case record.OpDelete:
-			if err := db.memtable.Delete(rec.Key, rec.Timestamp); err != nil {
-				panic(fmt.Sprintf("db: memtable.Delete on apply entry (ts=%d): %v", rec.Timestamp, err))
+		}
+		for _, rec := range recs[:len(recs)-1] {
+			switch rec.Op {
+			case record.OpPut:
+				if err := db.memtable.Put(rec.Key, rec.Value, rec.Timestamp); err != nil {
+					panic(fmt.Sprintf("db: memtable.Put on apply entry (ts=%d): %v", rec.Timestamp, err))
+				}
+			case record.OpDelete:
+				if err := db.memtable.Delete(rec.Key, rec.Timestamp); err != nil {
+					panic(fmt.Sprintf("db: memtable.Delete on apply entry (ts=%d): %v", rec.Timestamp, err))
+				}
 			}
+		}
+		if session != "" {
+			db.sessions[session] = seq
 		}
 	}
 

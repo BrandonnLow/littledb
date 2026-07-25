@@ -558,12 +558,13 @@ func within(timeout time.Duration, cond func() bool) bool {
 // pulls forward the commit of any prior-term tail (Raft §5.4.2), giving every node
 // a definite index to apply up to — without it, a leader elected after the last
 // write could sit on uncommitted prior-term entries indefinitely. It then quiesces,
-// checks all nodes hold identical committed state for the workload keys, and runs
-// the recorded history through lincheck (logging the verdict — believed-leader
-// reads can be stale until linearizable reads land).
+// checks all nodes hold identical committed state for the workload keys, and
+// asserts the recorded history is linearizable (reads route through the read-index
+// barrier, so believed-leader reads are no longer stale). Timeouts are generous:
+// resettling after heavy churn can be slow under full -race suite contention.
 func settleConvergeCheck(t *testing.T, c *Cluster, h *history, label string) {
 	t.Helper()
-	if !within(20*time.Second, func() bool {
+	if !within(30*time.Second, func() bool {
 		return c.Put([]byte("__sync__"), []byte("1")) == nil
 	}) {
 		t.Fatalf("%s: no leader accepted a sync write after heal\n%s", label, dumpClusterState(c))

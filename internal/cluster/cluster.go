@@ -840,6 +840,32 @@ func (n *Node) linearizableGet(key []byte) ([]byte, error) {
 	return n.storeGet(key)
 }
 
+// commitSessioned runs a transaction stamped with (session, seq) — typically a
+// read-modify-write — behind a read-index barrier, giving exactly-once semantics
+// on retry. The barrier does double duty: it confirms leadership AND ensures this
+// node has applied everything committed, so the txn reads current state (not a
+// freshly-elected leader's lagging view) and PrepareCommit's dedup table is
+// current. A retry with the same seq is deduped to a single application. The apply
+// callback runs under storeMu (a consistent read view); the commit is issued
+// without holding storeMu, since commit() re-acquires it for PrepareCommit.
+// Returns ErrNotLeader / ErrMaybeCommitted like a plain commit; db errors
+// (ErrConflict, ...) surface from Commit.
+func (n *Node) commitSessioned(session []byte, seq uint64, apply func(*db.Txn) error) error {
+	if err := n.readBarrier(); err != nil {
+		return err
+	}
+	n.storeMu.RLock()
+	tx := n.store.Begin()
+	tx.SetSession(session, seq)
+	err := apply(tx)
+	n.storeMu.RUnlock()
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 // Node returns the i-th node, for inspection and tests.
 func (c *Cluster) Node(i int) *Node {
 	c.nodesMu.RLock()

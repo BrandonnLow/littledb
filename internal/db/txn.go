@@ -15,6 +15,23 @@ type Txn struct {
 	readSnap uint64
 	writes   map[string]txnWrite
 	finished bool
+
+	// session and seq drive exactly-once dedup. When session is non-empty, the
+	// commit is stamped with (session, seq) on its OpCommit marker; a retry that
+	// reuses the same pair is recognized as a duplicate at prepare/apply time and
+	// does not re-apply. Empty session means no dedup (a plain, at-least-once write).
+	session []byte
+	seq     uint64
+}
+
+// SetSession stamps the transaction with a client session id and a per-session,
+// monotonically increasing sequence number, enabling exactly-once semantics: if a
+// commit is retried (e.g. after a leader change returns ErrMaybeCommitted) with the
+// same (session, seq), it applies at most once. The caller must reuse the same seq
+// across retries of the same logical operation, and advance it only for a new one.
+func (t *Txn) SetSession(session []byte, seq uint64) {
+	t.session = append([]byte(nil), session...)
+	t.seq = seq
 }
 
 type txnWrite struct {
@@ -203,6 +220,18 @@ func (db *DB) PrepareCommit(t *Txn) (entry []byte, commitTS uint64, err error) {
 		return nil, 0, nil
 	}
 
+	// Exactly-once dedup, BEFORE the conflict check. This runs under db.mu, the
+	// same lock ApplyEntry updates the session table and the memtable under, so the
+	// dedup view and the conflict-check view are consistent: if this session's seq
+	// is already applied, the retry short-circuits to success (nil entry) here; if
+	// it is not yet applied, neither is its earlier attempt's write, so the conflict
+	// check below cannot see it and reject the retry — it is proposed and deduped as
+	// a no-op at apply. Either way the retry never self-conflicts.
+	if len(t.session) > 0 && t.seq <= db.sessions[string(t.session)] {
+		t.finished = true
+		return nil, 0, nil
+	}
+
 	for k := range t.writes {
 		has, cerr := db.hasCommitNewerThanLocked([]byte(k), t.readSnap)
 		if cerr != nil {
@@ -230,6 +259,13 @@ func (db *DB) PrepareCommit(t *Txn) (entry []byte, commitTS uint64, err error) {
 		entry = append(entry, record.Encode(rec)...)
 	}
 	commitRec := &record.Record{Op: record.OpCommit, Timestamp: commitTS}
+	if len(t.session) > 0 {
+		// Carry (session, seq) on the marker: Key=session, Value=seq. OpCommit's
+		// key/value are otherwise unused and it lives only in the WAL and the Raft
+		// entry (never an SSTable), so this needs no record-format change.
+		commitRec.Key = append([]byte(nil), t.session...)
+		commitRec.Value = encodeSeq(t.seq)
+	}
 	entry = append(entry, record.Encode(commitRec)...)
 
 	t.finished = true
