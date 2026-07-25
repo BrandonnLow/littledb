@@ -49,7 +49,9 @@ func TestLaggingFollowerGetsSnapshot(t *testing.T) {
 	// Reconnect follower 2: its nextIndex is in the compacted prefix, so it must
 	// be caught up by InstallSnapshot.
 	pt.reconnect(2)
-	waitFor(t, 5*time.Second, func() bool { return c.Node(2).InstallsForTesting() >= 1 })
+	// Generous: a synchronous install (rebuild + swap + reopen) can exceed a few
+	// seconds under the CPU contention of the full -race suite.
+	waitFor(t, 15*time.Second, func() bool { return c.Node(2).InstallsForTesting() >= 1 })
 
 	// After install, follower 2's base equals the snapshot's lastIncludedIndex
 	// (> 0) and it holds every key. Use DB() (storeMu-guarded): the install

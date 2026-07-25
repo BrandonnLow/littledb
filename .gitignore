@@ -32,3 +32,5 @@ go.work.sum
 
 # Claude
 .claude/ 
+# Generated lincheck visualizations
+*.html

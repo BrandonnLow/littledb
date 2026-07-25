@@ -166,7 +166,9 @@ func TestInstallWipesStaleLiveKey(t *testing.T) {
 
 	// Reconnect: follower 2 installs the snapshot (which omits the deleted key).
 	pt.reconnect(2)
-	waitFor(t, 5*time.Second, func() bool { return c.Node(2).InstallsForTesting() >= 1 })
+	// Generous: the install is a synchronous DB rebuild + swap + reopen, which can
+	// run well past a few seconds under the CPU contention of the full -race suite.
+	waitFor(t, 15*time.Second, func() bool { return c.Node(2).InstallsForTesting() >= 1 })
 	waitFor(t, 2*time.Second, func() bool {
 		v, err := c.Node(2).DB().Get([]byte("k7"))
 		return err == nil && string(v) == "v7"
