@@ -320,7 +320,7 @@ func TestRenderHistoryHTML(t *testing.T) {
 	html := RenderHistoryHTML(bad, res)
 	// `witness"` matches the class APPLIED to an op group (not the CSS rule
 	// `.bar.witness`), confirming the counterexample is highlighted.
-	for _, want := range []string{"<!doctype html>", "<svg", "</svg>", "NOT linearizable", "witness\""} {
+	for _, want := range []string{"<!doctype html>", "<svg", "</svg>", "not linearizable", "pill bad", "witness\""} {
 		if !strings.Contains(html, want) {
 			t.Errorf("rendered HTML missing %q", want)
 		}
@@ -328,15 +328,35 @@ func TestRenderHistoryHTML(t *testing.T) {
 
 	// A linearizable history shows the ok verdict and highlights nothing.
 	good := []Op{put(0, "x", "a", 0, 1), getVal(1, "x", "a", 2, 3)}
-	if h := RenderHistoryHTML(good, Check(good)); !strings.Contains(h, "verdict ok") || strings.Contains(h, "NOT linearizable") || strings.Contains(h, "witness\"") {
+	if h := RenderHistoryHTML(good, Check(good)); !strings.Contains(h, "pill ok") || strings.Contains(h, "not linearizable") || strings.Contains(h, "witness\"") {
 		t.Error("linearizable render should show the ok verdict and no applied witness class")
 	}
 
+	// Optionally dump a polished example fragment (LINCHECK_FRAG_OUT) or full page
+	// (LINCHECK_HTML_OUT) for eyeballing / embedding.
+	ex := []Op{
+		put(0, "x", "A", 0, 6),
+		getVal(1, "x", "A", 7, 12),
+		{Client: 3, Kind: Put, Key: "y", Value: "1", Call: 10, Return: Infinity}, // uncertain write
+		put(0, "x", "B", 14, 20),
+		getVal(2, "x", "B", 21, 27),
+		put(1, "x", "C", 30, 37),
+		getVal(2, "x", "C", 40, 46),
+		getVal(3, "y", "1", 48, 54),
+		getVal(0, "x", "A", 50, 56), // STALE: x is "C" by now — the violation
+	}
+	exRes := Check(ex)
+	if out := os.Getenv("LINCHECK_FRAG_OUT"); out != "" {
+		if err := os.WriteFile(out, []byte(RenderHistoryFragment(ex, exRes)), 0o644); err != nil {
+			t.Fatalf("dump fragment: %v", err)
+		}
+		t.Logf("wrote fragment to %s", out)
+	}
 	if out := os.Getenv("LINCHECK_HTML_OUT"); out != "" {
-		if err := os.WriteFile(out, []byte(html), 0o644); err != nil {
+		if err := os.WriteFile(out, []byte(RenderHistoryHTML(ex, exRes)), 0o644); err != nil {
 			t.Fatalf("dump html: %v", err)
 		}
-		t.Logf("wrote sample timeline to %s", out)
+		t.Logf("wrote page to %s", out)
 	}
 }
 
