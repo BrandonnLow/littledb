@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"math/rand"
+	"sort"
 	"time"
 )
 
@@ -30,7 +31,34 @@ func (r Role) String() string {
 // noVote is the votedFor sentinel meaning "have not voted this term".
 const noVote NodeID = -1
 
-func (n *Node) majority() int { return (len(n.peers)+1)/2 + 1 }
+// majority is the quorum size of the current configuration (a strict majority of
+// the voting members, self included). A nil config falls back to the fixed peer
+// set, for bare-Node white-box tests. Must hold raftMu (reads config).
+func (n *Node) majority() int {
+	if n.config == nil {
+		return (len(n.peers)+1)/2 + 1
+	}
+	return len(n.config)/2 + 1
+}
+
+// votingPeers returns the current voting members other than this node, in id
+// order. Derived from config, so it shrinks and grows as membership changes,
+// unlike the fixed peers slice (which remains the transport-level universe of
+// nodes this process knows how to reach). A nil config falls back to the peer
+// set. Must hold raftMu.
+func (n *Node) votingPeers() []NodeID {
+	if n.config == nil {
+		return n.peers
+	}
+	out := make([]NodeID, 0, len(n.config))
+	for p := range n.config {
+		if p != n.id {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
 
 func (n *Node) randomElectionTimeout() time.Duration {
 	span := n.cfg.ElectionMax - n.cfg.ElectionMin
@@ -54,7 +82,7 @@ func (n *Node) resetElectionTimer() {
 func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
 	last := n.log.lastIndex()
-	for _, p := range n.peers {
+	for _, p := range n.votingPeers() {
 		n.nextIndex[p] = last + 1
 		n.matchIndex[p] = 0
 	}
@@ -146,7 +174,7 @@ func (n *Node) maybeStartElection() {
 	term := n.currentTerm
 	lastIndex := n.log.lastIndex()
 	lastTerm := n.log.lastTerm()
-	peers := n.peers
+	peers := n.votingPeers() // solicit only current voting members
 	n.raftMu.Unlock()
 
 	n.resetElectionTimer() // give this election a fresh window

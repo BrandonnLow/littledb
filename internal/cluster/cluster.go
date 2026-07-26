@@ -90,6 +90,13 @@ type Node struct {
 	currentTerm uint64
 	votedFor    NodeID // noVote if none this term
 
+	// config is the current voting membership (node ids, including self). Quorum
+	// size, the vote-solicitation set, and the commit-index computation all derive
+	// from it, so the cluster is no longer fixed-size: a membership change rewrites
+	// it. Bootstrapped to every node at construction, so a cluster with no
+	// membership changes behaves exactly as a fixed peer set. Guarded by raftMu.
+	config map[NodeID]bool
+
 	log         *RaftLog
 	logFile     *raftLogFile       // durable Raft log; nil for bare-Node white-box tests
 	stateFile   hardStatePersister // durable (currentTerm, votedFor); nil for bare-Node tests
@@ -645,7 +652,9 @@ func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, c
 	}
 
 	var peers []NodeID
+	config := make(map[NodeID]bool, size)
 	for j := 0; j < size; j++ {
+		config[NodeID(j)] = true // bootstrap config: every node is a voting member
 		if NodeID(j) != id {
 			peers = append(peers, NodeID(j))
 		}
@@ -655,6 +664,7 @@ func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, c
 		store:       store,
 		transport:   tr,
 		peers:       peers,
+		config:      config,
 		cfg:         cfg,
 		dir:         dir,
 		raftDir:     raftDir,

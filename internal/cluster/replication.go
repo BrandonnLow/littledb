@@ -161,10 +161,13 @@ func (n *Node) onAppendRejectLocked(p NodeID, hint uint64) {
 // index N commits everything <= N). The leader's own match is its lastIndex (it
 // holds every entry it appended).
 func (n *Node) maybeAdvanceCommitLocked() {
-	total := len(n.peers) + 1
+	// Over the current voting configuration only: self (its match is its lastIndex,
+	// since it holds every entry it appended) plus each voting peer's matchIndex.
+	peers := n.votingPeers()
+	total := len(peers) + 1
 	vals := make([]uint64, 0, total)
 	vals = append(vals, n.log.lastIndex())
-	for _, p := range n.peers {
+	for _, p := range peers {
 		vals = append(vals, n.matchIndex[p])
 	}
 	sort.Slice(vals, func(i, j int) bool { return vals[i] > vals[j] })
