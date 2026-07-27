@@ -1450,12 +1450,49 @@ and the Phase 5 harness running the randomized concurrent workload while a serve
 added underneath it, with the checker confirming linearizability. As with removal,
 membership changes concurrent with *fault injection* are the Stage 6 soak.
 
-### Still open (Stages 5–6)
+### Transferring leadership (Stage 5)
 
-Leadership transfer (`TimeoutNow` — a leader hands off to a caught-up follower that
-campaigns immediately, using the `LeaderTransfer` bypass already in place) and the
-deferred durability items remain: an `InstallSnapshot` must carry the configuration
-and the session table (today it ships only the live key/value set, so a follower that
-installs a snapshot loses its membership view and its exactly-once dedup), and
-compaction must fold a compacted configuration entry into the base-config file
-(`raft/config`) so it survives a restart. They are the rest of Phase 8.
+`Cluster.TransferLeadership(target)` hands leadership to a chosen voting member
+without waiting for a timeout-driven election — the operation behind a graceful
+shutdown (move leadership off a node before taking it down) or rebalancing. It is
+small because Stage 3 already built the one piece that makes it work: the
+`LeaderTransfer` bypass on `RequestVote`.
+
+The mechanism (dissertation §3.10): the leader (1) marks itself `transferring`,
+which gates `proposeAndAwait` so it appends no new entries — the target must not
+fall behind between the catch-up check and its election; (2) replicates its full log
+to the target and waits for `matchIndex[target]` to reach `lastIndex`, so the
+target's log is as up-to-date as any voter's; (3) sends the target a `MsgTimeoutNow`.
+The target, on receipt, campaigns **immediately** — `handleTimeoutNow` calls the
+election routine directly, bypassing its randomized timer — and stamps
+`LeaderTransfer` on its `RequestVote`s so the other voters skip the
+min-election-timeout rule they would otherwise apply (they *just* heard from the old
+leader, so without the bypass they would refuse). The target, being fully caught up,
+satisfies the §5.4.1 up-to-date check and wins at once; the old leader steps down the
+moment it sees the target's higher-term vote request, which clears `transferring`.
+
+Two properties make this safe rather than merely fast. **The up-to-date check is NOT
+bypassed** — only the min-timeout rule is — so `LeaderTransfer` can hand a vote to a
+current-log candidate but never to a stale one; a transfer to a lagging target simply
+fails its catch-up wait (`ErrTransferTimeout`) rather than electing someone who would
+lose committed entries. And **gating new proposals during the transfer** is what keeps
+the target from falling behind in the window between "caught up" and "elected": a
+client write that slipped in there would leave the target one entry short, and the
+other voters — now holding that newer entry — would refuse it, turning a transfer into
+a stall. While `transferring`, client writes get `ErrNotLeader` and redirect, retrying
+until the new leader answers (a sub-second window). If the target never takes over, the
+transfer aborts and the old leader resumes.
+
+Validation: a transfer to a chosen node makes it leader in single-digit milliseconds
+(versus the hundreds a timeout election would take), the old leader steps down, and
+writes then flow through the new leader; a transfer to a non-voter is refused
+(`ErrTransferTarget`); and a transfer to self is a no-op.
+
+### Still open (Stage 6)
+
+The deferred durability items remain: an `InstallSnapshot` must carry the
+configuration and the session table (today it ships only the live key/value set, so a
+follower that installs a snapshot loses its membership view and its exactly-once
+dedup), and compaction must fold a compacted configuration entry into the base-config
+file (`raft/config`) so it survives a restart. With those closed and a
+membership-under-fault-injection soak added to the checker, Phase 8 is complete.
