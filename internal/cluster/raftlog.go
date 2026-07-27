@@ -1,10 +1,11 @@
 package cluster
 
-// logEntry is one Raft log entry: a committed transaction's encoded records
-// (data records terminated by an OpCommit marker, all at one timestamp),
-// tagged with the term in which the leader created it.
+// logEntry is one Raft log entry: its kind (a transaction's encoded records, or a
+// membership configuration), the payload bytes, and the term in which the leader
+// created it.
 type logEntry struct {
 	term  uint64
+	kind  EntryKind
 	bytes []byte
 }
 
@@ -62,10 +63,13 @@ func (l *RaftLog) term(idx uint64) uint64 {
 // <= lastIndex). The slice is owned by the log; callers must not mutate it.
 func (l *RaftLog) entryAt(idx uint64) []byte { return l.entries[idx-l.baseIndex-1].bytes }
 
-// append adds bytes as a new entry in the given term and returns its index. The
-// bytes are copied, so the caller may reuse the buffer.
-func (l *RaftLog) append(term uint64, bytes []byte) uint64 {
-	l.entries = append(l.entries, logEntry{term: term, bytes: append([]byte(nil), bytes...)})
+// kindAt returns the kind of the entry at idx (must be > baseIndex and <= lastIndex).
+func (l *RaftLog) kindAt(idx uint64) EntryKind { return l.entries[idx-l.baseIndex-1].kind }
+
+// append adds bytes as a new entry of the given kind in the given term and returns
+// its index. The bytes are copied, so the caller may reuse the buffer.
+func (l *RaftLog) append(term uint64, kind EntryKind, bytes []byte) uint64 {
+	l.entries = append(l.entries, logEntry{term: term, kind: kind, bytes: append([]byte(nil), bytes...)})
 	return l.lastIndex()
 }
 
@@ -138,7 +142,7 @@ func (l *RaftLog) entriesAfter(idx uint64) []persistedEntry {
 	start := idx - l.baseIndex
 	out := make([]persistedEntry, 0, uint64(len(l.entries))-start)
 	for i := start; i < uint64(len(l.entries)); i++ {
-		out = append(out, persistedEntry{term: l.entries[i].term, data: l.entries[i].bytes})
+		out = append(out, persistedEntry{term: l.entries[i].term, kind: l.entries[i].kind, data: l.entries[i].bytes})
 	}
 	return out
 }

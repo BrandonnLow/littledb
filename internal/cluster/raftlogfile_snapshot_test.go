@@ -27,7 +27,7 @@ func TestRaftLogFileHeaderRoundTrip(t *testing.T) {
 		t.Fatalf("fresh: base=(%d,%d) entries=%d, want (0,0)/0", lf.baseIndex, lf.baseTerm, len(entries))
 	}
 	for i := 0; i < 4; i++ {
-		if err := lf.append(uint64(i+1), []byte{byte('a' + i)}); err != nil {
+		if err := lf.append(uint64(i+1), EntryData, []byte{byte('a' + i)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -52,18 +52,18 @@ func TestRaftLogFileCompactAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, tm := range []uint64{1, 1, 2, 2} { // a@1,b@1,c@2,d@2
-		if err := lf.append(tm, []byte{byte('a' + i)}); err != nil {
+		if err := lf.append(tm, EntryData, []byte{byte('a' + i)}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Compact to base 2 @ term 1; survivors are indices 3,4.
-	if err := lf.compact(2, 1, []persistedEntry{{2, []byte("c")}, {2, []byte("d")}}); err != nil {
+	if err := lf.compact(2, 1, []persistedEntry{{2, EntryData, []byte("c")}, {2, EntryData, []byte("d")}}); err != nil {
 		t.Fatal(err)
 	}
 	if lf.baseIndex != 2 || lf.baseTerm != 1 {
 		t.Fatalf("after compact base=(%d,%d), want (2,1)", lf.baseIndex, lf.baseTerm)
 	}
-	if err := lf.append(2, []byte("e")); err != nil { // index 5
+	if err := lf.append(2, EntryData, []byte("e")); err != nil { // index 5
 		t.Fatal(err)
 	}
 	lf.close()
@@ -116,14 +116,14 @@ func TestRaftLogFileTornFrameAfterCompactedBase(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, tm := range []uint64{1, 1, 2, 2} {
-		if err := lf.append(tm, []byte{byte('a' + i)}); err != nil {
+		if err := lf.append(tm, EntryData, []byte{byte('a' + i)}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := lf.compact(2, 1, []persistedEntry{{2, []byte("c")}, {2, []byte("d")}}); err != nil {
+	if err := lf.compact(2, 1, []persistedEntry{{2, EntryData, []byte("c")}, {2, EntryData, []byte("d")}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := lf.append(3, []byte("eeee")); err != nil { // index 5
+	if err := lf.append(3, EntryData, []byte("eeee")); err != nil { // index 5
 		t.Fatal(err)
 	}
 	lf.close()
@@ -163,7 +163,7 @@ func TestRaftLogFileTornHeaderReinit(t *testing.T) {
 	if lf.baseIndex != 0 || lf.baseTerm != 0 || len(entries) != 0 {
 		t.Fatalf("reinit: base=(%d,%d) entries=%d, want (0,0)/0", lf.baseIndex, lf.baseTerm, len(entries))
 	}
-	if err := lf.append(1, []byte("a")); err != nil {
+	if err := lf.append(1, EntryData, []byte("a")); err != nil {
 		t.Fatal(err)
 	}
 	lf.close()

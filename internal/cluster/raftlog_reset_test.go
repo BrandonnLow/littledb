@@ -7,9 +7,9 @@ import (
 
 func TestRaftLogResetToBaseDiscardsAll(t *testing.T) {
 	l := NewRaftLog()
-	l.append(1, []byte("a"))
-	l.append(1, []byte("b"))
-	l.append(2, []byte("c"))
+	l.append(1, EntryData, []byte("a"))
+	l.append(1, EntryData, []byte("b"))
+	l.append(2, EntryData, []byte("c"))
 
 	l.resetToBase(50, 7)
 
@@ -34,7 +34,7 @@ func TestRaftLogResetToBaseDiscardsAll(t *testing.T) {
 		t.Fatalf("matchesPrev(50,6) = true, want false")
 	}
 	// Appends resume at base+1.
-	if idx := l.append(7, []byte("d")); idx != 51 {
+	if idx := l.append(7, EntryData, []byte("d")); idx != 51 {
 		t.Fatalf("append after reset returned %d, want 51", idx)
 	}
 }
@@ -47,10 +47,10 @@ func TestRaftLogFileResetToBaseSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if err := lf.append(1, []byte("x")); err != nil {
+	if err := lf.append(1, EntryData, []byte("x")); err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	if err := lf.append(1, []byte("y")); err != nil {
+	if err := lf.append(1, EntryData, []byte("y")); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	if err := lf.resetToBase(100, 9); err != nil {
@@ -60,7 +60,7 @@ func TestRaftLogFileResetToBaseSurvivesReopen(t *testing.T) {
 		t.Fatalf("in-memory base = (%d,%d), want (100,9)", lf.baseIndex, lf.baseTerm)
 	}
 	// Append on top of the new base persists at index 101.
-	if err := lf.append(9, []byte("z")); err != nil {
+	if err := lf.append(9, EntryData, []byte("z")); err != nil {
 		t.Fatalf("append after reset: %v", err)
 	}
 	if err := lf.close(); err != nil {
@@ -88,8 +88,8 @@ func TestResetRaftLogFileToHelper(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	lf.append(3, []byte("old1"))
-	lf.append(3, []byte("old2"))
+	lf.append(3, EntryData, []byte("old1"))
+	lf.append(3, EntryData, []byte("old2"))
 	lf.close()
 
 	// Completion-style reset without a live handle.

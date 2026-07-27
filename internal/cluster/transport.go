@@ -54,12 +54,25 @@ type KVPair struct {
 	Value []byte
 }
 
-// Entry is one log entry on the wire: the encoded transaction bytes plus the
-// term in which its leader created it. The term must travel with the entry so
-// a follower can store it correctly and detect a conflicting (same-index,
-// different-term) entry during divergence repair.
+// EntryKind tags what a Raft log entry carries. Most entries are data (an encoded
+// transaction); a config entry carries a membership change, which the Raft layer
+// interprets itself (adopting it on append) rather than applying to the state
+// machine.
+type EntryKind uint8
+
+const (
+	EntryData   EntryKind = iota // an encoded transaction: data records + OpCommit
+	EntryConfig                  // a membership configuration (encoded voter set)
+)
+
+// Entry is one log entry on the wire: its kind, the payload bytes, and the term in
+// which its leader created it. The term must travel with the entry so a follower
+// can store it correctly and detect a conflicting (same-index, different-term)
+// entry during divergence repair; the kind must travel so a follower adopts a
+// config entry on receipt rather than trying to apply it as a transaction.
 type Entry struct {
 	Term uint64
+	Kind EntryKind
 	Data []byte
 }
 

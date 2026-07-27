@@ -90,7 +90,7 @@ func TestRaftLogFileMirrorsInMemoryLog(t *testing.T) {
 	// 1) Append three entries at term 1 onto an empty log.
 	f.handleAppendEntries(Message{
 		Type: MsgAppendEntries, From: 0, Term: 1, PrevLogIndex: 0, PrevLogTerm: 0,
-		Entries: []Entry{{1, ent("a")}, {1, ent("b")}, {1, ent("c")}},
+		Entries: []Entry{{1, EntryData, ent("a")}, {1, EntryData, ent("b")}, {1, EntryData, ent("c")}},
 	})
 	drainAppendResp(t, tr, 0, true)
 	if f.log.lastIndex() != 3 {
@@ -102,7 +102,7 @@ func TestRaftLogFileMirrorsInMemoryLog(t *testing.T) {
 	// b2,c2@2. This is exactly the divergence-repair path.
 	f.handleAppendEntries(Message{
 		Type: MsgAppendEntries, From: 0, Term: 2, PrevLogIndex: 1, PrevLogTerm: 1,
-		Entries: []Entry{{2, ent("b2")}, {2, ent("c2")}},
+		Entries: []Entry{{2, EntryData, ent("b2")}, {2, EntryData, ent("c2")}},
 	})
 	drainAppendResp(t, tr, 0, true)
 	if f.log.lastIndex() != 3 ||
@@ -116,7 +116,7 @@ func TestRaftLogFileMirrorsInMemoryLog(t *testing.T) {
 	// file must not gain a duplicate tail.
 	f.handleAppendEntries(Message{
 		Type: MsgAppendEntries, From: 0, Term: 2, PrevLogIndex: 1, PrevLogTerm: 1,
-		Entries: []Entry{{2, ent("b2")}, {2, ent("c2")}},
+		Entries: []Entry{{2, EntryData, ent("b2")}, {2, EntryData, ent("c2")}},
 	})
 	drainAppendResp(t, tr, 0, true)
 	if f.log.lastIndex() != 3 {
@@ -127,7 +127,7 @@ func TestRaftLogFileMirrorsInMemoryLog(t *testing.T) {
 	// 4) Extend with a fresh entry at term 2 (prevLogIndex now matches the tail).
 	f.handleAppendEntries(Message{
 		Type: MsgAppendEntries, From: 0, Term: 2, PrevLogIndex: 3, PrevLogTerm: 2,
-		Entries: []Entry{{2, ent("d2")}},
+		Entries: []Entry{{2, EntryData, ent("d2")}},
 	})
 	drainAppendResp(t, tr, 0, true)
 	if f.log.lastIndex() != 4 || string(f.log.entryAt(4)) != "d2" {

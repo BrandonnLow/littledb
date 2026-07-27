@@ -95,7 +95,14 @@ type Node struct {
 	// from it, so the cluster is no longer fixed-size: a membership change rewrites
 	// it. Bootstrapped to every node at construction, so a cluster with no
 	// membership changes behaves exactly as a fixed peer set. Guarded by raftMu.
-	config map[NodeID]bool
+	//
+	// It is derived state: baseConfig (the config as of the log's compaction base,
+	// persisted in configPath so it survives compaction and restart) plus the
+	// config entries surviving in the log. adoptConfigLocked updates it on append;
+	// deriveConfigLocked recomputes it after a truncation.
+	config     map[NodeID]bool
+	baseConfig map[NodeID]bool
+	configPath string
 
 	log         *RaftLog
 	logFile     *raftLogFile       // durable Raft log; nil for bare-Node white-box tests
@@ -290,6 +297,7 @@ func (n *Node) handleAppendEntries(m Message) {
 	// (unapplied) entries: §5.4.1's up-to-date vote rule keeps every committed
 	// entry in every future leader's log, so it never loses a conflict; the data
 	// WAL is untouched, holding only applied entries that never truncate.
+	configTouched := false // a config entry was appended or truncated -> re-derive
 	for i, e := range m.Entries {
 		idx := m.PrevLogIndex + uint64(i) + 1
 		if idx <= n.log.baseIndex {
@@ -313,9 +321,10 @@ func (n *Node) handleAppendEntries(m Message) {
 				}
 			}
 			n.log.truncateFrom(idx)
+			configTouched = true // the dropped suffix may hold a config entry
 		}
 		if n.logFile != nil {
-			if err := n.logFile.append(e.Term, e.Data); err != nil {
+			if err := n.logFile.append(e.Term, e.Kind, e.Data); err != nil {
 				cur := n.currentTerm
 				n.raftMu.Unlock()
 				_ = n.transport.Send(m.From, Message{
@@ -325,7 +334,15 @@ func (n *Node) handleAppendEntries(m Message) {
 				return
 			}
 		}
-		n.log.append(e.Term, e.Data)
+		n.log.append(e.Term, e.Kind, e.Data)
+		if e.Kind == EntryConfig {
+			configTouched = true
+		}
+	}
+	// Adopt the newest config in the (now-updated) log, or revert to what remains
+	// after a truncation — the latest-in-log rule, applied on receipt.
+	if configTouched {
+		n.deriveConfigLocked()
 	}
 	matchIndex := m.PrevLogIndex + uint64(len(m.Entries))
 	if ci := m.LeaderCommit; ci > n.commitIndex {
@@ -373,9 +390,20 @@ func (n *Node) applyCommitted() {
 		}
 		idx := n.lastApplied + 1
 		entry := n.log.entryAt(idx)
+		kind := n.log.kindAt(idx)
 		n.raftMu.Unlock()
 
-		if err := n.store.ApplyEntry(idx, entry); err != nil {
+		// A config entry carries no transaction: the Raft layer already adopted it
+		// on append, so applying it is a control no-op at the state machine — it
+		// writes a bare marker to keep the applied-index accounting (one per Raft
+		// entry) in lockstep, and changes no key. A data entry applies normally.
+		var err error
+		if kind == EntryConfig {
+			err = n.store.ApplyControlEntry(idx)
+		} else {
+			err = n.store.ApplyEntry(idx, entry)
+		}
+		if err != nil {
 			n.storeMu.RUnlock()
 			panic(fmt.Sprintf("cluster: node %d apply entry %d: %v", n.id, idx, err))
 		}
@@ -419,7 +447,7 @@ func (n *Node) commit(t *db.Txn) error {
 	if entry == nil {
 		return nil // empty txn
 	}
-	return n.proposeAndAwait(term, entry)
+	return n.proposeAndAwait(term, EntryData, entry)
 }
 
 // readBarrier drives a no-op entry through the ordinary quorum-commit path and
@@ -457,7 +485,7 @@ func (n *Node) readBarrier() error {
 	// A no-op that "maybe committed" is irrelevant — it changes nothing — but it
 	// means we lost leadership before confirming, so the read did not clear the
 	// barrier here. Report ErrNotLeader so the caller cleanly redirects.
-	if err := n.proposeAndAwait(term, entry); err != nil {
+	if err := n.proposeAndAwait(term, EntryData, entry); err != nil {
 		if errors.Is(err, ErrMaybeCommitted) {
 			return ErrNotLeader
 		}
@@ -471,7 +499,7 @@ func (n *Node) readBarrier() error {
 // of client commits and read barriers. The caller holds commitMu, has verified
 // leadership at `term`, and has built the entry outside raftMu. Returns
 // ErrNotLeader if leadership was lost before the entry committed.
-func (n *Node) proposeAndAwait(term uint64, entry []byte) error {
+func (n *Node) proposeAndAwait(term uint64, kind EntryKind, entry []byte) error {
 	n.raftMu.Lock()
 	// Re-check leadership: we may have stepped down while building the entry. Append
 	// to the Raft log file and the in-memory log TOGETHER under raftMu, so the file
@@ -485,12 +513,17 @@ func (n *Node) proposeAndAwait(term uint64, entry []byte) error {
 		return ErrNotLeader
 	}
 	if n.logFile != nil {
-		if err := n.logFile.append(term, entry); err != nil {
+		if err := n.logFile.append(term, kind, entry); err != nil {
 			n.raftMu.Unlock()
 			return fmt.Errorf("cluster: leader append to raft log: %w", err)
 		}
 	}
-	idx := n.log.append(term, entry)
+	idx := n.log.append(term, kind, entry)
+	// A config entry is adopted the instant the leader appends it (latest-in-log
+	// rule), before it commits; a later truncation re-derives the config.
+	if kind == EntryConfig {
+		n.adoptConfigLocked(entry)
+	}
 	n.maybeAdvanceCommitLocked() // commits immediately at n=1; no-op otherwise
 	n.raftMu.Unlock()
 
@@ -636,7 +669,7 @@ func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, c
 
 	rlog := NewRaftLogWithBase(logFile.baseIndex, logFile.baseTerm)
 	for _, pe := range persisted {
-		rlog.append(pe.term, pe.data)
+		rlog.append(pe.term, pe.kind, pe.data)
 	}
 	recovered := store.RecoveredAppliedIndex()
 	// Everything at-or-below baseIndex was applied and made durable in the data WAL
@@ -651,12 +684,31 @@ func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, c
 		return nil, fmt.Errorf("cluster: node %d recovered applied index %d below raft log base %d (corruption)", id, recovered, logFile.baseIndex)
 	}
 
+	// peers is the transport-level universe of nodes this process can reach (all
+	// nodes except self); the per-peer replication goroutines and maps key off it.
+	// The voting config is separate and can be a subset.
 	var peers []NodeID
-	config := make(map[NodeID]bool, size)
 	for j := 0; j < size; j++ {
-		config[NodeID(j)] = true // bootstrap config: every node is a voting member
 		if NodeID(j) != id {
 			peers = append(peers, NodeID(j))
+		}
+	}
+	// Base config: the persisted config as of the log's compaction base, or the
+	// bootstrap config (every node) for a fresh node. The current config is that,
+	// overridden by the latest config entry surviving in the reconstructed log.
+	configPath := filepath.Join(raftDir, raftConfigFileName)
+	baseConfig, ok := readBaseConfigFile(configPath)
+	if !ok {
+		baseConfig = make(map[NodeID]bool, size)
+		for j := 0; j < size; j++ {
+			baseConfig[NodeID(j)] = true
+		}
+	}
+	config := copyConfig(baseConfig)
+	for i := rlog.lastIndex(); i > rlog.baseIndex; i-- {
+		if rlog.kindAt(i) == EntryConfig {
+			config = decodeConfig(rlog.entryAt(i))
+			break
 		}
 	}
 	nd := &Node{
@@ -665,6 +717,8 @@ func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, c
 		transport:   tr,
 		peers:       peers,
 		config:      config,
+		baseConfig:  baseConfig,
+		configPath:  configPath,
 		cfg:         cfg,
 		dir:         dir,
 		raftDir:     raftDir,

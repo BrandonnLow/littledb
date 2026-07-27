@@ -75,7 +75,7 @@ func (n *Node) sendLoop(p NodeID) bool {
 		prevLogTerm := n.log.term(prevLogIndex)
 		var entries []Entry
 		for i := next; i <= last; i++ {
-			entries = append(entries, Entry{Term: n.log.term(i), Data: n.log.entryAt(i)})
+			entries = append(entries, Entry{Term: n.log.term(i), Kind: n.log.kindAt(i), Data: n.log.entryAt(i)})
 		}
 		leaderCommit := n.commitIndex
 		n.raftMu.Unlock()

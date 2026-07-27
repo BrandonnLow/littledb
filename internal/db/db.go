@@ -794,6 +794,38 @@ func (db *DB) ApplyEntry(idx uint64, entry []byte) error {
 	return nil
 }
 
+// ApplyControlEntry applies a non-data Raft entry (e.g. a membership change) as a
+// no-op at the state machine: it writes one bare OpCommit to the WAL — keeping the
+// applied-index accounting (one OpCommit per applied Raft entry) in lockstep, so a
+// restart reconstructs the right index — and advances the applied index, but
+// changes no key. The control payload itself (the new configuration) is
+// interpreted by the Raft layer, not here.
+func (db *DB) ApplyControlEntry(idx uint64) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return errClosed
+	}
+	commitTS := db.nextTimestamp
+	db.nextTimestamp++
+	if _, err := db.wal.Append(&record.Record{Op: record.OpCommit, Timestamp: commitTS}); err != nil {
+		return fmt.Errorf("db: apply control entry: wal append: %w", err)
+	}
+	if commitTS > db.appliedTS {
+		db.appliedTS = commitTS
+	}
+	if idx > db.appliedIndex {
+		db.appliedIndex = idx
+	}
+	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
+		if err := db.flushLocked(); err != nil {
+			return fmt.Errorf("db: apply control entry: flush: %w", err)
+		}
+		db.signalCompact()
+	}
+	return nil
+}
+
 func (db *DB) registerTxn(t *Txn) {
 	db.activeTxnsMu.Lock()
 	db.activeTxns[t] = struct{}{}

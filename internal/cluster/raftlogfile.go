@@ -11,16 +11,16 @@ import (
 
 const raftLogFileName = "raft.log"
 
-// raftLogMagic prefixes raft.log. Its presence distinguishes the snapshot-aware
-// format (with a base header) from pre-snapshot files, which are rejected loudly
-// rather than misparsed.
-const raftLogMagic uint64 = 0x52414654_4C4F4721
+// raftLogMagic prefixes raft.log. Its value identifies the on-disk format; a
+// mismatch (a pre-snapshot file, a pre-config-entry file, or a foreign file) is
+// rejected loudly rather than misparsed. Bumped when the frame gained a kind byte.
+const raftLogMagic uint64 = 0x52414654_4C4F4722
 
 // raftLogHeaderSize is the fixed file header: magic(8) | baseIndex(8) | baseTerm(8).
 const raftLogHeaderSize = 24
 
-// raftEntryHeaderSize is the per-frame header: term(8) | len(4).
-const raftEntryHeaderSize = 12
+// raftEntryHeaderSize is the per-frame header: term(8) | kind(1) | len(4).
+const raftEntryHeaderSize = 13
 
 // ErrBadRaftLog is returned by load when the file lacks the magic — a
 // pre-snapshot raft.log or a foreign file. Surfaced loudly rather than guessed.
@@ -47,6 +47,7 @@ type raftLogFile struct {
 // persistedEntry is one entry recovered from (or to be written to) the log file.
 type persistedEntry struct {
 	term uint64
+	kind EntryKind
 	data []byte
 }
 
@@ -135,13 +136,15 @@ func (lf *raftLogFile) load() ([]persistedEntry, error) {
 			break // torn frame header
 		}
 		term := binary.LittleEndian.Uint64(buf[off:])
-		n := binary.LittleEndian.Uint32(buf[off+8:])
+		kind := EntryKind(buf[off+8])
+		n := binary.LittleEndian.Uint32(buf[off+9:])
 		end := off + raftEntryHeaderSize + int64(n)
 		if end > size {
 			break // torn frame body
 		}
 		entries = append(entries, persistedEntry{
 			term: term,
+			kind: kind,
 			data: append([]byte(nil), buf[off+raftEntryHeaderSize:end]...),
 		})
 		lf.offsets = append(lf.offsets, off)
@@ -173,7 +176,7 @@ func (lf *raftLogFile) load() ([]persistedEntry, error) {
 // keeping the two logs trivially consistent. Lifting the fsync off raftMu needs
 // a separately-tracked durable index (matchIndex[self]) so the leader never
 // counts an unsynced entry toward commit — deferred.
-func (lf *raftLogFile) append(term uint64, data []byte) error {
+func (lf *raftLogFile) append(term uint64, kind EntryKind, data []byte) error {
 	lf.mu.Lock()
 	defer lf.mu.Unlock()
 	if lf.f == nil {
@@ -181,7 +184,8 @@ func (lf *raftLogFile) append(term uint64, data []byte) error {
 	}
 	var hdr [raftEntryHeaderSize]byte
 	binary.LittleEndian.PutUint64(hdr[0:], term)
-	binary.LittleEndian.PutUint32(hdr[8:], uint32(len(data)))
+	hdr[8] = byte(kind)
+	binary.LittleEndian.PutUint32(hdr[9:], uint32(len(data)))
 	off := lf.size
 	if _, err := lf.f.Write(hdr[:]); err != nil {
 		return fmt.Errorf("cluster: raft log append header: %w", err)
@@ -272,7 +276,8 @@ func (lf *raftLogFile) compact(newBaseIndex, newBaseTerm uint64, survivors []per
 	var fhdr [raftEntryHeaderSize]byte
 	for _, e := range survivors {
 		binary.LittleEndian.PutUint64(fhdr[0:], e.term)
-		binary.LittleEndian.PutUint32(fhdr[8:], uint32(len(e.data)))
+		fhdr[8] = byte(e.kind)
+		binary.LittleEndian.PutUint32(fhdr[9:], uint32(len(e.data)))
 		if _, err := tf.Write(fhdr[:]); err != nil {
 			return fail("cluster: write compacted frame: %w", err)
 		}

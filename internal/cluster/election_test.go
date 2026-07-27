@@ -226,7 +226,7 @@ func makeVoter(t *testing.T, logTerms []uint64) (*Node, *ChannelTransport) {
 	tr.Register(9) // candidate, to capture the reply
 	log := NewRaftLog()
 	for _, term := range logTerms {
-		log.append(term, []byte("e"))
+		log.append(term, EntryData, []byte("e"))
 	}
 	nd := &Node{
 		id: 0, transport: tr, log: log,
@@ -314,7 +314,7 @@ func TestStepDownOnHigherTerm(t *testing.T) {
 // it commits too.
 func TestCommitRulePriorTermViaCurrentTerm(t *testing.T) {
 	log := NewRaftLog()
-	log.append(1, []byte("prior")) // index 1 @ term 1 — the prior-term tail
+	log.append(1, EntryData, []byte("prior")) // index 1 @ term 1 — the prior-term tail
 
 	nd := &Node{
 		peers:       []NodeID{1, 2},
@@ -337,7 +337,7 @@ func TestCommitRulePriorTermViaCurrentTerm(t *testing.T) {
 
 	// Append a current-term entry and replicate it to a majority.
 	nd.raftMu.Lock()
-	nd.log.append(2, []byte("current")) // index 2 @ term 2
+	nd.log.append(2, EntryData, []byte("current")) // index 2 @ term 2
 	nd.matchIndex[1] = 2
 	nd.maybeAdvanceCommitLocked()
 	ci := nd.commitIndex
