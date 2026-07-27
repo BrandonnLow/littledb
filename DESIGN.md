@@ -1378,10 +1378,84 @@ configuration change is invisible to the register, so shrinking the voting set
 mid-flight must admit no anomaly. Membership changes concurrent with *fault
 injection* are the heavier soak deferred to Stage 6.
 
-### Still open (Stages 4–6)
+### Adding a server (Stage 4)
 
-Adding a server — with a non-voting **learner** catch-up phase so a slow new node
-never stalls commits — leadership transfer (`TimeoutNow`), and the deferred
-durability items (an `InstallSnapshot` must carry the configuration and the session
-table; compaction must fold a compacted config entry into the base-config file)
-remain. They are the rest of Phase 8.
+Removing a server only shrinks structures that already exist. Adding one is the
+harder direction: a brand-new node must be constructed, wired into the transport,
+and integrated into a running cluster whose per-peer replication state was frozen at
+construction. `Cluster.AddServer(id, dir)` does it in two movements — bring the node
+online, then change the configuration — and the interesting decisions are in how
+those movements avoid stalling commits and avoid data races.
+
+**A joining node starts as a non-voting learner.** The new node is built (`buildNode`)
+over a fresh dir with an **empty** bootstrap configuration, so it comes up as a plain
+follower that is not in *any* configuration — which means it will not campaign (the
+Stage 3 candidate-side guard), and its lagging log can never be part of a majority.
+It simply waits. The leader replicates its log to the learner, and the learner adopts
+whatever configurations that log carries (adopt-on-append) — including, eventually,
+the very entry that promotes it. It only becomes a voter when it applies a
+configuration that contains its own id.
+
+**The learner phase is why a slow join does not stall commits.** `addServer` runs in
+three phases, and the middle one deliberately holds no commit lock:
+
+1. Under `raftMu`, register the learner as a replication target (`ensurePeerLocked`)
+   and record the current commit index as the catch-up goal. Kick replication.
+2. **Without `commitMu`**, poll until the learner's `matchIndex` reaches that goal (or
+   a timeout — `ErrCatchupTimeout` — leaves it online as a learner for a later retry).
+   Ordinary client commits proceed throughout, because the learner is not yet counted.
+3. Under `commitMu` and behind the one-change-at-a-time gate, propose the configuration
+   that adds the learner as a voter. Because it is already caught up, the new (larger)
+   majority is satisfiable immediately — promotion does not open an availability gap.
+   Holding `commitMu` across the *catch-up* (phase 2) would have frozen all commits for
+   the entire join; scoping it to just the proposal is what keeps the cluster live.
+
+The alternative — promote the new server to a voter immediately and let it catch up
+afterward — is simpler but wrong for a cluster near its minimum: growing `{0}` to
+`{0,1}` makes the two-node majority require *both* nodes, so an uncaught-up second
+node would stall every commit until it caught up. The learner phase removes that
+window; the `{0}→{0,1}` test is its pin.
+
+**Growing the peer set safely.** The per-peer replication state was, before Stage 4,
+created once in `buildNode` and never touched again — so several readers touched the
+maps without a lock (`run()` routes a response by `respCh[from]`; `signalReplicators`
+iterates `replSignal`; each replicator reads its own `replSignal` channel). Adding a
+peer at runtime turns those into data races. Two decisions resolve it: `nextIndex`
+and `matchIndex` are already `raftMu`-guarded everywhere, so a new entry goes in under
+`raftMu`; `respCh` and `replSignal` — read outside `raftMu` — get a dedicated
+`replMu`, taken write-side only by the (rare) addition and read-side by the hot
+readers. Entries are only ever added, never removed, and each channel is stable once
+published, so a replicator captures its signal channel exactly once at startup and
+never re-reads the map. `replMu` is a leaf lock (raftMu → replMu, never the reverse),
+so it cannot deadlock. A follower does not need a joining member's replication state
+until it might replicate *to* it — i.e. on becoming leader — so `becomeLeaderLocked`
+reconciles peers for the whole current configuration rather than every node doing it
+eagerly on adopt.
+
+**Two smaller decisions.** The transport must know the new id before anyone sends to
+it, so `spawnNode` registers it first (with the in-process `ChannelTransport`,
+registration is global — one inbox — so every existing node can reach it; a network
+transport would instead distribute the address, a Stage-6+/transport concern). And a
+new node's id must be the next dense slot (`c.Size()`), so `nodes[i]` stays the node
+with id `i` — the invariant the harness and the realistic client's rotation rely on.
+
+### Validation
+
+The add tests pin each property: a three-node cluster grows to `{0,1,2,3}`, the new
+node holds the pre-join data, and — after the leader is partitioned — the surviving
+three elect a successor, which under a four-member majority of three *requires* the
+new node's vote, so a successful election proves it is a full voter; the one-node
+`{0}→{0,1}` growth where the learner phase matters most; the dense-id precondition;
+and the Phase 5 harness running the randomized concurrent workload while a server is
+added underneath it, with the checker confirming linearizability. As with removal,
+membership changes concurrent with *fault injection* are the Stage 6 soak.
+
+### Still open (Stages 5–6)
+
+Leadership transfer (`TimeoutNow` — a leader hands off to a caught-up follower that
+campaigns immediately, using the `LeaderTransfer` bypass already in place) and the
+deferred durability items remain: an `InstallSnapshot` must carry the configuration
+and the session table (today it ships only the live key/value set, so a follower that
+installs a snapshot loses its membership view and its exactly-once dedup), and
+compaction must fold a compacted configuration entry into the base-config file
+(`raft/config`) so it survives a restart. They are the rest of Phase 8.
