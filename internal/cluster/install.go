@@ -247,6 +247,7 @@ func (n *Node) handleInstallSnapshot(m Message) {
 	}
 	n.role = Follower
 	n.resetElectionTimer()
+	n.lastLeaderContact = time.Now() // a current leader exists: arm disruption prevention
 	term := n.currentTerm
 
 	if n.installing {
