@@ -33,6 +33,12 @@ var ErrConfigChangeInProgress = errors.New("cluster: a configuration change is a
 // able to form a quorum.
 var ErrCannotRemove = errors.New("cluster: cannot remove the last voting member")
 
+// ErrCatchupTimeout is returned by AddServer when the joining node does not
+// replicate far enough to be promoted within addServerCatchupTimeout. The new
+// node stays online as a non-voting learner (the leader keeps replicating to it),
+// so a retry can promote it once it has caught up.
+var ErrCatchupTimeout = errors.New("cluster: added server did not catch up in time")
+
 // ErrMaybeCommitted is returned by a write whose entry was appended and
 // replicated but whose leader stepped down before confirming it applied. The
 // write may or may not have committed: a later leader may commit the replicated
@@ -47,6 +53,12 @@ const bootstrapLeader NodeID = 0
 // routeTimeout bounds how long Put/Delete/Get retry to find a leader (e.g.
 // across an election) before giving up.
 const routeTimeout = 2 * time.Second
+
+// addServerCatchupTimeout bounds how long AddServer replicates to a joining node
+// as a non-voting learner before it must be caught up enough to promote. Chosen
+// well above a healthy in-process catch-up so it only fires on a genuinely stuck
+// join, not normal replication latency.
+const addServerCatchupTimeout = 10 * time.Second
 
 // Config tunes the election and heartbeat timers. Heartbeat must be well below
 // ElectionMin (a few heartbeats per election window) or healthy leaders get
@@ -139,10 +151,17 @@ type Node struct {
 
 	// Leader replication state (per peer), guarded by raftMu. Present on every
 	// node since any node can become leader; only acted on while role==Leader.
+	// The peer set grows dynamically as servers are added (ensurePeerLocked), so
+	// nextIndex/matchIndex are mutated under raftMu, while respCh/replSignal — which
+	// are read OUTSIDE raftMu (run() routes a response by respCh; signalReplicators
+	// iterates replSignal) — have their key set additionally guarded by replMu, so a
+	// concurrent add never races those readers. Entries are only ever added, never
+	// removed, and each channel is stable once published.
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
 	respCh     map[NodeID]chan Message
 	replSignal map[NodeID]chan struct{}
+	replMu     sync.RWMutex
 
 	applySignal     chan struct{} // coalescing wake for the apply loop
 	electionResetCh chan struct{} // coalescing reset for the election timer
@@ -261,8 +280,11 @@ func (n *Node) run() {
 			case MsgAppendResponse, MsgInstallSnapshotResponse:
 				// Route to the follower's replicator. Reliable (no drop): with
 				// one AppendEntries / InstallSnapshot in flight per follower,
-				// dropping a response would stall it forever.
+				// dropping a response would stall it forever. respCh may gain keys
+				// concurrently (a server being added), so read it under replMu.
+				n.replMu.RLock()
 				ch := n.respCh[m.From]
+				n.replMu.RUnlock()
 				if ch == nil {
 					continue
 				}
@@ -628,6 +650,74 @@ func (n *Node) removeServer(id NodeID) error {
 	return nil
 }
 
+// addServer is the leader side of AddServer: it brings id in as a non-voting
+// LEARNER first, replicates until it has caught up, and only THEN proposes the
+// configuration that makes it a voter. The learner phase is why a slow new node
+// never stalls commits: while it is catching up it is not in the configuration, so
+// its lagging matchIndex is never part of any majority; promotion happens once it
+// is nearly current, so the new (larger) majority is immediately satisfiable.
+//
+// Catch-up runs WITHOUT commitMu so ordinary client commits proceed throughout;
+// only the final proposal takes commitMu (serialized with other commits, behind
+// the one-change-at-a-time gate). Returns ErrNotLeader if leadership is lost,
+// ErrCatchupTimeout if the learner never catches up, ErrConfigChangeInProgress if
+// a prior change is still uncommitted, or nil if id is already a voter.
+func (n *Node) addServer(id NodeID) error {
+	// Phase 1: register the learner and start replicating to it (no commitMu).
+	n.raftMu.Lock()
+	if n.role != Leader {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	if n.config != nil && n.config[id] {
+		n.raftMu.Unlock()
+		return nil // already a voting member
+	}
+	term := n.currentTerm
+	n.ensurePeerLocked(id)
+	target := n.commitIndex // catch-up goal: the current committed prefix
+	n.raftMu.Unlock()
+	n.signalReplicators() // kick off replication to the new learner now
+
+	// Phase 2: wait for the learner to replicate through `target`, staying leader.
+	deadline := time.Now().Add(addServerCatchupTimeout)
+	for {
+		n.raftMu.Lock()
+		if n.role != Leader || n.currentTerm != term {
+			n.raftMu.Unlock()
+			return ErrNotLeader
+		}
+		caught := n.matchIndex[id] >= target
+		n.raftMu.Unlock()
+		if caught {
+			break
+		}
+		if time.Now().After(deadline) {
+			return ErrCatchupTimeout
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Phase 3: propose the configuration that adds id as a voter, under commitMu and
+	// behind the one-change gate. adopt-on-append makes id count from this point;
+	// since it is caught up, the new majority is immediately satisfiable.
+	n.commitMu.Lock()
+	defer n.commitMu.Unlock()
+	n.raftMu.Lock()
+	if n.role != Leader || n.currentTerm != term {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	if !n.latestConfigEntryCommittedLocked() {
+		n.raftMu.Unlock()
+		return ErrConfigChangeInProgress
+	}
+	newCfg := copyConfig(n.config)
+	newCfg[id] = true
+	n.raftMu.Unlock()
+	return n.proposeAndAwait(term, EntryConfig, encodeConfig(newCfg))
+}
+
 // latestConfigEntryCommittedLocked reports whether the newest configuration entry
 // in the log is already committed (or there is none above the base, in which case
 // the base configuration is committed by definition). It is the one-change-at-a-
@@ -662,14 +752,63 @@ func (n *Node) relinquishLeadershipLocked() {
 	n.resetElectionTimer()
 }
 
+// ensurePeerLocked makes id a replication target of this node: it adds per-peer
+// replication state (nextIndex/matchIndex under raftMu, respCh/replSignal under
+// replMu since they are read outside raftMu) and starts a replicator goroutine,
+// idempotently. It grows the peer set dynamically — the leader adds a joining
+// learner (addServer), and any node that becomes leader adds each newly-configured
+// member (reconcilePeersLocked). nextIndex starts at lastIndex+1 (standard Raft
+// backup finds the match); the replicator idles until this node leads and signals
+// it. Must hold raftMu.
+func (n *Node) ensurePeerLocked(id NodeID) {
+	if id == n.id {
+		return
+	}
+	n.replMu.RLock()
+	_, exists := n.replSignal[id]
+	n.replMu.RUnlock()
+	if exists {
+		return
+	}
+	n.nextIndex[id] = n.log.lastIndex() + 1
+	n.matchIndex[id] = 0
+	n.replMu.Lock()
+	n.respCh[id] = make(chan Message, 1)
+	n.replSignal[id] = make(chan struct{}, 1)
+	n.replMu.Unlock()
+	// peers is the transport universe; keep it current (read only at start()).
+	n.peers = append(n.peers, id)
+	n.wg.Add(1)
+	go n.replicateTo(id)
+}
+
+// reconcilePeersLocked ensures this node has replication state for every voting
+// member of the current configuration other than itself — so a node that becomes
+// leader can reach a member added since it was constructed. Idempotent. Must hold
+// raftMu.
+func (n *Node) reconcilePeersLocked() {
+	for id, in := range n.config {
+		if in && id != n.id {
+			n.ensurePeerLocked(id)
+		}
+	}
+}
+
 // Cluster is a Raft replication group over a transport.
 type Cluster struct {
 	transport Transport
 
-	// nodesMu guards the nodes slice's contents. Its length is fixed at
-	// construction, but an element is swapped when a node is rebuilt after a
-	// simulated crash (see the linearizability harness), so readers snapshot the
-	// slice header under RLock and the swap takes the write lock.
+	// opts and cfg are retained so a server ADDED after construction
+	// (AddServer/spawnNode) is built with the same store options and Raft timers
+	// as the founding nodes.
+	opts db.Options
+	cfg  Config
+
+	// nodesMu guards the nodes slice. An element is swapped when a node is rebuilt
+	// after a simulated crash (see the linearizability harness), and the slice
+	// GROWS when a server is added (AddServer appends), so readers snapshot the
+	// slice header under RLock and a swap/append takes the write lock. Node ids stay
+	// dense (a new node's id is the next slot), so nodes[i] is the node with id i.
 	nodesMu sync.RWMutex
 	nodes   []*Node
 }
@@ -711,9 +850,15 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 		tr.Register(NodeID(i))
 	}
 
-	c := &Cluster{transport: tr}
+	members := make([]NodeID, n)
+	for i := range members {
+		members[i] = NodeID(i)
+	}
+	full := fullConfig(n)
+
+	c := &Cluster{transport: tr, opts: opts, cfg: cfg}
 	for i := 0; i < n; i++ {
-		nd, err := buildNode(NodeID(i), n, dirs[i], opts, tr, cfg)
+		nd, err := buildNode(NodeID(i), members, full, dirs[i], opts, tr, cfg)
 		if err != nil {
 			c.Close()
 			return nil, err
@@ -727,15 +872,43 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 	return c, nil
 }
 
+// fullConfig returns the dense voting membership {0, 1, ..., n-1} — the bootstrap
+// configuration of a founding n-node cluster.
+func fullConfig(n int) map[NodeID]bool {
+	m := make(map[NodeID]bool, n)
+	for i := 0; i < n; i++ {
+		m[NodeID(i)] = true
+	}
+	return m
+}
+
+// peersExcept returns a sorted copy of ids with self removed — a node's
+// transport peer set (everyone it can reach except itself), derived from a member
+// list.
+func peersExcept(ids []NodeID, self NodeID) []NodeID {
+	out := make([]NodeID, 0, len(ids))
+	for _, id := range ids {
+		if id != self {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 // buildNode constructs — but does not start — a single node with id over dir,
 // reconstructing its durable Raft state (log, hard state, applied watermark) and
-// resolving its startup role. size is the cluster's node count (for the peer
-// set). It is used both at cluster creation and to rebuild a node over the same
-// dir after a simulated crash, so it must be a faithful cold-start: the durable
+// resolving its startup role. `peers` is the transport-level universe this node
+// can reach (all other ids it knows); `bootstrapConfig` is the voting membership a
+// FRESH node adopts when no durable config file exists — the full member set for a
+// founding node, or the empty set for a joining learner (which must not campaign
+// until the leader replicates a config that includes it). It is used at cluster
+// creation, to rebuild a node over the same dir after a simulated crash, AND to
+// spawn a newly-added server, so it must be a faithful cold-start: the durable
 // files alone decide fresh-bootstrap vs. restart-and-re-elect. On any error it
 // releases whatever it had already opened. The caller registers the id with the
 // transport and starts the node.
-func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, cfg Config) (*Node, error) {
+func buildNode(id NodeID, peers []NodeID, bootstrapConfig map[NodeID]bool, dir string, opts db.Options, tr Transport, cfg Config) (*Node, error) {
 	// Per-node Raft files live in a raft/ subdir, isolated from the DB's own dir.
 	// Create it first so install completion (below) can find a pending marker, and
 	// so the freshness stat further down sees a stable dir.
@@ -800,25 +973,20 @@ func buildNode(id NodeID, size int, dir string, opts db.Options, tr Transport, c
 		return nil, fmt.Errorf("cluster: node %d recovered applied index %d below raft log base %d (corruption)", id, recovered, logFile.baseIndex)
 	}
 
-	// peers is the transport-level universe of nodes this process can reach (all
-	// nodes except self); the per-peer replication goroutines and maps key off it.
-	// The voting config is separate and can be a subset.
-	var peers []NodeID
-	for j := 0; j < size; j++ {
-		if NodeID(j) != id {
-			peers = append(peers, NodeID(j))
-		}
-	}
+	// peers is the transport-level universe of nodes this process can reach; the
+	// per-peer replication goroutines and maps key off it. The voting config is
+	// separate and can be a subset (or, for a joining learner, exclude self). We
+	// copy the caller's slice and drop self defensively.
+	peers = peersExcept(peers, id)
 	// Base config: the persisted config as of the log's compaction base, or the
-	// bootstrap config (every node) for a fresh node. The current config is that,
-	// overridden by the latest config entry surviving in the reconstructed log.
+	// caller-supplied bootstrap config for a fresh node (the full member set for a
+	// founding node, the empty set for a joining learner). The current config is
+	// that, overridden by the latest config entry surviving in the reconstructed
+	// log.
 	configPath := filepath.Join(raftDir, raftConfigFileName)
 	baseConfig, ok := readBaseConfigFile(configPath)
 	if !ok {
-		baseConfig = make(map[NodeID]bool, size)
-		for j := 0; j < size; j++ {
-			baseConfig[NodeID(j)] = true
-		}
+		baseConfig = copyConfig(bootstrapConfig)
 	}
 	config := copyConfig(baseConfig)
 	for i := rlog.lastIndex(); i > rlog.baseIndex; i-- {
@@ -997,6 +1165,59 @@ func (c *Cluster) Begin() *db.Txn { return c.leaderNode().storeBegin() }
 // of an already-absent member is a no-op).
 func (c *Cluster) RemoveServer(id NodeID) error {
 	return c.withLeader(func(ld *Node) error { return ld.removeServer(id) })
+}
+
+// AddServer brings a new server online over dir and adds it to the cluster. The
+// id must be the next dense slot (c.Size()), so nodes[i] stays the node with id i.
+// The new node starts as a non-voting learner — the leader replicates to it until
+// it catches up, then a configuration change promotes it to a voter — so a slow
+// join never stalls commits. On return the new node is a committed voting member.
+//
+// Returns ErrCatchupTimeout if the new node cannot catch up in time (it stays
+// online as a learner; calling AddServer again with the same id skips the spawn and
+// retries the promotion), ErrConfigChangeInProgress if a prior change is still
+// uncommitted, or an error if id is not the next slot. dir is ignored on a retry
+// (the node is already online).
+func (c *Cluster) AddServer(id NodeID, dir string) error {
+	c.nodesMu.RLock()
+	spawned := int(id) < len(c.nodes) && c.nodes[id].id == id
+	c.nodesMu.RUnlock()
+	if !spawned {
+		if err := c.spawnNode(id, dir); err != nil {
+			return err
+		}
+	}
+	return c.withLeader(func(ld *Node) error { return ld.addServer(id) })
+}
+
+// spawnNode registers id with the transport, builds a joining node over dir (a
+// non-voting learner: empty bootstrap config, so it will not campaign until the
+// leader replicates a config that includes it), appends it to the cluster, and
+// starts it. Its transport peer set is the current membership, so it can reach the
+// existing nodes if it later leads.
+func (c *Cluster) spawnNode(id NodeID, dir string) error {
+	c.nodesMu.Lock()
+	if int(id) != len(c.nodes) {
+		c.nodesMu.Unlock()
+		return fmt.Errorf("cluster: AddServer id %d must be the next slot %d", id, len(c.nodes))
+	}
+	members := make([]NodeID, 0, len(c.nodes)+1)
+	for _, nd := range c.nodes {
+		members = append(members, nd.id)
+	}
+	members = append(members, id)
+	c.nodesMu.Unlock()
+
+	c.transport.Register(id)
+	nd, err := buildNode(id, members, map[NodeID]bool{}, dir, c.opts, c.transport, c.cfg)
+	if err != nil {
+		return fmt.Errorf("cluster: spawn node %d: %w", id, err)
+	}
+	c.nodesMu.Lock()
+	c.nodes = append(c.nodes, nd)
+	c.nodesMu.Unlock()
+	nd.start()
+	return nil
 }
 
 // Config returns the current voting membership as believed by the current leader
