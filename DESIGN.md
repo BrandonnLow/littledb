@@ -1488,11 +1488,66 @@ Validation: a transfer to a chosen node makes it leader in single-digit millisec
 writes then flow through the new leader; a transfer to a non-voter is refused
 (`ErrTransferTarget`); and a transfer to self is a no-op.
 
-### Still open (Stage 6)
+### Durability across compaction and snapshots (Stage 6)
 
-The deferred durability items remain: an `InstallSnapshot` must carry the
-configuration and the session table (today it ships only the live key/value set, so a
-follower that installs a snapshot loses its membership view and its exactly-once
-dedup), and compaction must fold a compacted configuration entry into the base-config
-file (`raft/config`) so it survives a restart. With those closed and a
-membership-under-fault-injection soak added to the checker, Phase 8 is complete.
+The operations above all assume a node's *configuration* survives everything the log
+does — including the two places the log throws state away. Both were real gaps once
+membership shipped, because the current configuration is derived state (a base config
+plus the config entries surviving in the log), and both compaction and an
+`InstallSnapshot` discard log entries.
+
+**Compaction folds a discarded config entry into the base.** When `maybeCompactLocked`
+compacts the log up to the applied watermark, any config entry in the discarded prefix
+would simply vanish — on restart the node would re-derive its configuration from a
+stale base plus a log that no longer holds the change. So before compacting past index
+`safe`, the node sets its base config to the configuration *as of* `safe` (the latest
+config entry at or below it, else unchanged) and persists it to `raft/config` — the
+first place that file is ever written after bootstrap. Ordering is chosen so a crash
+is always consistent: the base file is written *before* the log is compacted, so a
+crash in between leaves the still-full log's latest config entry to re-derive the same
+configuration; either way recovery agrees, and a persist failure just aborts the
+compaction with nothing lost.
+
+**InstallSnapshot carries the configuration and the session table.** A snapshot ships
+logical state as of `LastIncludedIndex` and the follower *wipes* its log and rebuilds —
+so without help it would lose both its membership view (the config entries are gone
+with the log) and its exactly-once dedup table (the pre-snapshot `OpCommit` markers
+that carried it are gone with the WAL). Two additions close this. The **session table**
+is the easy half: it lives in the DB directory (`sessions` file), so shipping it in the
+message and having `BuildSnapshotDB` write it into the staged DB means it swaps in with
+the store automatically — a follower rebuilt from a snapshot keeps deduplicating
+retries of commands applied before it. The **configuration** is the awkward half,
+because `raft/config` lives in `raftDir`, which the store swap deliberately preserves
+rather than replaces. It is handled by the same crash-atomic marker the store swap
+uses: the snapshot's config is staged next to the marker (written before it), and both
+the in-process completion and a restart-driven completion fold it into `raft/config`
+while the marker still guards the install — so a crash mid-completion re-runs the fold.
+`configAsOfLocked` (the same helper compaction uses) computes what the leader ships.
+The end-to-end test is pointed: a follower is partitioned, *removed* from the
+configuration, and then caught up by a snapshot — and it correctly learns both the new
+configuration `{0,1,2}` (which it never saw the log entry for) and the session table,
+neither of which the pre-Stage-6 snapshot carried.
+
+A latent race surfaced here too. Growing the peer set at runtime (Stage 4) made the
+`respCh`/`replSignal` maps mutable, and the replication path still read `respCh[p]` on
+every round; a concurrent add could rehash the map under that read. The fix is the same
+capture-once discipline the signal channel already used: a replicator captures its
+response channel when it starts and never re-reads the map, so the hot path touches no
+shared map at all.
+
+### Validation, and Phase 8 complete
+
+Beyond the per-feature tests, the capstone soak runs the randomized concurrent workload
+while **all three** membership operations churn underneath it *and* partitions inject
+faults *and* compaction is on — so a follower that falls behind is caught up by an
+`InstallSnapshot` that must carry the shrunk configuration, all at once. After healing,
+every node converges to identical committed state and the recorded history checks
+linearizable: a configuration change, a leadership transfer, and a snapshot install are
+each invisible to the register. That is the whole point of the correctness-first
+approach — every stage of Phase 8 was built against the Phase 5 checker, and the finished
+phase is measured by it.
+
+With single-server add and remove, adopt-on-append configuration in the log, disruption
+prevention, the learner catch-up, leadership transfer, and configuration-and-sessions
+durability across compaction and snapshots, **Phase 8 is complete**: littledb changes its
+cluster membership online, without downtime and without losing linearizability.
