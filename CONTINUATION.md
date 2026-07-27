@@ -20,9 +20,9 @@ committed on `main`:
 4. **Phase 7** — client sessions / exactly-once dedup.
 5. **Membership groundwork** — config-driven quorum, then configuration-in-the-log.
 
-**We are mid-way through the membership-changes track.** Stages 1–4 are done and
-committed. **Next: Stage 5 (leadership transfer — small, self-contained).** Then
-Stage 6 (validate + document + handle deferred items).
+**We are near the end of the membership-changes track.** Stages 1–5 are done and
+committed. **Next: Stage 6 — the finish line: validate membership under fault
+injection + close the two deferred durability items + finish DESIGN.md Phase 8.**
 
 The checker is the oracle: build a stage, then run it under the checker/fault
 injection to confirm it stays linearizable before moving on.
@@ -73,6 +73,7 @@ injection to confirm it stays linearizable before moving on.
 
 | Commit | What |
 |---|---|
+| `4e5e65d` | membership: **leadership transfer / TimeoutNow** — Stage 5 |
 | `f3968e3` | membership: **add a server + learner catch-up** — Stage 4 |
 | `0130417` | membership: **remove a server + disruption prevention** — Stage 3 |
 | `f9f3e85` | membership: **configuration in the Raft log** (config entries) — Stage 2 |
@@ -131,7 +132,7 @@ feeds histories to the checker lives in `internal/cluster/lincheck_harness_test.
 
 ---
 
-## 4. Membership track — what's DONE (Stages 1–4)
+## 4. Membership track — what's DONE (Stages 1–5)
 
 > The authoritative, decision-log write-up of all of this now lives in **`DESIGN.md`
 > Phase 8** (per the user's steer: DESIGN.md is the durable record; this file is just
@@ -212,30 +213,33 @@ just adds the API that *creates* the first `EntryConfig`.
   vote), `TestAddServerToSingleNode` (1→{0,1}, learner phase matters most),
   `TestAddServerRejectsNonSequentialID`, `TestClusterLinearizableUnderServerAdd`.
 
+**Stage 5 (`4e5e65d`): leadership transfer / `TimeoutNow`.**
+- **`Cluster.TransferLeadership(target)`** → node-side `transferLeadership`: verify leader
+  + target is a voting member, set **`transferring`** (gates `proposeAndAwait` so no new
+  entries append), ensure `matchIndex[target] == lastIndex` (replicate the tail), send
+  **`MsgTimeoutNow`**, wait for step-down. Aborts with `ErrTransferTimeout` / `ErrTransferTarget`.
+- **Target side:** `handleTimeoutNow` calls `maybeStartElection(true)` — campaign NOW
+  (bypass the randomized timer) with `Message.LeaderTransfer` set so the other voters
+  bypass the min-election-timeout stickiness rule. The up-to-date §5.4.1 check is **not**
+  bypassed, so a stale target just fails its catch-up wait rather than winning.
+- `maybeStartElection` gained a `leaderTransfer bool` param; `stepDownLocked` /
+  `becomeLeaderLocked` clear `transferring`.
+- **Tests (`internal/cluster/transfer_test.go`):** `TestTransferLeadership` (0→2 in ~5ms,
+  old leader steps down, writes flow through the new leader), `TestTransferLeadershipToNonVoter`
+  (`ErrTransferTarget`), `TestTransferLeadershipToSelf` (no-op).
+
 ---
 
-## 5. Remaining plan — Stages 5–6 (the point of this handoff)
+## 5. Remaining plan — Stage 6 (the finish line)
 
 Approach: **single-server changes** (dissertation §4.1), one add/remove at a time — NOT
 joint consensus. Any two majorities of configs differing by one server overlap, which is
 what makes it safe.
 
-**Stages 3–4 are DONE — see §4 and DESIGN.md Phase 8** (commits `0130417`, `f3968e3`).
-Carry-forward facts Stage 5 depends on: (a) the **min-election-timeout stickiness rule**
-in `handleRequestVote` is the disruption defense (voters do NOT check candidate config),
-bypassable via **`Message.LeaderTransfer`** — Stage 5's `TimeoutNow` sets it so the
-transfer target gets votes immediately; (b) `ensurePeerLocked` / the per-peer replication
-model handles dynamic membership, and the leader already tracks `matchIndex[target]` for
-the "is the target caught up" check the transfer needs.
-
-### Stage 5 — leadership transfer (`TimeoutNow`)  *(next; small, self-contained)*
-- New message `MsgTimeoutNow`. `Cluster.TransferLeadership(target)`: leader ensures the
-  target is caught up (`matchIndex[target] == lastIndex`, send the tail first), stops
-  accepting new proposals, sends `MsgTimeoutNow` to the target. The target, on receipt,
-  **immediately starts an election** (bypassing its randomized timer *and* the Stage-3
-  disruption-prevention rule — hence the `force` flag on its RequestVote). The old leader
-  steps down when it sees the target's higher term.
-- **Test:** transfer to a chosen node; it becomes leader within a couple hundred ms.
+**Stages 3–5 are DONE — see §4 and DESIGN.md Phase 8** (commits `0130417`, `f3968e3`,
+`4e5e65d`). All the membership *operations* (remove / add-with-learner / transfer) exist
+and are checker-validated in isolation. Stage 6 is the finish: exercise them under fault
+injection and close the durability gaps compaction/snapshot leave open.
 
 ### Stage 6 — validate + DESIGN.md Phase 8 + commit + **the deferred items**
 - Run membership changes concurrent with the workload under fault injection; confirm
@@ -252,9 +256,9 @@ the "is the target caught up" check the transfer needs.
      latest config entry ≤ `safe` (else unchanged) and `writeBaseConfigFile` it. Today the
      base file is only ever written at... nowhere yet (bootstrap uses the in-memory
      default), so a compacted config entry would be forgotten on restart.
-- **DESIGN.md Phase 8 is being written incrementally** (Stages 1–4 already documented
-  there); Stage 6 just adds the `TimeoutNow` and config+sessions-in-snapshot / compaction
-  sections and the final validation note. Commit.
+- **DESIGN.md Phase 8 is being written incrementally** (Stages 1–5 already documented
+  there, including `TimeoutNow`); Stage 6 just adds the config+sessions-in-snapshot /
+  compaction sections and the final validation note. Commit.
 
 ---
 
@@ -284,9 +288,9 @@ the "is the target caught up" check the transfer needs.
 ---
 
 ## 8. First action in the new session
-Read this file + `DESIGN.md` (Phases 4–8) + `git log --oneline -8`, then **start Stage 5
-(leadership transfer / `TimeoutNow`)** — small and self-contained; see §5. Stages 3–4 are
-already done (`0130417`, `f3968e3`). Confirm the baseline is green first:
+Read this file + `DESIGN.md` (Phases 4–8) + `git log --oneline -8`, then **start Stage 6
+(validate under fault injection + the two deferred durability items)** — see §5. Stages
+3–5 are already done (`0130417`, `f3968e3`, `4e5e65d`). Confirm the baseline is green first:
 ```bash
 export PATH="/usr/local/go/bin:/usr/bin:/bin"; cd ~/projects/littledb && go test ./... -race -count=1
 ```
