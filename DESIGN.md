@@ -1166,3 +1166,222 @@ expired (unbounded — LRU / timeout-based expiry is a later refinement), and
 preserved across a snapshot install (the exactly-once tests keep compaction off to
 avoid that path). `ErrMaybeCommitted` remains the honest signal a client without a
 session still gets.
+
+## Phase 8 — Cluster membership changes
+
+Everything through Phase 7 assumed a fixed set of nodes chosen at construction. A
+real cluster must replace failed hardware and grow or shrink without downtime,
+which means changing the set of *voting* members while the cluster keeps serving.
+Raft supports this, and the linearizability checker from Phase 5 is the oracle:
+each stage is built, then run under the checker before the next. The phase is
+deliberately incremental — quorum-from-a-config, then configuration-in-the-log,
+then the remove / add / transfer operations — so the log-and-quorum machinery is
+proven behavior-preserving before any operation that actually changes membership
+exists.
+
+### Single-server changes, not joint consensus
+
+The danger in a membership change is two disjoint majorities forming under the old
+and new configurations — electing two leaders, or committing two conflicting
+entries. **Adding or removing one server at a time cannot create disjoint
+majorities:** any majority of the old configuration and any majority of the new
+one overlap in at least one server (their sizes force it), and that server's
+single vote and single log prevent divergence across the switch. So the transition
+needs no special protocol — the cluster runs the old config, then the new one, and
+the overlap covers the change.
+
+**Alternative considered: joint consensus** (the dissertation's `C_old,new`
+intermediate configuration, where an entry needs majorities of *both* the old and
+new member sets to commit). It handles arbitrary multi-server changes atomically,
+but costs a two-entry transition, a configuration that is the union of two member
+sets, and vote/commit rules that consult both halves. Single-server changes get
+the same safety for the operations we actually need — replacing a node is a remove
+then an add — with none of that machinery, and it is what the dissertation itself
+recommends for most systems (§4.3).
+
+The constraint this imposes: **only one change may be in flight at a time.** Overlap
+holds only between configurations that differ by one server; stacking a second
+uncommitted change breaks the argument. The implementation enforces it (the
+one-change-at-a-time gate, below).
+
+### Quorum from a per-node configuration (Stage 1)
+
+Before membership can change, quorum must stop meaning "a majority of the fixed
+node count." Stage 1 adds a per-node `config` — the set of voting member ids, self
+included — and routes every quorum decision through it: `majority()` (size),
+`votingPeers()` (whom to solicit for votes and count for commit), leader
+initialization of `nextIndex`/`matchIndex`, and the commit-index computation. It is
+bootstrapped to all nodes, so a cluster that never changes membership behaves
+exactly as the old fixed peer set did — Stage 1 is entirely behavior-preserving and
+the whole suite passes unchanged. A nil config falls back to the transport peer
+set, keeping the bare-`Node` white-box tests working.
+
+The distinction that carries the rest of the phase: **`peers` is the transport-level
+universe** — every node id this process can reach, fixed at construction — **while
+`config` is the voting subset** that membership changes rewrite. Message delivery
+derives from `peers`; vote-counting and commit derive from `config`. Keeping them
+separate is what later lets a *removed* node keep receiving heartbeats harmlessly
+(still in `peers`, not `config`) and a being-*added* learner receive replication
+before it is a voter (also in `peers`, not yet `config`).
+
+### Configuration in the Raft log, adopted on append (Stage 2)
+
+A configuration is replicated state, so it lives in the Raft log as its own kind of
+entry. `EntryKind` (`EntryData` / `EntryConfig`) travels on the wire (`Entry`), in
+memory (`RaftLog`), and on disk — the durable frame grew a kind byte
+(`term(8)|kind(1)|len(4)|bytes`, magic bumped so an old file is rejected loudly
+rather than misparsed). A config entry's payload is the encoded voter set
+(`encodeConfig`: a count followed by sorted ids, so the bytes are deterministic
+across nodes and the entry replicates byte-for-byte).
+
+The load-bearing decision is **when a node acts on a config entry: the instant it
+appends the entry, before it commits** (§4.1). The leader adopts on append inside
+`proposeAndAwait`; a follower adopts on append inside `handleAppendEntries`. This is
+what makes single-server changes safe without joint consensus — the proposer of
+`C_new` immediately begins counting commits under `C_new`, so the change commits
+under the *new* majority and there is never a window where the old majority is used
+to commit the very entry that supersedes it. The counterpart is truncation:
+dropping a conflicting suffix (which may hold an uncommitted config entry) must
+revert the configuration. `deriveConfigLocked` recomputes it as the payload of the
+highest-indexed config entry still in the log, or the base config if none survive —
+the "latest config entry wins" rule, applied after any truncation.
+
+Applying a committed config entry to the state machine is a **control no-op**
+(`ApplyControlEntry`): the Raft layer already adopted it on append, so there is
+nothing to do to the key/value state — but it still writes one bare `OpCommit` to
+the data WAL. That detail is not optional. The applied index is reconstructed on
+restart as `walBase + (OpCommits in the WAL)`, so *every* committed Raft entry —
+data or config — must leave exactly one `OpCommit`, or the count drifts and a
+restart mis-seeds the applied index. It is the same accounting the read-index no-op
+(Phase 6) and the dedup no-op (Phase 7) already depend on.
+
+Durability: the current configuration is `baseConfig` (persisted in `raft/config`)
+plus the config entries surviving above the log's compaction base, rebuilt on
+restart. `baseConfig` is the configuration as of that base, so it need only be
+rewritten when the base advances. Two consequences of a config entry being
+compacted away — folding it into `baseConfig`, and shipping the configuration in an
+`InstallSnapshot` — are real gaps that Stage 6 closes; until then compaction stays
+off on the membership tests and a fresh node uses the in-memory bootstrap default.
+
+Stage 2 ships no operation that *creates* a config entry, so `config` stays "all
+nodes" and the suite is unchanged — the log/quorum machinery is proven
+behavior-preserving before Stage 3 gives it a trigger.
+
+### Removing a server (Stage 3)
+
+`Cluster.RemoveServer(id)` routes to the leader (retrying across leadership changes,
+like `Put`), which builds `newCfg = config \ {id}` and drives an `EntryConfig`
+through the ordinary `proposeAndAwait` path. Adopt-on-append shrinks the leader's
+quorum the moment the entry is appended, so the removal commits under the new,
+smaller majority. Removing two of five servers one at a time leaves `{0,1,2}`, and
+the cluster then commits through any two of the three — a majority of the new
+configuration that would *not* have been a majority of the old five, which is the
+entire point of shrinking.
+
+**One change at a time is enforced by reading the log, not by tracking a flag.**
+`latestConfigEntryCommittedLocked` scans back for the newest config entry and
+refuses a new change (`ErrConfigChangeInProgress`) if that entry's index exceeds
+the commit index. Two removals on one leader are already serialized by `commitMu`
+(each `proposeAndAwait` waits for its entry to commit before returning), so the gate
+rarely fires on the happy path — its real job is *across a leadership change*, where
+a new leader may inherit an uncommitted config entry from its predecessor and must
+not stack a second change onto it. Keying the gate on durable log state rather than
+a volatile in-memory flag is what makes it survive that handoff.
+
+### The commit rule when the leader is not in its own configuration
+
+Removing the leader itself is the sharp case. Once `C_new` (which excludes the
+leader) commits, a leader outside its own configuration must step down (§4.2.2). But
+committing `C_new` requires a majority *of `C_new`* — and the leader is not one of
+them. This exposed a latent assumption in `maybeAdvanceCommitLocked`: it had always
+counted the leader's own log toward the commit tally. That is correct only while the
+leader is a voter. A leader driving `C_new` while excluded from it must count **only**
+the members of `C_new`; counting itself would advance the commit index one
+acknowledgement early, under a majority that does not exist. The fix threads
+`inConfigLocked()` through the tally — self contributes its `lastIndex` iff self is a
+voting member, otherwise the majority is computed purely from the followers'
+`matchIndex`. The leader still *replicates* `C_new` (replication is gated on the
+leader role, not on config membership); it simply no longer *counts* its own copy.
+
+The bug never manifested before Stage 3 because every prior configuration included
+the leader — the removal path is the first time a leader is ever outside its own
+config. The self-removal test is the permanent guard.
+
+Once `C_new` commits, `removeServer` calls `relinquishLeadershipLocked` — a
+step-down that changes neither term nor vote (unlike `stepDownLocked`, which adopts
+a higher term). The ex-leader drops the leader role and goes quiet; it will not
+campaign again because a node not in its own configuration does not stand for
+election (below), so it leaves the cluster cleanly while the members of `C_new`
+elect a successor from among themselves.
+
+### Disruption prevention: the minimum-election-timeout rule
+
+A server removed from the configuration, or partitioned during the change, can time
+out and campaign with an ever-rising term. The damage is not the vote it cannot win
+— it is the *term*: a live leader that sees the higher term steps down, and a
+disruptor that keeps incrementing forces re-election after re-election. The
+dissertation's defense (§4.2.3) is that **a server disregards a `RequestVote`
+received within the minimum election timeout of hearing from a current leader.**
+Each node stamps `lastLeaderContact` on every `AppendEntries` / `InstallSnapshot`
+accepted from a current-term leader; `handleRequestVote` **ignores** a vote request
+that arrives within `ElectionMin` of that stamp — and "ignores" is exact: it neither
+grants the vote *nor adopts the request's term*. Refusing the term is the part that
+actually prevents disruption; refusing only the vote would still let the leader step
+down.
+
+The subtlety the dissertation flags, and we honor: **voters do not gate on "is the
+candidate in my configuration."** A being-added learner (Stage 4) is legitimately not
+yet in the config but must eventually be votable, and a voter cannot always
+distinguish a removed disruptor from a not-yet-added learner. The minimum-timeout
+rule is uniform — it shields a cluster that *has* a live leader from every vote
+request whatever its source, and lets a real election proceed the moment the leader
+is genuinely gone (once each survivor's `lastLeaderContact` ages past `ElectionMin`).
+This does add at most one election round of latency when a candidate's timeout
+barely exceeds a peer's stickiness window; the randomized `[ElectionMin, ElectionMax]`
+timeout absorbs it, and the soaks (which relax the timers under `-race`) confirm
+failover still lands well inside a client's write deadline.
+
+We pair it with a companion **candidate-side** guard: a node does not start an
+election when it is not in its own configuration. This is not the dissertation's
+mechanism — it is an optimization available *because* our removed nodes do learn
+`C_new` (they stay in `peers` and keep receiving it) — and it is what makes
+self-removal clean: the stepped-down ex-leader knows it is gone and stays silent
+rather than relying on the others to out-vote it. The two guards are complementary
+— the candidate-side guard silences a removed node that knows its status; the
+min-timeout rule covers one that does not.
+
+The rule must be **bypassable**, because Stage 5's leadership transfer deliberately
+tells one follower to campaign immediately while its peers are still hearing from
+the (transferring) leader — exactly the condition the stickiness rule rejects. A
+`LeaderTransfer` flag on the `RequestVote` skips the check. It ships now, always
+false, so the voter-side handling is in place before Stage 5 sets it.
+
+A note on our transport choice: a removed node stays in `peers`, so the leader keeps
+heartbeating it and it does not, on its own, time out — harmless, since it applies
+entries but is never counted. Not skipping non-config peers is deliberate: it keeps
+replication uniform and is forward-compatible with Stage 4 learners (non-config but
+replicated-to). The disruption rule is implemented for the cases this does not cover
+(a removed node also partitioned, or one that never received `C_new`) and as the
+foundation Stage 5 builds on.
+
+### Validation
+
+The removal tests pin each property directly: a five-node cluster shrunk to
+`{0,1,2}` commits through `{0,1}` alone; a leader removes itself, commits `C_new`
+under the new majority, steps down, and never leads again while a successor takes
+over; the min-timeout rule ignores a higher-term vote request inside the window,
+honors it once expired, and is bypassed by `LeaderTransfer`; and the one-change and
+cannot-remove-last gates. Then the Phase 5 harness runs the randomized concurrent
+workload — with reads routed through the read-index barrier — while two servers are
+removed underneath it, and the checker confirms the history stays linearizable: a
+configuration change is invisible to the register, so shrinking the voting set
+mid-flight must admit no anomaly. Membership changes concurrent with *fault
+injection* are the heavier soak deferred to Stage 6.
+
+### Still open (Stages 4–6)
+
+Adding a server — with a non-voting **learner** catch-up phase so a slow new node
+never stalls commits — leadership transfer (`TimeoutNow`), and the deferred
+durability items (an `InstallSnapshot` must carry the configuration and the session
+table; compaction must fold a compacted config entry into the base-config file)
+remain. They are the rest of Phase 8.
