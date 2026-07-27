@@ -62,6 +62,76 @@ func TestConfigEntryMechanism(t *testing.T) {
 	}
 }
 
+// TestCompactionFoldsConfig pins Stage 6a: when Raft-log compaction discards a
+// prefix containing a configuration entry, that configuration is folded into the
+// durable base-config file so it survives a restart (the log no longer holds the
+// entry to re-derive it). readBaseConfigFile is exactly what buildNode reads at
+// startup, so a correct base file here means a correct reconstruction on restart.
+func TestCompactionFoldsConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), raftConfigFileName)
+	l := NewRaftLog()
+	l.append(1, EntryData, []byte("d1"))                                               // 1
+	l.append(1, EntryConfig, encodeConfig(map[NodeID]bool{0: true, 1: true, 2: true})) // 2: {0,1,2}
+	l.append(1, EntryData, []byte("d2"))                                               // 3
+	l.append(1, EntryConfig, encodeConfig(map[NodeID]bool{0: true, 1: true}))          // 4: {0,1}
+	l.append(1, EntryData, []byte("d3"))                                               // 5
+
+	base := map[NodeID]bool{0: true, 1: true, 2: true, 3: true}
+	n := &Node{
+		log:         l,
+		baseConfig:  copyConfig(base),
+		config:      map[NodeID]bool{0: true, 1: true},
+		configPath:  configPath,
+		cfg:         Config{SnapshotThreshold: 1}, // compact whenever asked
+		lastApplied: 4,                            // discard through index 4 (the {0,1} entry)
+	}
+	n.raftMu.Lock()
+	n.maybeCompactLocked()
+	n.raftMu.Unlock()
+
+	// The base-config file (and the in-memory base) now hold the config as of the
+	// new base, index 4 = {0,1}; the log compacted to base 4.
+	if got, ok := readBaseConfigFile(configPath); !ok || !configEqual(got, map[NodeID]bool{0: true, 1: true}) {
+		t.Fatalf("base-config file after compaction = %v (ok=%v), want {0,1}", got, ok)
+	}
+	if !configEqual(n.baseConfig, map[NodeID]bool{0: true, 1: true}) {
+		t.Fatalf("in-memory baseConfig = %v, want {0,1}", n.baseConfig)
+	}
+	if n.log.baseIndex != 4 {
+		t.Fatalf("log baseIndex = %d, want 4", n.log.baseIndex)
+	}
+}
+
+// TestCompactionNoConfigLeavesBase pins the other branch: compacting a prefix with
+// no configuration entry leaves the base config untouched (and writes no file).
+func TestCompactionNoConfigLeavesBase(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), raftConfigFileName)
+	l := NewRaftLog()
+	l.append(1, EntryData, []byte("d1")) // 1
+	l.append(1, EntryData, []byte("d2")) // 2
+	l.append(1, EntryData, []byte("d3")) // 3
+
+	base := map[NodeID]bool{0: true, 1: true, 2: true}
+	n := &Node{
+		log:         l,
+		baseConfig:  copyConfig(base),
+		config:      copyConfig(base),
+		configPath:  configPath,
+		cfg:         Config{SnapshotThreshold: 1},
+		lastApplied: 2,
+	}
+	n.raftMu.Lock()
+	n.maybeCompactLocked()
+	n.raftMu.Unlock()
+
+	if !configEqual(n.baseConfig, base) {
+		t.Fatalf("baseConfig changed without a compacted config entry: %v", n.baseConfig)
+	}
+	if _, ok := readBaseConfigFile(configPath); ok {
+		t.Fatalf("base-config file was written despite no config entry in the compacted prefix")
+	}
+}
+
 // TestConfigDrivesQuorum pins Stage 1: the quorum size and the vote-solicitation
 // set derive from the config, so shrinking or growing it changes the majority — and
 // a nil config falls back to the fixed peer set for bare-Node white-box tests.

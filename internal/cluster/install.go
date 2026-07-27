@@ -134,6 +134,79 @@ func clearInstallMarker(raftDir string, sync bool) error {
 	return nil
 }
 
+// installConfigName holds the snapshot's encoded configuration while an install is
+// pending. It is staged alongside the marker (written BEFORE it) so BOTH the
+// in-process completion and a restart completion can fold it into the durable
+// base-config file (raft/config) — the config lives in raftDir, not the DB dir, so
+// the store swap does not carry it; staging it here does. The sessions table, by
+// contrast, lives in the DB dir and swaps in with the store, so it needs no staging.
+const installConfigName = "install.config"
+
+func installConfigPath(raftDir string) string { return filepath.Join(raftDir, installConfigName) }
+
+// writeInstallConfig durably stages the snapshot configuration (encoded voter set),
+// crash-atomically. Called before the marker; consumed after the swap.
+func writeInstallConfig(raftDir string, encoded []byte, sync bool) error {
+	tmp := installConfigPath(raftDir) + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("cluster: write install config: %w", err)
+	}
+	if _, err := f.Write(encoded); err != nil {
+		f.Close()
+		return fmt.Errorf("cluster: write install config: %w", err)
+	}
+	if sync {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return fmt.Errorf("cluster: sync install config: %w", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("cluster: close install config: %w", err)
+	}
+	if err := os.Rename(tmp, installConfigPath(raftDir)); err != nil {
+		return fmt.Errorf("cluster: rename install config: %w", err)
+	}
+	if sync {
+		if err := syncDir(raftDir); err != nil {
+			return fmt.Errorf("cluster: sync dir after install config: %w", err)
+		}
+	}
+	return nil
+}
+
+func clearInstallConfig(raftDir string) error {
+	if err := os.Remove(installConfigPath(raftDir)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cluster: clear install config: %w", err)
+	}
+	return nil
+}
+
+// installStagedConfig folds a staged snapshot configuration into the durable
+// base-config file (raft/config), so the reconstructed configuration after the
+// install reflects the snapshot's membership rather than the node's stale prior
+// view. It returns the decoded config (for the in-process in-memory update) and
+// whether one was staged. A no-op when nothing is staged (an older leader that did
+// not ship a config). Idempotent: safe to re-run on a restart completion.
+func installStagedConfig(raftDir string, sync bool) (cfg map[NodeID]bool, ok bool, err error) {
+	encoded, readErr := os.ReadFile(installConfigPath(raftDir))
+	if os.IsNotExist(readErr) {
+		return nil, false, nil // nothing staged (older leader): leave raft/config as is
+	}
+	if readErr != nil {
+		// A genuine read error must not be swallowed: silently skipping the fold
+		// would drop the config change. Fail so completion retries (the marker still
+		// guards it).
+		return nil, false, fmt.Errorf("cluster: read staged install config: %w", readErr)
+	}
+	cfg = decodeConfig(encoded)
+	if err := writeBaseConfigFile(filepath.Join(raftDir, raftConfigFileName), cfg, sync); err != nil {
+		return nil, false, err
+	}
+	return cfg, true, nil
+}
+
 // copyFileSync copies src to dst (truncating dst) and fsyncs dst.
 func copyFileSync(src, dst string, sync bool) error {
 	in, err := os.Open(src)
@@ -223,9 +296,15 @@ func completeInstallIfPending(dir, raftDir string, sync bool) error {
 	if err := resetRaftLogFileTo(filepath.Join(raftDir, raftLogFileName), m.lastIncludedIndex, m.lastIncludedTerm, sync); err != nil {
 		return err
 	}
+	// Fold the staged configuration into raft/config while the marker still guards
+	// the completion, so a crash here re-runs it. buildNode reads raft/config next.
+	if _, _, err := installStagedConfig(raftDir, sync); err != nil {
+		return err
+	}
 	if err := clearInstallMarker(raftDir, sync); err != nil {
 		return err
 	}
+	_ = clearInstallConfig(raftDir)
 	return os.RemoveAll(stagedDir)
 }
 
@@ -281,8 +360,13 @@ func (n *Node) handleInstallSnapshot(m Message) {
 			Value: append([]byte(nil), kp.Value...),
 		}
 	}
+	sessions := make(map[string]uint64, len(m.Sessions))
+	for _, s := range m.Sessions {
+		sessions[string(s.Session)] = s.Seq
+	}
+	config := append([]byte(nil), m.Config...) // nil-safe copy off the shared slice
 
-	if recoverable, err := n.installSnapshot(m.LastIncludedIndex, m.LastIncludedTerm, m.SnapshotTS, kvs); err != nil {
+	if recoverable, err := n.installSnapshot(m.LastIncludedIndex, m.LastIncludedTerm, m.SnapshotTS, kvs, sessions, config); err != nil {
 		if recoverable {
 			// The old store is intact (failure before the swap): clear installing
 			// so the node resumes serving its prior state and a later attempt can
@@ -311,7 +395,7 @@ func (n *Node) handleInstallSnapshot(m Message) {
 // node keeps serving its old state), whereas a completeInstall error happens
 // AFTER the store is closed and the data swapped (NOT recoverable — the node
 // must stay parked until a restart re-runs completion from the marker).
-func (n *Node) installSnapshot(lastIncludedIndex, lastIncludedTerm, snapshotTS uint64, kvs []db.KV) (recoverable bool, err error) {
+func (n *Node) installSnapshot(lastIncludedIndex, lastIncludedTerm, snapshotTS uint64, kvs []db.KV, sessions map[string]uint64, config []byte) (recoverable bool, err error) {
 	stagedDir := stagedDBPath(n.raftDir)
 	if err := os.RemoveAll(stagedDir); err != nil {
 		return true, err
@@ -319,8 +403,16 @@ func (n *Node) installSnapshot(lastIncludedIndex, lastIncludedTerm, snapshotTS u
 	if err := os.MkdirAll(stagedDir, 0o755); err != nil {
 		return true, err
 	}
-	if err := db.BuildSnapshotDB(stagedDir, kvs, lastIncludedIndex, snapshotTS); err != nil {
+	if err := db.BuildSnapshotDB(stagedDir, kvs, sessions, lastIncludedIndex, snapshotTS); err != nil {
 		return true, err
+	}
+	// Stage the configuration alongside the DB (before the marker) so completion —
+	// in-process or after a restart — folds it into raft/config. The sessions table
+	// is already inside the staged DB and swaps in with it.
+	if len(config) > 0 {
+		if err := writeInstallConfig(n.raftDir, config, n.opts.SyncOnWrite); err != nil {
+			return true, err
+		}
 	}
 	if err := writeInstallMarker(n.raftDir, installMarker{
 		lastIncludedIndex: lastIncludedIndex,
@@ -379,12 +471,25 @@ func (n *Node) completeInstall(lastIncludedIndex, lastIncludedTerm uint64) error
 	newStore.SetCommitOverride(n.commit)
 	n.store = newStore
 
+	// Fold the staged configuration into raft/config (durable) before clearing the
+	// marker, so a crash between here and completion re-runs it. Then adopt it
+	// in-memory: the reset log has no entries above the new base, so the current
+	// configuration is exactly this snapshot base config.
+	newBaseConfig, haveConfig, cerr := installStagedConfig(n.raftDir, n.opts.SyncOnWrite)
+	if cerr != nil {
+		return cerr
+	}
+
 	n.raftMu.Lock()
 	if err := n.logFile.resetToBase(lastIncludedIndex, lastIncludedTerm); err != nil {
 		n.raftMu.Unlock()
 		return fmt.Errorf("cluster: reset raft log for install: %w", err)
 	}
 	n.log.resetToBase(lastIncludedIndex, lastIncludedTerm)
+	if haveConfig {
+		n.baseConfig = copyConfig(newBaseConfig)
+		n.config = copyConfig(newBaseConfig)
+	}
 	n.commitIndex = lastIncludedIndex
 	n.lastApplied = lastIncludedIndex
 	n.installing = false
@@ -398,6 +503,7 @@ func (n *Node) completeInstall(lastIncludedIndex, lastIncludedTerm uint64) error
 	if err := clearInstallMarker(n.raftDir, n.opts.SyncOnWrite); err != nil {
 		return err
 	}
+	_ = clearInstallConfig(n.raftDir)
 	n.installsApplied.Add(1)
 	return os.RemoveAll(stagedDBPath(n.raftDir))
 }
@@ -406,8 +512,8 @@ func (n *Node) completeInstall(lastIncludedIndex, lastIncludedTerm uint64) error
 // sendLoop when p's nextIndex has fallen into the compacted prefix. It captures
 // a pinned, consistent snapshot off the store (no raftMu), reads the snapshot's
 // term from the committed log, ships it, and on a successful ack fast-forwards
-// p's match/next. Returns false only on quit.
-func (n *Node) sendSnapshot(p NodeID, term uint64) bool {
+// p's match/next. Returns false only on quit. rc is p's captured response channel.
+func (n *Node) sendSnapshot(p NodeID, term uint64, rc chan Message) bool {
 	n.storeMu.RLock()
 	it, lastIncludedIndex, snapshotTS, err := n.store.SnapshotScan()
 	if err != nil {
@@ -423,6 +529,10 @@ func (n *Node) sendSnapshot(p NodeID, term uint64) bool {
 	}
 	iterErr := it.Err()
 	it.Close()
+	// The session dedup table travels with the snapshot so the follower keeps
+	// exactly-once dedup for commands applied before the snapshot. Captured under
+	// the same storeMu that pins the scan.
+	sessions := n.store.SessionTable()
 	n.storeMu.RUnlock()
 	if iterErr != nil {
 		return true
@@ -441,8 +551,17 @@ func (n *Node) sendSnapshot(p NodeID, term uint64) bool {
 		return true
 	}
 	lastIncludedTerm := n.log.term(lastIncludedIndex)
+	// The voting configuration as of the snapshot index travels too, so the follower
+	// adopts the right membership (its own log, wiped by the install, no longer
+	// carries the config entries to re-derive it).
+	configBytes := encodeConfig(n.configAsOfLocked(lastIncludedIndex))
 	leaderCommit := n.commitIndex
 	n.raftMu.Unlock()
+
+	sessKV := make([]SessionKV, 0, len(sessions))
+	for s, seq := range sessions {
+		sessKV = append(sessKV, SessionKV{Session: []byte(s), Seq: seq})
+	}
 
 	msg := Message{
 		Type: MsgInstallSnapshot, From: n.id, Term: term,
@@ -450,6 +569,8 @@ func (n *Node) sendSnapshot(p NodeID, term uint64) bool {
 		LastIncludedTerm:  lastIncludedTerm,
 		SnapshotTS:        snapshotTS,
 		Snapshot:          kvs,
+		Config:            configBytes,
+		Sessions:          sessKV,
 		LeaderCommit:      leaderCommit,
 	}
 	if err := n.transport.Send(p, msg); err != nil {
@@ -458,7 +579,7 @@ func (n *Node) sendSnapshot(p NodeID, term uint64) bool {
 
 	var resp Message
 	select {
-	case resp = <-n.respCh[p]:
+	case resp = <-rc:
 	case <-time.After(installResponseTimeout):
 		return true
 	case <-n.quit:

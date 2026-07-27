@@ -531,6 +531,20 @@ func (db *DB) SessionLastSeq(session []byte) uint64 {
 	return db.sessions[string(session)]
 }
 
+// SessionTable returns a copy of the full session dedup table (session -> last
+// applied seq). It is the source of the exactly-once state shipped in an
+// InstallSnapshot, so a follower rebuilt from the snapshot keeps deduplicating
+// retries of commands applied before the snapshot.
+func (db *DB) SessionTable() map[string]uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	out := make(map[string]uint64, len(db.sessions))
+	for k, v := range db.sessions {
+		out[k] = v
+	}
+	return out
+}
+
 // encodeSeq / decodeSeq (de)serialize a session sequence number carried in the
 // OpCommit marker's Value field: 8 bytes, little-endian. A short/absent slice
 // decodes to 0 (no sequence).

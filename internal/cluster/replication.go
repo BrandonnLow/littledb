@@ -33,8 +33,13 @@ func (n *Node) signalReplicators() {
 // re-reads the replSignal map and cannot race a concurrent peer addition.
 func (n *Node) replicateTo(p NodeID) {
 	defer n.wg.Done()
+	// Capture p's signal and response channels once. Both are published before this
+	// goroutine starts and never change, so reading them once avoids re-reading the
+	// respCh/replSignal maps — which a concurrent peer addition (ensurePeerLocked)
+	// may be writing — on every round.
 	n.replMu.RLock()
 	sig := n.replSignal[p]
+	rc := n.respCh[p]
 	n.replMu.RUnlock()
 	for {
 		select {
@@ -42,7 +47,7 @@ func (n *Node) replicateTo(p NodeID) {
 			return
 		case <-sig:
 		}
-		if !n.sendLoop(p) {
+		if !n.sendLoop(p, rc) {
 			return // quit observed mid-send
 		}
 	}
@@ -50,8 +55,9 @@ func (n *Node) replicateTo(p NodeID) {
 
 // sendLoop pushes AppendEntries to p until p is caught up (then returns true to
 // await the next signal). Returns immediately if we are not the leader, so a
-// follower's replicator just idles. Returns false only on quit.
-func (n *Node) sendLoop(p NodeID) bool {
+// follower's replicator just idles. Returns false only on quit. rc is p's captured
+// response channel (see replicateTo).
+func (n *Node) sendLoop(p NodeID, rc chan Message) bool {
 	for {
 		n.raftMu.Lock()
 		if n.role != Leader {
@@ -67,7 +73,7 @@ func (n *Node) sendLoop(p NodeID) bool {
 			// of AppendEntries (term(prevLogIndex) below would index the compacted
 			// prefix and panic).
 			n.raftMu.Unlock()
-			if !n.sendSnapshot(p, term) {
+			if !n.sendSnapshot(p, term, rc) {
 				return false
 			}
 			n.raftMu.Lock()
@@ -99,7 +105,7 @@ func (n *Node) sendLoop(p NodeID) bool {
 
 		var resp Message
 		select {
-		case resp = <-n.respCh[p]:
+		case resp = <-rc:
 		case <-time.After(appendResponseTimeout):
 			return true // reply lost (e.g. partition); retry on the next signal
 		case <-n.quit:
@@ -221,10 +227,41 @@ func (n *Node) maybeCompactLocked() {
 		return
 	}
 	newBaseTerm := n.log.term(safe)
+	// Fold any configuration entry in the prefix we are about to discard into the
+	// durable base config, so a membership change below the new base survives a
+	// restart — after compaction the log no longer holds the entry to re-derive it
+	// from. The config as of `safe` is the latest config entry at index <= safe, or
+	// the existing base if none. Persist it BEFORE compacting: if we crash in
+	// between, the base file reflects `safe` while the (still-full) log's latest
+	// config entry re-derives the same configuration, so either order recovers
+	// correctly; persisting first also means a persist failure aborts the compaction
+	// with nothing lost.
+	if n.configPath != "" {
+		newBaseConfig := n.configAsOfLocked(safe)
+		if !configEqual(newBaseConfig, n.baseConfig) {
+			if err := writeBaseConfigFile(n.configPath, newBaseConfig, n.opts.SyncOnWrite); err != nil {
+				return // couldn't persist the base config; don't compact past it
+			}
+			n.baseConfig = newBaseConfig
+		}
+	}
 	if n.logFile != nil {
 		if err := n.logFile.compact(safe, newBaseTerm, n.log.entriesAfter(safe)); err != nil {
 			return // file unchanged; leave memory uncompacted to stay mirrored
 		}
 	}
 	n.log.compactTo(safe, newBaseTerm)
+}
+
+// configAsOfLocked returns the configuration in effect at log index idx: the
+// payload of the latest config entry at index <= idx (and above the compaction
+// base), or a copy of the current base config if none survive in that range. Must
+// hold raftMu.
+func (n *Node) configAsOfLocked(idx uint64) map[NodeID]bool {
+	for i := idx; i > n.log.baseIndex; i-- {
+		if n.log.kindAt(i) == EntryConfig {
+			return decodeConfig(n.log.entryAt(i))
+		}
+	}
+	return copyConfig(n.baseConfig)
 }

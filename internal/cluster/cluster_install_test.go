@@ -56,7 +56,7 @@ func TestCompleteInstallIfPendingSwapsAndResets(t *testing.T) {
 		{Key: []byte("a"), Value: []byte("1")},
 		{Key: []byte("b"), Value: []byte("2")},
 	}
-	if err := db.BuildSnapshotDB(stagedDir, kvs, lii, ts); err != nil {
+	if err := db.BuildSnapshotDB(stagedDir, kvs, nil, lii, ts); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeInstallMarker(raftDir, installMarker{lastIncludedIndex: lii, lastIncludedTerm: lit, snapshotTS: ts}, true); err != nil {

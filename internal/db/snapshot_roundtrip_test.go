@@ -73,7 +73,7 @@ func TestSnapshotScanBuildRoundTrip(t *testing.T) {
 
 	// Materialize the snapshot into a fresh staged dir and reopen it.
 	stagedDir := t.TempDir()
-	if err := BuildSnapshotDB(stagedDir, kvs, lii, ts); err != nil {
+	if err := BuildSnapshotDB(stagedDir, kvs, nil, lii, ts); err != nil {
 		t.Fatalf("BuildSnapshotDB: %v", err)
 	}
 	dst, err := OpenWith(stagedDir, Options{SyncOnWrite: false, DisableBackgroundCompaction: true})
@@ -102,9 +102,35 @@ func TestSnapshotScanBuildRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSnapshotCarriesSessions pins Stage 6b at the db layer: BuildSnapshotDB writes
+// the session dedup table into the staged dir, so a follower rebuilt from a snapshot
+// keeps exactly-once dedup for commands applied before the snapshot.
+func TestSnapshotCarriesSessions(t *testing.T) {
+	stagedDir := t.TempDir()
+	sessions := map[string]uint64{"clientA": 7, "clientB": 3}
+	kvs := []KV{{Key: []byte("a"), Value: []byte("1")}}
+	if err := BuildSnapshotDB(stagedDir, kvs, sessions, 5, 9); err != nil {
+		t.Fatalf("BuildSnapshotDB: %v", err)
+	}
+	dst, err := OpenWith(stagedDir, Options{SyncOnWrite: false, DisableBackgroundCompaction: true})
+	if err != nil {
+		t.Fatalf("open staged: %v", err)
+	}
+	defer dst.Close()
+	if got := dst.SessionLastSeq([]byte("clientA")); got != 7 {
+		t.Errorf("SessionLastSeq(clientA) = %d, want 7", got)
+	}
+	if got := dst.SessionLastSeq([]byte("clientB")); got != 3 {
+		t.Errorf("SessionLastSeq(clientB) = %d, want 3", got)
+	}
+	if got := dst.SessionLastSeq([]byte("unknown")); got != 0 {
+		t.Errorf("SessionLastSeq(unknown) = %d, want 0", got)
+	}
+}
+
 func TestBuildSnapshotDBEmpty(t *testing.T) {
 	stagedDir := t.TempDir()
-	if err := BuildSnapshotDB(stagedDir, nil, 42, 99); err != nil {
+	if err := BuildSnapshotDB(stagedDir, nil, nil, 42, 99); err != nil {
 		t.Fatalf("BuildSnapshotDB empty: %v", err)
 	}
 	// No SSTable should exist; applied.base alone carries the index.
@@ -124,7 +150,7 @@ func TestBuildSnapshotDBEmpty(t *testing.T) {
 func TestBuildSnapshotDBRejectsOutOfOrder(t *testing.T) {
 	stagedDir := t.TempDir()
 	kvs := []KV{{Key: []byte("b"), Value: []byte("1")}, {Key: []byte("a"), Value: []byte("2")}}
-	if err := BuildSnapshotDB(stagedDir, kvs, 1, 1); err == nil {
+	if err := BuildSnapshotDB(stagedDir, kvs, nil, 1, 1); err == nil {
 		t.Fatalf("BuildSnapshotDB accepted out-of-order keys, want error")
 	}
 }
