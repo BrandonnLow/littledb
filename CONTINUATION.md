@@ -20,10 +20,9 @@ committed on `main`:
 4. **Phase 7** — client sessions / exactly-once dedup.
 5. **Membership groundwork** — config-driven quorum, then configuration-in-the-log.
 
-**We are mid-way through the membership-changes track.** Stages 1–2 are done and
-committed. **Next: Stage 3 (remove a server + disruption prevention).** Then Stage 4
-(add a server — the biggest lift), Stage 5 (leadership transfer), Stage 6 (validate
-+ document + handle deferred items).
+**We are mid-way through the membership-changes track.** Stages 1–3 are done and
+committed. **Next: Stage 4 (add a server — the biggest lift).** Then Stage 5
+(leadership transfer), Stage 6 (validate + document + handle deferred items).
 
 The checker is the oracle: build a stage, then run it under the checker/fault
 injection to confirm it stays linearizable before moving on.
@@ -74,6 +73,7 @@ injection to confirm it stays linearizable before moving on.
 
 | Commit | What |
 |---|---|
+| `0130417` | membership: **remove a server + disruption prevention** — Stage 3 |
 | `f9f3e85` | membership: **configuration in the Raft log** (config entries) — Stage 2 |
 | `156c798` | membership: **derive quorum from a per-node config** (groundwork) — Stage 1 |
 | `24177b7` | **phase7: client sessions / exactly-once** dedup |
@@ -130,7 +130,7 @@ feeds histories to the checker lives in `internal/cluster/lincheck_harness_test.
 
 ---
 
-## 4. Membership track — what's DONE (Stages 1–2)
+## 4. Membership track — what's DONE (Stages 1–3)
 
 **Stage 1 (`156c798`): quorum from a config field.** A per-node `config` (voting members,
 incl. self), bootstrapped to all nodes. `majority()`, the vote-solicitation set
@@ -152,41 +152,53 @@ incl. self), bootstrapped to all nodes. `majority()`, the vote-solicitation set
 **Everything a config change needs at the log/quorum level is already in place.** Stage 3
 just adds the API that *creates* the first `EntryConfig`.
 
+**Stage 3 (`0130417`): remove a server + disruption prevention.**
+- **`Cluster.RemoveServer(id)`** (leader-routed, like `Put`) → node-side `removeServer`
+  builds `newCfg = config \ {id}` and drives an `EntryConfig` through
+  `proposeAndAwait`. Adopt-on-append means quorum shrinks immediately and the change
+  commits under the *new* majority. Idempotent (re-removing an absent id is a no-op);
+  refuses the last member (`ErrCannotRemove`).
+- **One-change-at-a-time gate:** `latestConfigEntryCommittedLocked` refuses a new change
+  while the newest config entry in the log is still uncommitted (`ErrConfigChangeInProgress`).
+- **Self-removal (§4.2.2):** a leader removing itself commits `C_new` then
+  `relinquishLeadershipLocked` (drops to follower at the *same* term). This required
+  fixing **`maybeAdvanceCommitLocked` to count self only when self ∈ config** (via
+  `inConfigLocked`) — else a leader outside its own config would commit `C_new` one ack
+  early. That was a latent correctness gap the removal path exposed.
+- **Disruption prevention (§4.2.3):** `Node.lastLeaderContact` is stamped on every
+  AppendEntries/InstallSnapshot accepted from a current leader; `handleRequestVote`
+  **ignores** a vote request within `ElectionMin` of it (no term adoption, no grant) —
+  `withinLeaderStickinessLocked`. Companion candidate-side guard: `maybeStartElection`
+  bails when `!inConfigLocked()` (a removed node that knows it's gone won't campaign).
+  `Message.LeaderTransfer` (always false until Stage 5) bypasses the stickiness rule for
+  `TimeoutNow`.
+- **Decisions:** removed nodes keep running and still get heartbeats (harmless, and
+  forward-compatible with Stage 4 learners — so replication is NOT restricted to config
+  members). Config changes aren't deduped across a leadership change, so an
+  `ErrMaybeCommitted` change may need an idempotent retry.
+- **Tests (`internal/cluster/remove_test.go`):** `TestRemoveServerShrinksQuorum`
+  (5→{0,1,2}, commits through {0,1} alone), `TestRemoveLeaderStepsDown`,
+  `TestClusterLinearizableUnderMembershipChange` (lincheck stays linearizable while two
+  servers are removed under load), the disruption-rule unit tests, and the
+  guard/cannot-remove tests.
+
 ---
 
-## 5. Remaining plan — Stages 3–6 (the point of this handoff)
+## 5. Remaining plan — Stages 4–6 (the point of this handoff)
 
 Approach: **single-server changes** (dissertation §4.1), one add/remove at a time — NOT
 joint consensus. Any two majorities of configs differing by one server overlap, which is
 what makes it safe.
 
-### Stage 3 — remove a server + disruption prevention  *(next; moderate)*
-- **API:** `Cluster.RemoveServer(id)` → on the leader, build `newCfg = currentConfig \
-  {id}`, then `proposeAndAwait(term, EntryConfig, encodeConfig(newCfg))`. The leader
-  adopts `newCfg` on append (already wired), so quorum immediately shrinks and the change
-  commits under the *new* majority. Needs a small leader-side wrapper like `commit()`
-  (take `commitMu`, verify leader, get term, build entry, propose).
-- **One-change-at-a-time guard:** reject a new config change while the latest config entry
-  in the log is uncommitted (its index > `commitIndex`).
-- **Leader removed from config:** commit `C_new`, then step down.
-- **Disruption prevention (important):** a removed node, no longer receiving heartbeats,
-  times out and campaigns with ever-higher terms, disrupting the cluster. Fix: a follower
-  **ignores `RequestVote` received within the minimum election timeout of the last
-  AppendEntries from a current leader.** Add a `lastLeaderContact time.Time` to `Node`,
-  set on AppendEntries/InstallSnapshot receipt; in `handleRequestVote`, if
-  `now - lastLeaderContact < cfg.ElectionMin`, do not grant. **Subtlety:** voters do NOT
-  check "is the candidate in my config" (a being-added learner isn't yet, either) — the
-  min-timeout rule is the mechanism. **This rule must be bypassable by leadership transfer
-  (Stage 5)** — carry a `force`/`leaderTransfer` flag on the RequestVote so a `TimeoutNow`
-  target can still get votes immediately.
-- **The removed node still exists** in `c.nodes` and (since `signalReplicators` iterates
-  the fixed peer set) still receives AppendEntries — harmless (it applies but isn't
-  counted). Optionally skip non-config peers in `sendLoop`/`signalReplicators`, and/or
-  stop the removed node.
-- **Test:** 5-node cluster, `RemoveServer(4)`; the 4-node cluster still commits; node 4's
-  campaigns don't disrupt. Then run it under the harness to confirm linearizability.
+**Stage 3 (remove a server + disruption prevention) is DONE — see §4 and commit `0130417`.**
+Two carry-forward facts it established that Stages 4–5 depend on: (a) voters do NOT check
+"is the candidate in my config" — the **min-election-timeout stickiness rule** in
+`handleRequestVote` is the disruption defense, and it is bypassable via
+`Message.LeaderTransfer` (used by Stage 5's `TimeoutNow`); (b) replication is **not**
+restricted to config members, so a Stage-4 learner (non-config but replicated-to) already
+fits the existing per-peer replication.
 
-### Stage 4 — add a server + learner catch-up  *(the largest lift)*
+### Stage 4 — add a server + learner catch-up  *(next; the largest lift)*
 - **New-node integration is the hard part.** Today `c.nodes` is fixed-length and each
   node's `peers` + per-peer goroutines/maps are frozen at construction. Adding a server
   requires:
@@ -260,9 +272,10 @@ what makes it safe.
 ---
 
 ## 8. First action in the new session
-Read this file + `DESIGN.md` (Phases 4–7) + `git log --oneline -8`, then **start Stage 3
-(remove a server)**. The task list (if present) has stages 16–19 = membership 3–6. Confirm
-the baseline is green first:
+Read this file + `DESIGN.md` (Phases 4–7) + `git log --oneline -8`, then **start Stage 4
+(add a server + learner catch-up)** — the largest lift; see §5 for the replication-refactor
+guidance. Stage 3 (remove a server) is already done (`0130417`). Confirm the baseline is
+green first:
 ```bash
 export PATH="/usr/local/go/bin:/usr/bin:/bin"; cd ~/projects/littledb && go test ./... -race -count=1
 ```
