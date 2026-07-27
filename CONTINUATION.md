@@ -1,9 +1,10 @@
 # littledb — Session Handoff / Continuation Guide
 
-> Working document for continuing the **membership-changes track**. Safe to delete
-> once membership + leadership transfer are finished and documented. Everything
-> already built is committed to `main`; this file exists to carry the *plan for the
-> unbuilt stages* and the project's working conventions into a fresh session.
+> **The membership-changes track is COMPLETE (Stages 1–6, all committed on `main`).**
+> The authoritative write-up is **`DESIGN.md` Phase 8**. This file is now just a
+> progress record + working-conventions handoff; it is safe to delete. The next
+> roadmap item is the **network transport** (replace the in-process `ChannelTransport`)
+> — see §6.
 
 ---
 
@@ -20,9 +21,11 @@ committed on `main`:
 4. **Phase 7** — client sessions / exactly-once dedup.
 5. **Membership groundwork** — config-driven quorum, then configuration-in-the-log.
 
-**We are near the end of the membership-changes track.** Stages 1–5 are done and
-committed. **Next: Stage 6 — the finish line: validate membership under fault
-injection + close the two deferred durability items + finish DESIGN.md Phase 8.**
+**The membership-changes track is COMPLETE.** All six stages are done and committed
+(remove / add-with-learner / leadership-transfer + the durability items), each
+validated under the checker, with the capstone soak running all three operations
+concurrent with partition faults and config-carrying snapshots. **Phase 8 in
+`DESIGN.md` is the full decision-log write-up.**
 
 The checker is the oracle: build a stage, then run it under the checker/fault
 injection to confirm it stays linearizable before moving on.
@@ -73,6 +76,7 @@ injection to confirm it stays linearizable before moving on.
 
 | Commit | What |
 |---|---|
+| `67a52d8` | membership: **durable config+sessions across compaction & snapshots** — Stage 6 |
 | `4e5e65d` | membership: **leadership transfer / TimeoutNow** — Stage 5 |
 | `f3968e3` | membership: **add a server + learner catch-up** — Stage 4 |
 | `0130417` | membership: **remove a server + disruption prevention** — Stage 3 |
@@ -132,7 +136,7 @@ feeds histories to the checker lives in `internal/cluster/lincheck_harness_test.
 
 ---
 
-## 4. Membership track — what's DONE (Stages 1–5)
+## 4. Membership track — what's DONE (Stages 1–6, COMPLETE)
 
 > The authoritative, decision-log write-up of all of this now lives in **`DESIGN.md`
 > Phase 8** (per the user's steer: DESIGN.md is the durable record; this file is just
@@ -228,37 +232,36 @@ just adds the API that *creates* the first `EntryConfig`.
   old leader steps down, writes flow through the new leader), `TestTransferLeadershipToNonVoter`
   (`ErrTransferTarget`), `TestTransferLeadershipToSelf` (no-op).
 
+**Stage 6 (`67a52d8`): durable config+sessions across compaction & snapshots + validation.**
+- **6a — compaction folds config into the base file.** `maybeCompactLocked`, before
+  discarding the applied prefix, sets `baseConfig = configAsOfLocked(safe)` (latest config
+  entry ≤ safe, else unchanged) and `writeBaseConfigFile`s it to `raft/config` **before**
+  compacting the log (crash-safe either order). First time `raft/config` is written after
+  bootstrap.
+- **6b — InstallSnapshot carries config + sessions.** `Message` gains `Config []byte` +
+  `Sessions []SessionKV`. Sessions ride in the DB dir (`BuildSnapshotDB` writes the sessions
+  file into the staged DB → swaps in). Config is staged as `raft/install.config` (written
+  before the marker); **both** `completeInstall` and `completeInstallIfPending` fold it into
+  `raft/config` while the marker still guards the install (crash mid-completion re-runs).
+  `db.SessionTable()` added; `configAsOfLocked` computes what the leader ships.
+- **Race fix (Stage 4 fallout):** the replication path read `respCh[p]` each round, which a
+  concurrent `ensurePeerLocked` could rehash under. Now captured once at replicator start
+  (like the signal channel).
+- **Tests:** `TestCompactionFoldsConfig` / `…NoConfigLeavesBase`; db-layer
+  `TestSnapshotCarriesSessions`; end-to-end `TestSnapshotCarriesConfigAndSessions`
+  (partitioned+removed follower learns config {0,1,2} + session table purely from the
+  snapshot); capstone `TestMembershipUnderFaults` (all 3 ops + partitions + snapshots +
+  workload, converges + linearizable).
+
 ---
 
-## 5. Remaining plan — Stage 6 (the finish line)
+## 5. Remaining plan — NONE (membership track complete)
 
-Approach: **single-server changes** (dissertation §4.1), one add/remove at a time — NOT
-joint consensus. Any two majorities of configs differing by one server overlap, which is
-what makes it safe.
-
-**Stages 3–5 are DONE — see §4 and DESIGN.md Phase 8** (commits `0130417`, `f3968e3`,
-`4e5e65d`). All the membership *operations* (remove / add-with-learner / transfer) exist
-and are checker-validated in isolation. Stage 6 is the finish: exercise them under fault
-injection and close the durability gaps compaction/snapshot leave open.
-
-### Stage 6 — validate + DESIGN.md Phase 8 + commit + **the deferred items**
-- Run membership changes concurrent with the workload under fault injection; confirm
-  convergence + linearizability with the checker.
-- **MUST address the deferred items (they're real correctness gaps once add/remove ship):**
-  1. **InstallSnapshot must carry the config AND the session table.** Today it ships only
-     the live KV set, so a follower that installs a snapshot **loses its membership config
-     and its exactly-once session dedup**. Add `Config` + `Sessions` to the
-     `MsgInstallSnapshot` `Message`; `sendSnapshot` includes them; `handleInstallSnapshot`
-     / `installSnapshot` / `db.BuildSnapshotDB` persist them (config → `raft/config` +
-     `baseConfig`; sessions → the `sessions` file); `completeInstall` resets them.
-  2. **Compaction must fold config entries into the base-config file.** In
-     `maybeCompactLocked`, before compacting past index `safe`, set `baseConfig` = the
-     latest config entry ≤ `safe` (else unchanged) and `writeBaseConfigFile` it. Today the
-     base file is only ever written at... nowhere yet (bootstrap uses the in-memory
-     default), so a compacted config entry would be forgotten on restart.
-- **DESIGN.md Phase 8 is being written incrementally** (Stages 1–5 already documented
-  there, including `TimeoutNow`); Stage 6 just adds the config+sessions-in-snapshot /
-  compaction sections and the final validation note. Commit.
+All six stages are done (§4) and fully documented in **DESIGN.md Phase 8**. There is no
+remaining membership work. The approach throughout was **single-server changes**
+(dissertation §4.1), one add/remove at a time — never joint consensus — because any two
+majorities of configs differing by one server overlap, which is what makes each
+transition safe.
 
 ---
 
@@ -288,9 +291,12 @@ injection and close the durability gaps compaction/snapshot leave open.
 ---
 
 ## 8. First action in the new session
-Read this file + `DESIGN.md` (Phases 4–8) + `git log --oneline -8`, then **start Stage 6
-(validate under fault injection + the two deferred durability items)** — see §5. Stages
-3–5 are already done (`0130417`, `f3968e3`, `4e5e65d`). Confirm the baseline is green first:
+The membership track is **complete** — nothing left to build here. Read `DESIGN.md`
+(Phases 4–8) + `git log --oneline -10` for context. The next roadmap item (§6) is the
+**network transport**: replace the in-process `ChannelTransport` (the `Transport`
+interface is the seam) with wire serialization + addresses, then a client/server split.
+This handoff file can be deleted once that track starts. Confirm the baseline is green
+first:
 ```bash
 export PATH="/usr/local/go/bin:/usr/bin:/bin"; cd ~/projects/littledb && go test ./... -race -count=1
 ```
