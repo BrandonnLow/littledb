@@ -39,6 +39,16 @@ var ErrCannotRemove = errors.New("cluster: cannot remove the last voting member"
 // so a retry can promote it once it has caught up.
 var ErrCatchupTimeout = errors.New("cluster: added server did not catch up in time")
 
+// ErrTransferTarget is returned by TransferLeadership when the target is not a
+// voting member of the current configuration (e.g. a learner still catching up),
+// so it could not win an election.
+var ErrTransferTarget = errors.New("cluster: leadership-transfer target is not a voting member")
+
+// ErrTransferTimeout is returned by TransferLeadership when the target does not
+// take over within the transfer deadline (it never caught up, or its election did
+// not complete). The old leader resumes accepting proposals.
+var ErrTransferTimeout = errors.New("cluster: leadership transfer did not complete in time")
+
 // ErrMaybeCommitted is returned by a write whose entry was appended and
 // replicated but whose leader stepped down before confirming it applied. The
 // write may or may not have committed: a later leader may commit the replicated
@@ -59,6 +69,15 @@ const routeTimeout = 2 * time.Second
 // well above a healthy in-process catch-up so it only fires on a genuinely stuck
 // join, not normal replication latency.
 const addServerCatchupTimeout = 10 * time.Second
+
+// transferCatchupTimeout bounds how long TransferLeadership waits for the target
+// to replicate the leader's full log before sending it the TimeoutNow; transferStepdownTimeout
+// bounds the wait for the target's election to unseat this leader afterward.
+const (
+	transferCatchupTimeout  = 3 * time.Second
+	transferStepdownTimeout = 2 * time.Second
+	transferPollInterval    = 5 * time.Millisecond
+)
 
 // Config tunes the election and heartbeat timers. Heartbeat must be well below
 // ElectionMin (a few heartbeats per election window) or healthy leaders get
@@ -130,6 +149,13 @@ type Node struct {
 	config     map[NodeID]bool
 	baseConfig map[NodeID]bool
 	configPath string
+
+	// transferring is set while this leader is handing off leadership (Stage 5): it
+	// gates proposeAndAwait so no new entry is appended during the transfer, keeping
+	// the target's log from falling behind between the catch-up check and its
+	// election. Cleared when this node steps down (the transfer succeeded, or a
+	// higher term appeared) or the transfer aborts. Guarded by raftMu.
+	transferring bool
 
 	log         *RaftLog
 	logFile     *raftLogFile       // durable Raft log; nil for bare-Node white-box tests
@@ -275,6 +301,8 @@ func (n *Node) run() {
 				n.handleRequestVote(m)
 			case MsgRequestVoteResponse:
 				n.handleVoteResponse(m)
+			case MsgTimeoutNow:
+				n.handleTimeoutNow(m)
 			case MsgInstallSnapshot:
 				n.handleInstallSnapshot(m)
 			case MsgAppendResponse, MsgInstallSnapshotResponse:
@@ -555,7 +583,10 @@ func (n *Node) proposeAndAwait(term uint64, kind EntryKind, entry []byte) error 
 	// eagerly, so the entry is durable before maybeAdvanceCommit can count it toward
 	// the commit index and apply it. If we stepped down we bail before touching
 	// either log; the entry is simply never created here.
-	if n.role != Leader || n.currentTerm != term {
+	if n.role != Leader || n.currentTerm != term || n.transferring {
+		// transferring: a leadership transfer is in progress, so we stop accepting
+		// new entries (the target must not fall behind before its election). The
+		// caller redirects, retrying until the new leader is up.
 		n.raftMu.Unlock()
 		return ErrNotLeader
 	}
@@ -716,6 +747,90 @@ func (n *Node) addServer(id NodeID) error {
 	newCfg[id] = true
 	n.raftMu.Unlock()
 	return n.proposeAndAwait(term, EntryConfig, encodeConfig(newCfg))
+}
+
+// transferLeadership is the leader side of TransferLeadership: it hands leadership
+// to a caught-up voting member without an availability gap. It marks itself
+// `transferring` (which stops it appending new entries), replicates its full log to
+// the target, sends the target a MsgTimeoutNow, and waits for the target's election
+// to unseat it. The target campaigns immediately with LeaderTransfer set, so the
+// other voters bypass the disruption-prevention rule and vote for it at once.
+//
+// Returns ErrNotLeader if not the leader (or already transferring), ErrTransferTarget
+// if the target is not a voting member, or ErrTransferTimeout if the target does not
+// catch up or take over in time (the leader then resumes normally). Transferring to
+// self is a no-op.
+func (n *Node) transferLeadership(target NodeID) error {
+	n.raftMu.Lock()
+	if n.role != Leader {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	if target == n.id {
+		n.raftMu.Unlock()
+		return nil // already leader
+	}
+	if n.transferring {
+		n.raftMu.Unlock()
+		return ErrNotLeader // a transfer is already underway
+	}
+	if n.config != nil && !n.config[target] {
+		n.raftMu.Unlock()
+		return ErrTransferTarget
+	}
+	term := n.currentTerm
+	// Stop appending new entries so lastIndex is stable while the target catches up
+	// and campaigns. Cleared on step-down (success) or on abort below.
+	n.transferring = true
+	last := n.log.lastIndex()
+	n.raftMu.Unlock()
+	n.signalReplicators() // push the tail to the target now
+
+	abort := func(err error) error {
+		n.raftMu.Lock()
+		if n.role == Leader {
+			n.transferring = false // resume normal operation
+		}
+		n.raftMu.Unlock()
+		return err
+	}
+
+	// Wait for the target to hold our full log (so its RequestVote is up-to-date).
+	deadline := time.Now().Add(transferCatchupTimeout)
+	for {
+		n.raftMu.Lock()
+		if n.role != Leader || n.currentTerm != term {
+			n.raftMu.Unlock()
+			return ErrNotLeader // stepped down before we could hand off
+		}
+		caught := n.matchIndex[target] >= last
+		n.raftMu.Unlock()
+		if caught {
+			break
+		}
+		if time.Now().After(deadline) {
+			return abort(ErrTransferTimeout)
+		}
+		time.Sleep(transferPollInterval)
+	}
+
+	// Tell the target to campaign now.
+	_ = n.transport.Send(target, Message{Type: MsgTimeoutNow, From: n.id, Term: term})
+
+	// Wait for the target's election to unseat us (we step down on its higher term).
+	deadline = time.Now().Add(transferStepdownTimeout)
+	for {
+		n.raftMu.Lock()
+		stepped := n.role != Leader
+		n.raftMu.Unlock()
+		if stepped {
+			return nil // transfer complete
+		}
+		if time.Now().After(deadline) {
+			return abort(ErrTransferTimeout)
+		}
+		time.Sleep(transferPollInterval)
+	}
 }
 
 // latestConfigEntryCommittedLocked reports whether the newest configuration entry
@@ -1188,6 +1303,19 @@ func (c *Cluster) AddServer(id NodeID, dir string) error {
 		}
 	}
 	return c.withLeader(func(ld *Node) error { return ld.addServer(id) })
+}
+
+// TransferLeadership hands leadership to target — a voting member — without an
+// availability gap: the current leader stops accepting new writes, brings target
+// fully up to date, and directs it to campaign immediately (bypassing the
+// randomized election timer and the disruption-prevention rule). On return, target
+// has taken over (or is about to). Routes to the current leader, retrying across
+// leadership changes.
+//
+// Returns ErrTransferTarget if target is not a voting member (e.g. a learner still
+// catching up), or ErrTransferTimeout if the handoff does not complete in time.
+func (c *Cluster) TransferLeadership(target NodeID) error {
+	return c.withLeader(func(ld *Node) error { return ld.transferLeadership(target) })
 }
 
 // spawnNode registers id with the transport, builds a joining node over dir (a
