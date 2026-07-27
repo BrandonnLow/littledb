@@ -20,7 +20,7 @@ func newVoterWithState(t *testing.T, dir string, id NodeID, term uint64, votedFo
 	}
 	log := NewRaftLog()
 	for _, lt := range logTerms {
-		log.append(lt, []byte("e"))
+		log.append(lt, EntryData, []byte("e"))
 	}
 	nd := &Node{
 		id: id, transport: tr, log: log, stateFile: sf,
@@ -165,7 +165,7 @@ func TestRestartMaxLoadTermReconciliation(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, lt := range tc.logTerms {
-				if err := lf.append(lt, []byte("x")); err != nil {
+				if err := lf.append(lt, EntryData, []byte("x")); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -180,8 +180,8 @@ func TestAppendEntriesRejectsPrevLogTermMismatch(t *testing.T) {
 	tr.Register(0)
 	tr.Register(1)
 	log := NewRaftLog()
-	log.append(1, []byte("a"))
-	log.append(2, []byte("b"))
+	log.append(1, EntryData, []byte("a"))
+	log.append(2, EntryData, []byte("b"))
 	f := &Node{
 		id: 1, transport: tr, peers: []NodeID{0},
 		inbox: tr.Inbox(1), quit: make(chan struct{}), log: log,
@@ -193,7 +193,7 @@ func TestAppendEntriesRejectsPrevLogTermMismatch(t *testing.T) {
 	f.handleAppendEntries(Message{
 		Type: MsgAppendEntries, From: 0, Term: 2,
 		PrevLogIndex: 2, PrevLogTerm: 99, // index 2 exists but at term 2, not 99
-		Entries: []Entry{{2, []byte("c")}},
+		Entries: []Entry{{2, EntryData, []byte("c")}},
 	})
 	resp := <-tr.Inbox(0)
 	if resp.Success {
@@ -223,10 +223,10 @@ func TestAppendEntriesMixedSkipThenConflict(t *testing.T) {
 	}
 	log := NewRaftLog()
 	for _, s := range []string{"a", "b", "c"} { // seed file + memory with [a@1,b@1,c@1]
-		if err := lf.append(1, []byte(s)); err != nil {
+		if err := lf.append(1, EntryData, []byte(s)); err != nil {
 			t.Fatal(err)
 		}
-		log.append(1, []byte(s))
+		log.append(1, EntryData, []byte(s))
 	}
 	f := &Node{
 		id: 1, transport: tr, peers: []NodeID{0},
@@ -241,7 +241,7 @@ func TestAppendEntriesMixedSkipThenConflict(t *testing.T) {
 	// idx1 a@1 (skip), idx2 b2@2 (conflict: truncate b,c then append), idx3 c2@2.
 	f.handleAppendEntries(Message{
 		Type: MsgAppendEntries, From: 0, Term: 2, PrevLogIndex: 0, PrevLogTerm: 0,
-		Entries: []Entry{{1, []byte("a")}, {2, []byte("b2")}, {2, []byte("c2")}},
+		Entries: []Entry{{1, EntryData, []byte("a")}, {2, EntryData, []byte("b2")}, {2, EntryData, []byte("c2")}},
 	})
 	resp := <-tr.Inbox(0)
 	if !resp.Success || resp.MatchIndex != 3 {
@@ -265,7 +265,7 @@ func TestAppendEntriesRejectsStaleLowerTerm(t *testing.T) {
 	tr.Register(0)
 	tr.Register(1)
 	log := NewRaftLog()
-	log.append(5, []byte("x"))
+	log.append(5, EntryData, []byte("x"))
 	f := &Node{
 		id: 1, transport: tr, peers: []NodeID{0},
 		inbox: tr.Inbox(1), quit: make(chan struct{}), log: log,
@@ -277,7 +277,7 @@ func TestAppendEntriesRejectsStaleLowerTerm(t *testing.T) {
 	f.handleAppendEntries(Message{
 		Type: MsgAppendEntries, From: 0, Term: 3, // stale, below our 5
 		PrevLogIndex: 0, PrevLogTerm: 0,
-		Entries: []Entry{{3, []byte("y")}},
+		Entries: []Entry{{3, EntryData, []byte("y")}},
 	})
 	resp := <-tr.Inbox(0)
 	if resp.Success {

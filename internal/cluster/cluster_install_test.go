@@ -42,8 +42,8 @@ func TestCompleteInstallIfPendingSwapsAndResets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lf.append(1, []byte("e1"))
-	lf.append(1, []byte("e2"))
+	lf.append(1, EntryData, []byte("e1"))
+	lf.append(1, EntryData, []byte("e2"))
 	lf.close()
 
 	// Staged snapshot DB with fresh keys at a high index/ts.

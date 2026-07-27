@@ -7,7 +7,7 @@ import "testing"
 func buildLog(terms ...uint64) *RaftLog {
 	l := NewRaftLog()
 	for i, tm := range terms {
-		l.append(tm, []byte{byte('a' + i)})
+		l.append(tm, EntryData, []byte{byte('a' + i)})
 	}
 	return l
 }
@@ -91,7 +91,7 @@ func TestRaftLogTruncateFromAfterCompact(t *testing.T) {
 	if l.lastIndex() != 2 || l.lastTerm() != 1 {
 		t.Fatalf("after truncateFrom(3): lastIndex=%d lastTerm=%d, want 2/1 (back to base)", l.lastIndex(), l.lastTerm())
 	}
-	if idx := l.append(3, []byte("z")); idx != 3 {
+	if idx := l.append(3, EntryData, []byte("z")); idx != 3 {
 		t.Fatalf("append after truncate-to-base returned %d, want 3", idx)
 	}
 }

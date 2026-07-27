@@ -20,8 +20,8 @@ func TestRaftLogAppendAndRead(t *testing.T) {
 		t.Error("has(0) = false, want true (empty-log sentinel)")
 	}
 
-	i1 := l.append(term1, []byte("one"))
-	i2 := l.append(term1, []byte("two"))
+	i1 := l.append(term1, EntryData, []byte("one"))
+	i2 := l.append(term1, EntryData, []byte("two"))
 	if i1 != 1 || i2 != 2 {
 		t.Fatalf("append indexes = %d,%d, want 1,2", i1, i2)
 	}
@@ -42,7 +42,7 @@ func TestRaftLogAppendAndRead(t *testing.T) {
 func TestRaftLogAppendCopiesBytes(t *testing.T) {
 	l := NewRaftLog()
 	buf := []byte("data")
-	l.append(term1, buf)
+	l.append(term1, EntryData, buf)
 	buf[0] = 'X' // mutate the caller's buffer
 	if !bytes.Equal(l.entryAt(1), []byte("data")) {
 		t.Errorf("entry = %q, want data (append must copy)", l.entryAt(1))
@@ -54,8 +54,8 @@ func TestRaftLogMatchesPrev(t *testing.T) {
 	if !l.matchesPrev(0, 0) {
 		t.Error("matchesPrev(0,0) on empty = false, want true (start of log)")
 	}
-	l.append(term1, []byte("a"))
-	l.append(term1, []byte("b"))
+	l.append(term1, EntryData, []byte("a"))
+	l.append(term1, EntryData, []byte("b"))
 
 	if !l.matchesPrev(2, term1) {
 		t.Error("matchesPrev(2, term1) = false, want true")
@@ -71,7 +71,7 @@ func TestRaftLogMatchesPrev(t *testing.T) {
 func TestRaftLogTruncateFrom(t *testing.T) {
 	l := NewRaftLog()
 	for i := 0; i < 4; i++ {
-		l.append(term1, []byte{byte('0' + i)})
+		l.append(term1, EntryData, []byte{byte('0' + i)})
 	}
 	if l.lastIndex() != 4 {
 		t.Fatalf("lastIndex = %d, want 4", l.lastIndex())
@@ -91,7 +91,7 @@ func TestRaftLogTruncateFrom(t *testing.T) {
 	}
 
 	// Can append after truncation; indexes resume from the new end.
-	if idx := l.append(term1, []byte("new")); idx != 3 {
+	if idx := l.append(term1, EntryData, []byte("new")); idx != 3 {
 		t.Errorf("append after truncate = index %d, want 3", idx)
 	}
 }
