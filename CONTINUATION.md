@@ -20,9 +20,9 @@ committed on `main`:
 4. **Phase 7** — client sessions / exactly-once dedup.
 5. **Membership groundwork** — config-driven quorum, then configuration-in-the-log.
 
-**We are mid-way through the membership-changes track.** Stages 1–3 are done and
-committed. **Next: Stage 4 (add a server — the biggest lift).** Then Stage 5
-(leadership transfer), Stage 6 (validate + document + handle deferred items).
+**We are mid-way through the membership-changes track.** Stages 1–4 are done and
+committed. **Next: Stage 5 (leadership transfer — small, self-contained).** Then
+Stage 6 (validate + document + handle deferred items).
 
 The checker is the oracle: build a stage, then run it under the checker/fault
 injection to confirm it stays linearizable before moving on.
@@ -73,6 +73,7 @@ injection to confirm it stays linearizable before moving on.
 
 | Commit | What |
 |---|---|
+| `f3968e3` | membership: **add a server + learner catch-up** — Stage 4 |
 | `0130417` | membership: **remove a server + disruption prevention** — Stage 3 |
 | `f9f3e85` | membership: **configuration in the Raft log** (config entries) — Stage 2 |
 | `156c798` | membership: **derive quorum from a per-node config** (groundwork) — Stage 1 |
@@ -130,7 +131,12 @@ feeds histories to the checker lives in `internal/cluster/lincheck_harness_test.
 
 ---
 
-## 4. Membership track — what's DONE (Stages 1–3)
+## 4. Membership track — what's DONE (Stages 1–4)
+
+> The authoritative, decision-log write-up of all of this now lives in **`DESIGN.md`
+> Phase 8** (per the user's steer: DESIGN.md is the durable record; this file is just
+> progress/handoff). The summaries below are pointers.
+
 
 **Stage 1 (`156c798`): quorum from a config field.** A per-node `config` (voting members,
 incl. self), bootstrapped to all nodes. `majority()`, the vote-solicitation set
@@ -182,42 +188,47 @@ just adds the API that *creates* the first `EntryConfig`.
   servers are removed under load), the disruption-rule unit tests, and the
   guard/cannot-remove tests.
 
+**Stage 4 (`f3968e3`): add a server + learner catch-up.**
+- **`Cluster.AddServer(id, dir)`** → `spawnNode` (register transport, `buildNode` over a
+  fresh dir with an **empty** bootstrap config so the joiner is a non-voting follower
+  that won't campaign, append under `nodesMu`, start) then node-side `addServer`:
+  - **Phase 1** (raftMu): `ensurePeerLocked(id)` as a learner; record `commitIndex` as the
+    catch-up target.
+  - **Phase 2** (NO commitMu): poll `matchIndex[id] >= target` or `ErrCatchupTimeout`.
+    Client commits proceed — the learner isn't in the config, so it's never counted.
+  - **Phase 3** (commitMu + one-change gate): propose `EntryConfig(config ∪ {id})`. It's
+    caught up, so the new majority is immediately satisfiable (no availability gap).
+- **Dynamic peer growth made race-safe:** `ensurePeerLocked` grows the per-peer maps at
+  runtime. `nextIndex`/`matchIndex` stay raftMu-guarded; **`respCh`/`replSignal` get a new
+  `replMu`** (leaf lock; raftMu→replMu) because `run()`/`signalReplicators` read them
+  outside raftMu. Add-only maps; each replicator captures its signal channel once.
+  `becomeLeaderLocked` calls `reconcilePeersLocked` so a follower that wins can reach a
+  member added since its construction.
+- **`buildNode` signature changed** to `(id, peers, bootstrapConfig, dir, opts, tr, cfg)`;
+  `Cluster` retains `opts`/`cfg`; new ids must be the **next dense slot** so `nodes[i]`==node
+  i; `AddServer` is retry-safe after a catch-up timeout (skips spawn, retries promotion).
+- **Tests (`internal/cluster/add_test.go`):** `TestAddServerJoinsAndVotes` (3→{0,1,2,3};
+  after partitioning the leader the survivors' 3-of-4 election *requires* the new node's
+  vote), `TestAddServerToSingleNode` (1→{0,1}, learner phase matters most),
+  `TestAddServerRejectsNonSequentialID`, `TestClusterLinearizableUnderServerAdd`.
+
 ---
 
-## 5. Remaining plan — Stages 4–6 (the point of this handoff)
+## 5. Remaining plan — Stages 5–6 (the point of this handoff)
 
 Approach: **single-server changes** (dissertation §4.1), one add/remove at a time — NOT
 joint consensus. Any two majorities of configs differing by one server overlap, which is
 what makes it safe.
 
-**Stage 3 (remove a server + disruption prevention) is DONE — see §4 and commit `0130417`.**
-Two carry-forward facts it established that Stages 4–5 depend on: (a) voters do NOT check
-"is the candidate in my config" — the **min-election-timeout stickiness rule** in
-`handleRequestVote` is the disruption defense, and it is bypassable via
-`Message.LeaderTransfer` (used by Stage 5's `TimeoutNow`); (b) replication is **not**
-restricted to config members, so a Stage-4 learner (non-config but replicated-to) already
-fits the existing per-peer replication.
+**Stages 3–4 are DONE — see §4 and DESIGN.md Phase 8** (commits `0130417`, `f3968e3`).
+Carry-forward facts Stage 5 depends on: (a) the **min-election-timeout stickiness rule**
+in `handleRequestVote` is the disruption defense (voters do NOT check candidate config),
+bypassable via **`Message.LeaderTransfer`** — Stage 5's `TimeoutNow` sets it so the
+transfer target gets votes immediately; (b) `ensurePeerLocked` / the per-peer replication
+model handles dynamic membership, and the leader already tracks `matchIndex[target]` for
+the "is the target caught up" check the transfer needs.
 
-### Stage 4 — add a server + learner catch-up  *(next; the largest lift)*
-- **New-node integration is the hard part.** Today `c.nodes` is fixed-length and each
-  node's `peers` + per-peer goroutines/maps are frozen at construction. Adding a server
-  requires:
-  - Instantiate a `Node` over a fresh dir (`buildNode`), register it with the transport,
-    append it to `c.nodes` under `nodesMu` (the slice grows — check `Node(i)`/`Size()`).
-  - **The existing nodes must learn the new peer**: their `peers` sets don't include it,
-    so they can't send to it. The leader must add `nextIndex/matchIndex/respCh/replSignal`
-    entries for the new id and **start a `replicateTo` goroutine** for it.
-  - **Strongly consider refactoring replication** from "one fixed goroutine per peer" to a
-    driver that iterates the *current* config/peer set each signal — much cleaner for
-    dynamic membership than managing goroutine lifecycles. (Bigger refactor; worth it.)
-- **Learner phase:** replicate to the new node as a **non-voting** member (not in config)
-  until its `matchIndex` catches up, THEN propose the `EntryConfig` adding it as a voter —
-  so a slow catch-up never stalls commits.
-- **v1 simplification option:** add as a voter immediately and accept a brief availability
-  dip while it catches up (defer the learner phase). Note it if you take this path.
-- **Test:** 3-node → `AddServer(3)` → 4-node; the new node converges and can vote.
-
-### Stage 5 — leadership transfer (`TimeoutNow`)  *(small, self-contained)*
+### Stage 5 — leadership transfer (`TimeoutNow`)  *(next; small, self-contained)*
 - New message `MsgTimeoutNow`. `Cluster.TransferLeadership(target)`: leader ensures the
   target is caught up (`matchIndex[target] == lastIndex`, send the tail first), stops
   accepting new proposals, sends `MsgTimeoutNow` to the target. The target, on receipt,
@@ -241,8 +252,9 @@ fits the existing per-peer replication.
      latest config entry ≤ `safe` (else unchanged) and `writeBaseConfigFile` it. Today the
      base file is only ever written at... nowhere yet (bootstrap uses the in-memory
      default), so a compacted config entry would be forgotten on restart.
-- Write DESIGN.md **Phase 8** (single-server changes, config-in-log/adopt-on-append,
-  disruption prevention, learner, `TimeoutNow`, config+sessions-in-snapshot). Commit.
+- **DESIGN.md Phase 8 is being written incrementally** (Stages 1–4 already documented
+  there); Stage 6 just adds the `TimeoutNow` and config+sessions-in-snapshot / compaction
+  sections and the final validation note. Commit.
 
 ---
 
@@ -272,10 +284,9 @@ fits the existing per-peer replication.
 ---
 
 ## 8. First action in the new session
-Read this file + `DESIGN.md` (Phases 4–7) + `git log --oneline -8`, then **start Stage 4
-(add a server + learner catch-up)** — the largest lift; see §5 for the replication-refactor
-guidance. Stage 3 (remove a server) is already done (`0130417`). Confirm the baseline is
-green first:
+Read this file + `DESIGN.md` (Phases 4–8) + `git log --oneline -8`, then **start Stage 5
+(leadership transfer / `TimeoutNow`)** — small and self-contained; see §5. Stages 3–4 are
+already done (`0130417`, `f3968e3`). Confirm the baseline is green first:
 ```bash
 export PATH="/usr/local/go/bin:/usr/bin:/bin"; cd ~/projects/littledb && go test ./... -race -count=1
 ```
