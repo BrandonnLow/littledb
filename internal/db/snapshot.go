@@ -17,9 +17,12 @@ type KV struct {
 
 // BuildSnapshotDB materializes a fresh, standalone DB at dir containing exactly
 // kvs, every pair stamped at snapshotTS, with the applied Raft index recorded as
-// lastIncludedIndex. It is the follower side of InstallSnapshot: the received
-// logical state is written into a staging directory which is then swapped into
-// place. dir must already exist and be empty.
+// lastIncludedIndex, and the session dedup table `sessions`. It is the follower
+// side of InstallSnapshot: the received logical state is written into a staging
+// directory which is then swapped into place. dir must already exist and be empty.
+// sessions is written into the staged dir's sessions file, so it swaps in with the
+// DB and the follower keeps its exactly-once dedup across the install; an empty
+// table writes no file (recovery reads that as no sessions).
 //
 // Reopening dir reconstructs RecoveredAppliedIndex() == lastIncludedIndex and
 // (when kvs is non-empty) appliedTS == snapshotTS / nextTimestamp ==
@@ -37,7 +40,7 @@ type KV struct {
 // the first applied entry after the install re-raises nextTimestamp through
 // ApplyEntry's max. A snapshot with zero live keys (everything deleted as of
 // snapshotTS) is the only way to reach this.
-func BuildSnapshotDB(dir string, kvs []KV, lastIncludedIndex, snapshotTS uint64) error {
+func BuildSnapshotDB(dir string, kvs []KV, sessions map[string]uint64, lastIncludedIndex, snapshotTS uint64) error {
 	if len(kvs) > 0 {
 		path := filepath.Join(dir, sstableFilename(1))
 		w, err := sstable.NewWriter(path, len(kvs), lastIncludedIndex)
@@ -60,6 +63,14 @@ func BuildSnapshotDB(dir string, kvs []KV, lastIncludedIndex, snapshotTS uint64)
 	// lastIncludedIndex in every case.
 	if err := writeAppliedBase(dir, lastIncludedIndex); err != nil {
 		return fmt.Errorf("db: build snapshot: applied base: %w", err)
+	}
+	// The session table swaps in with the DB (dir/sessions), so exactly-once dedup
+	// survives the install. Skip an empty table — recovery reads its absence as no
+	// sessions, identical to writing count 0.
+	if len(sessions) > 0 {
+		if err := writeSessionsFile(dir, sessions); err != nil {
+			return fmt.Errorf("db: build snapshot: sessions: %w", err)
+		}
 	}
 	return nil
 }

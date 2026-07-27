@@ -59,6 +59,14 @@ type KVPair struct {
 	Value []byte
 }
 
+// SessionKV is one session dedup entry on the wire in an InstallSnapshot: a client
+// session id and the highest command sequence applied for it. Shipping the table
+// with the snapshot preserves exactly-once semantics across an install.
+type SessionKV struct {
+	Session []byte
+	Seq     uint64
+}
+
 // EntryKind tags what a Raft log entry carries. Most entries are data (an encoded
 // transaction); a config entry carries a membership change, which the Raft layer
 // interprets itself (adopting it on append) rather than applying to the state
@@ -119,7 +127,9 @@ type Message struct {
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
 	SnapshotTS        uint64
-	Snapshot          []KVPair // read-only; the follower copies what it keeps
+	Snapshot          []KVPair    // read-only; the follower copies what it keeps
+	Config            []byte      // encoded voting configuration as of LastIncludedIndex
+	Sessions          []SessionKV // session dedup table (read-only; follower copies)
 }
 
 // Transport delivers messages between nodes. The Raft invariants are
