@@ -13,8 +13,11 @@ const appendResponseTimeout = 250 * time.Millisecond
 
 // signalReplicators wakes every follower's replication goroutine. Non-blocking
 // and coalescing. Called when a new entry is appended, the commit index
-// advances, or this node becomes leader (immediate heartbeat).
+// advances, or this node becomes leader (immediate heartbeat). replSignal may
+// gain keys concurrently (a server being added), so iterate under replMu.
 func (n *Node) signalReplicators() {
+	n.replMu.RLock()
+	defer n.replMu.RUnlock()
 	for _, ch := range n.replSignal {
 		select {
 		case ch <- struct{}{}:
@@ -25,14 +28,19 @@ func (n *Node) signalReplicators() {
 
 // replicateTo is the per-follower replication loop, running on every node but
 // active only while this node is the leader. It idles by blocking on its
-// signal / quit — never spins on role.
+// signal / quit — never spins on role. The signal channel is captured once (it is
+// published before this goroutine starts and never changes), so the loop never
+// re-reads the replSignal map and cannot race a concurrent peer addition.
 func (n *Node) replicateTo(p NodeID) {
 	defer n.wg.Done()
+	n.replMu.RLock()
+	sig := n.replSignal[p]
+	n.replMu.RUnlock()
 	for {
 		select {
 		case <-n.quit:
 			return
-		case <-n.replSignal[p]:
+		case <-sig:
 		}
 		if !n.sendLoop(p) {
 			return // quit observed mid-send

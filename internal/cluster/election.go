@@ -93,6 +93,10 @@ func (n *Node) resetElectionTimer() {
 // time out and start a competing election. Must hold raftMu.
 func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
+	// Ensure a replicator exists for every voting member, including any added since
+	// this node was constructed (its replication state and goroutine may not exist
+	// yet), before initializing their nextIndex/matchIndex.
+	n.reconcilePeersLocked()
 	last := n.log.lastIndex()
 	for _, p := range n.votingPeers() {
 		n.nextIndex[p] = last + 1

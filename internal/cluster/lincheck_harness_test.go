@@ -396,7 +396,14 @@ func crashRestart(c *Cluster, i int, opts db.Options, cfg Config) error {
 	}
 	old.storeMu.Unlock()
 
-	nd, err := buildNode(old.id, size, old.dir, opts, c.transport, cfg)
+	// Rebuild over the same dir with the current dense membership as the transport
+	// peer set and the fresh-node fallback config (the durable config file, which
+	// exists for a restart, takes precedence inside buildNode).
+	members := make([]NodeID, size)
+	for i := range members {
+		members[i] = NodeID(i)
+	}
+	nd, err := buildNode(old.id, members, fullConfig(size), old.dir, opts, c.transport, cfg)
 	if err != nil {
 		return err
 	}
