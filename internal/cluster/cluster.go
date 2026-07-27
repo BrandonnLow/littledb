@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,20 @@ import (
 // did not commit). Clients retry on the new leader; the cluster's own
 // Put/Delete/Get do this automatically.
 var ErrNotLeader = errors.New("cluster: not leader")
+
+// ErrConfigChangeInProgress is returned by a membership change (AddServer /
+// RemoveServer) attempted while the latest configuration entry in the leader's
+// log is not yet committed. Raft allows only one configuration change in flight
+// at a time (dissertation §4.1): a second change, proposed atop an uncommitted
+// first, could commit under a configuration the first would have superseded,
+// breaking the overlapping-majorities safety argument. The caller retries once
+// the in-flight change commits.
+var ErrConfigChangeInProgress = errors.New("cluster: a configuration change is already in progress")
+
+// ErrCannotRemove is returned by RemoveServer when the removal is impossible:
+// removing the sole remaining voting member would leave the cluster with no one
+// able to form a quorum.
+var ErrCannotRemove = errors.New("cluster: cannot remove the last voting member")
 
 // ErrMaybeCommitted is returned by a write whose entry was appended and
 // replicated but whose leader stepped down before confirming it applied. The
@@ -110,6 +125,15 @@ type Node struct {
 	commitIndex uint64
 	lastApplied uint64
 	appliedCond *sync.Cond // broadcast when lastApplied advances or we step down
+
+	// lastLeaderContact is the wall-clock time of the last AppendEntries /
+	// InstallSnapshot accepted from a current-term leader. It drives disruption
+	// prevention (Raft dissertation §4.2.3): a node ignores a RequestVote received
+	// within ElectionMin of hearing from a leader, so a server removed from the
+	// configuration (or partitioned) that campaigns with an ever-rising term
+	// cannot force the live leader to step down. Zero until the first contact.
+	// Guarded by raftMu.
+	lastLeaderContact time.Time
 
 	votesReceived int // tally for the current election (candidate only)
 
@@ -272,6 +296,7 @@ func (n *Node) handleAppendEntries(m Message) {
 	}
 	n.role = Follower // a current-term leader exists; defer to it
 	n.resetElectionTimer()
+	n.lastLeaderContact = time.Now() // a current leader exists: arm disruption prevention
 	term := n.currentTerm
 
 	if !n.log.matchesPrev(m.PrevLogIndex, m.PrevLogTerm) {
@@ -544,6 +569,97 @@ func (n *Node) proposeAndAwait(term uint64, kind EntryKind, entry []byte) error 
 		}
 		n.appliedCond.Wait()
 	}
+}
+
+// removeServer is the leader side of RemoveServer: it removes id from the current
+// voting configuration by driving a config entry through the ordinary
+// quorum-commit path. The leader adopts the new configuration the instant it
+// appends the entry (adopt-on-append), so the change commits under the NEW
+// majority — a single-server change (dissertation §4.1), where the old and new
+// majorities always overlap, so the transition is safe without joint consensus.
+//
+// It returns nil (a no-op) if id is already absent, ErrCannotRemove if the
+// removal would empty the configuration, ErrConfigChangeInProgress if a prior
+// change is still uncommitted, and ErrNotLeader / ErrMaybeCommitted like any
+// commit. If the leader removes ITSELF, it relinquishes leadership once C_new
+// commits (§4.2.2) so the remaining members elect a leader from within C_new.
+func (n *Node) removeServer(id NodeID) error {
+	n.commitMu.Lock()
+	defer n.commitMu.Unlock()
+
+	n.raftMu.Lock()
+	if n.role != Leader {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	if !n.latestConfigEntryCommittedLocked() {
+		n.raftMu.Unlock()
+		return ErrConfigChangeInProgress
+	}
+	if n.config != nil && !n.config[id] {
+		n.raftMu.Unlock()
+		return nil // already not a voting member
+	}
+	newCfg := copyConfig(n.config)
+	delete(newCfg, id)
+	if len(newCfg) == 0 {
+		n.raftMu.Unlock()
+		return ErrCannotRemove
+	}
+	term := n.currentTerm
+	n.raftMu.Unlock()
+
+	if err := n.proposeAndAwait(term, EntryConfig, encodeConfig(newCfg)); err != nil {
+		return err
+	}
+
+	// C_new is committed. If we removed ourselves we are no longer a voting member;
+	// a leader outside its own configuration must step down so C_new elects its own
+	// leader. We relinquish at the SAME term (no term bump): we are simply ceasing
+	// to lead, not adopting a newer term. inConfigLocked guards against a spurious
+	// step-down if we somehow regained membership.
+	if id == n.id {
+		n.raftMu.Lock()
+		if n.role == Leader && !n.inConfigLocked() {
+			n.relinquishLeadershipLocked()
+		}
+		n.raftMu.Unlock()
+	}
+	return nil
+}
+
+// latestConfigEntryCommittedLocked reports whether the newest configuration entry
+// in the log is already committed (or there is none above the base, in which case
+// the base configuration is committed by definition). It is the one-change-at-a-
+// time gate: a new membership change may start only when the previous one has
+// committed. Must hold raftMu.
+func (n *Node) latestConfigEntryCommittedLocked() bool {
+	for i := n.log.lastIndex(); i > n.log.baseIndex; i-- {
+		if n.log.kindAt(i) == EntryConfig {
+			return i <= n.commitIndex
+		}
+	}
+	return true
+}
+
+// inConfigLocked reports whether this node is a voting member of its current
+// configuration. A nil config (bare-Node white-box tests) counts as a member.
+// Must hold raftMu.
+func (n *Node) inConfigLocked() bool {
+	return n.config == nil || n.config[n.id]
+}
+
+// relinquishLeadershipLocked reverts this leader to follower WITHOUT adopting a
+// new term — used when a leader removes itself from the configuration and must
+// stop leading once C_new commits (dissertation §4.2.2). Unlike stepDownLocked it
+// changes neither currentTerm nor votedFor (so nothing needs re-persisting): it
+// simply drops the leader role and wakes any commit waiter. The removed node will
+// not campaign again (maybeStartElection bails when not in its own config), so it
+// quietly exits the cluster. Must hold raftMu.
+func (n *Node) relinquishLeadershipLocked() {
+	n.role = Follower
+	n.appliedCond.Broadcast()
+	n.resetElectionTimer()
 }
 
 // Cluster is a Raft replication group over a transport.
@@ -864,6 +980,41 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 // a leadership change will get ErrNotLeader from Commit (no transparent retry —
 // the snapshot is tied to the node it began on).
 func (c *Cluster) Begin() *db.Txn { return c.leaderNode().storeBegin() }
+
+// RemoveServer removes a voting member from the cluster configuration, routing to
+// the current leader and retrying across leadership changes (like Put). The change
+// is a single-server change committed under the new majority; on return the new
+// configuration is committed. Removing a follower shrinks the quorum immediately;
+// removing the leader makes it step down once the change commits, after which the
+// remaining members elect a successor. The removed node keeps running (it stays in
+// the transport's peer set and still receives heartbeats, harmlessly), but is no
+// longer counted toward any quorum.
+//
+// Returns nil if id is already absent (idempotent), ErrCannotRemove if it is the
+// last voting member, or ErrConfigChangeInProgress if a prior change has not yet
+// committed. Config changes are not deduplicated across a leadership change, so a
+// change that returns ErrMaybeCommitted may need an idempotent retry (a re-removal
+// of an already-absent member is a no-op).
+func (c *Cluster) RemoveServer(id NodeID) error {
+	return c.withLeader(func(ld *Node) error { return ld.removeServer(id) })
+}
+
+// Config returns the current voting membership as believed by the current leader
+// (or the bootstrap node if none), as a sorted slice of node ids. For inspection
+// and tests.
+func (c *Cluster) Config() []NodeID {
+	nd := c.leaderNode()
+	nd.raftMu.Lock()
+	defer nd.raftMu.Unlock()
+	out := make([]NodeID, 0, len(nd.config))
+	for id, in := range nd.config {
+		if in {
+			out = append(out, id)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
 
 // storePut/storeDelete/storeGet/storeBegin reach the node's store under storeMu
 // (shared), so an in-flight InstallSnapshot swap (exclusive) never tears a read

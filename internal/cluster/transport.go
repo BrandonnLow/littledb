@@ -99,6 +99,13 @@ type Message struct {
 	CandidateID  NodeID
 	LastLogIndex uint64
 	LastLogTerm  uint64
+	// LeaderTransfer marks a RequestVote solicited by a leadership transfer
+	// (Stage 5's TimeoutNow): the target campaigns at the current leader's behest,
+	// so voters bypass the disruption-prevention min-election-timeout rule
+	// (handleRequestVote) that would otherwise ignore a vote request from a server
+	// they believe to be a removed/partitioned disruptor. Ordinary elections leave
+	// it false.
+	LeaderTransfer bool
 
 	// MsgRequestVoteResponse (voter -> candidate):
 	VoteGranted bool

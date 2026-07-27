@@ -60,6 +60,18 @@ func (n *Node) votingPeers() []NodeID {
 	return out
 }
 
+// withinLeaderStickinessLocked reports whether we heard from a current leader too
+// recently to entertain a vote request — within one minimum election timeout. It
+// is the predicate behind disruption prevention (§4.2.3). A zero lastLeaderContact
+// (never heard a leader) or a zero ElectionMin (bare-Node white-box tests) makes
+// it false, so those paths behave exactly as before. Must hold raftMu.
+func (n *Node) withinLeaderStickinessLocked() bool {
+	if n.lastLeaderContact.IsZero() || n.cfg.ElectionMin <= 0 {
+		return false
+	}
+	return time.Since(n.lastLeaderContact) < n.cfg.ElectionMin
+}
+
 func (n *Node) randomElectionTimeout() time.Duration {
 	span := n.cfg.ElectionMax - n.cfg.ElectionMin
 	return n.cfg.ElectionMin + time.Duration(rand.Int63n(int64(span)+1))
@@ -158,6 +170,15 @@ func (n *Node) maybeStartElection() {
 		n.raftMu.Unlock()
 		return
 	}
+	if !n.inConfigLocked() {
+		// We are not a voting member of our own configuration (e.g. we were removed,
+		// or we are a leader that removed itself). Standing for election would let a
+		// removed server win leadership back, so we stay a follower and go quiet. The
+		// min-election-timeout rule (handleRequestVote) is the companion defense for a
+		// removed server that has NOT yet learned it was removed.
+		n.raftMu.Unlock()
+		return
+	}
 	prevTerm, prevRole, prevVote, prevVotes := n.currentTerm, n.role, n.votedFor, n.votesReceived
 	n.currentTerm++
 	n.role = Candidate
@@ -193,6 +214,24 @@ func (n *Node) maybeStartElection() {
 // (Raft §5.4.1). Runs in the inbox goroutine.
 func (n *Node) handleRequestVote(m Message) {
 	n.raftMu.Lock()
+	// Disruption prevention (Raft dissertation §4.2.3). If we heard from a current
+	// leader within the minimum election timeout, a vote request is almost
+	// certainly from a server that has been removed from the configuration — or
+	// partitioned — and is campaigning with an ever-rising term. We IGNORE it
+	// entirely: not merely declining the vote, but declining even to adopt its
+	// (higher) term, so it cannot force the live leader to step down and thrash the
+	// cluster. A leadership-transfer request (Stage 5) carries LeaderTransfer to
+	// bypass this, since the current leader deliberately initiated it. We reply with
+	// our current term (a stale candidate still steps down on it); a higher-term
+	// disruptor simply gets no grant and keeps failing to win.
+	if !m.LeaderTransfer && n.withinLeaderStickinessLocked() {
+		term := n.currentTerm
+		n.raftMu.Unlock()
+		_ = n.transport.Send(m.From, Message{
+			Type: MsgRequestVoteResponse, From: n.id, Term: term, VoteGranted: false,
+		})
+		return
+	}
 	if m.Term > n.currentTerm {
 		n.stepDownLocked(m.Term)
 	}

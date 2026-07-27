@@ -161,17 +161,25 @@ func (n *Node) onAppendRejectLocked(p NodeID, hint uint64) {
 // index N commits everything <= N). The leader's own match is its lastIndex (it
 // holds every entry it appended).
 func (n *Node) maybeAdvanceCommitLocked() {
-	// Over the current voting configuration only: self (its match is its lastIndex,
-	// since it holds every entry it appended) plus each voting peer's matchIndex.
+	// Over the current voting configuration only. Self counts only if it is itself
+	// a voting member — its match is its lastIndex, since it holds every entry it
+	// appended. A leader that removed ITSELF from the configuration still drives
+	// C_new to commitment but is no longer part of the majority that commits it, so
+	// it must not count its own log toward the tally (else it would commit C_new one
+	// ack early, under a majority that does not exist).
 	peers := n.votingPeers()
-	total := len(peers) + 1
-	vals := make([]uint64, 0, total)
-	vals = append(vals, n.log.lastIndex())
+	vals := make([]uint64, 0, len(peers)+1)
+	if n.inConfigLocked() {
+		vals = append(vals, n.log.lastIndex())
+	}
 	for _, p := range peers {
 		vals = append(vals, n.matchIndex[p])
 	}
+	if len(vals) == 0 {
+		return // no voters to form a quorum (degenerate); nothing can commit
+	}
 	sort.Slice(vals, func(i, j int) bool { return vals[i] > vals[j] })
-	cand := vals[total/2] // highest index a majority (incl. leader) holds
+	cand := vals[len(vals)/2] // highest index a strict majority of voters holds
 
 	// cand >= baseIndex whenever term(cand) is evaluated: the guard requires
 	// cand > commitIndex, and commitIndex >= baseIndex always (we only compact
