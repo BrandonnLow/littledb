@@ -93,6 +93,7 @@ func (n *Node) resetElectionTimer() {
 // time out and start a competing election. Must hold raftMu.
 func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
+	n.transferring = false // fresh leadership: not mid-transfer
 	// Ensure a replicator exists for every voting member, including any added since
 	// this node was constructed (its replication state and goroutine may not exist
 	// yet), before initializing their nextIndex/matchIndex.
@@ -122,6 +123,7 @@ func (n *Node) stepDownLocked(term uint64) {
 	n.currentTerm = term
 	n.role = Follower
 	n.votedFor = noVote
+	n.transferring = false // a transfer in progress ends when we cease to lead
 	// Persist the adopted term + reset vote before the node acts on the new
 	// term. A failure here degrades to under-approximation (in-memory term may
 	// exceed the durable term); it never externalizes a vote, only an idempotent
@@ -152,16 +154,19 @@ func (n *Node) electionTimer() {
 			}
 			timer.Reset(n.randomElectionTimeout())
 		case <-timer.C:
-			n.maybeStartElection()
+			n.maybeStartElection(false)
 			timer.Reset(n.randomElectionTimeout())
 		}
 	}
 }
 
 // maybeStartElection becomes a candidate for a new term and solicits votes,
-// unless this node is already the leader. The RequestVotes are sent outside
-// raftMu (Send may block on a slow inbox).
-func (n *Node) maybeStartElection() {
+// unless this node is already the leader. When leaderTransfer is set (a
+// MsgTimeoutNow directed this node to take over), its RequestVotes carry the
+// LeaderTransfer flag so the other voters bypass the disruption-prevention
+// min-election-timeout rule and vote immediately. The RequestVotes are sent
+// outside raftMu (Send may block on a slow inbox).
+func (n *Node) maybeStartElection(leaderTransfer bool) {
 	n.raftMu.Lock()
 	if n.role == Leader {
 		n.raftMu.Unlock()
@@ -208,8 +213,24 @@ func (n *Node) maybeStartElection() {
 		_ = n.transport.Send(p, Message{
 			Type: MsgRequestVote, From: n.id, Term: term,
 			CandidateID: n.id, LastLogIndex: lastIndex, LastLogTerm: lastTerm,
+			LeaderTransfer: leaderTransfer,
 		})
 	}
+}
+
+// handleTimeoutNow is the target side of a leadership transfer: the leader has
+// directed this node to take over, so it campaigns immediately — bypassing its
+// randomized election timer — with LeaderTransfer set on its RequestVotes so the
+// other voters bypass the min-election-timeout rule. A stale directive (below our
+// term) is ignored. Runs in the inbox goroutine.
+func (n *Node) handleTimeoutNow(m Message) {
+	n.raftMu.Lock()
+	stale := m.Term < n.currentTerm
+	n.raftMu.Unlock()
+	if stale {
+		return
+	}
+	n.maybeStartElection(true)
 }
 
 // handleRequestVote is the voter side. It adopts a higher term (stepping

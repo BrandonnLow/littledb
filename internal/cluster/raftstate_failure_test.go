@@ -87,7 +87,7 @@ func TestMaybeStartElectionPersistFailureAborts(t *testing.T) {
 	}
 	n.appliedCond = sync.NewCond(&n.raftMu)
 
-	n.maybeStartElection()
+	n.maybeStartElection(false)
 
 	n.raftMu.Lock()
 	gotTerm, gotRole, gotVote, gotVotes := n.currentTerm, n.role, n.votedFor, n.votesReceived

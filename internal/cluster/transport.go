@@ -44,6 +44,11 @@ const (
 	// is durably installed (MatchIndex = LastIncludedIndex), or a higher Term so
 	// a stale leader steps down.
 	MsgInstallSnapshotResponse
+	// MsgTimeoutNow is a leadership-transfer directive (leader -> a caught-up
+	// target): the target must start an election immediately, bypassing its
+	// randomized election timer. Its RequestVotes carry LeaderTransfer so the
+	// other voters also bypass the disruption-prevention min-election-timeout rule.
+	MsgTimeoutNow
 )
 
 // KVPair is one live key/value pair on the wire in an InstallSnapshot. Keys are
