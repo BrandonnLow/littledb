@@ -51,7 +51,10 @@ type cursorHeap []*heapCursor
 
 func (h cursorHeap) Len() int { return len(h) }
 func (h cursorHeap) Less(i, j int) bool {
-	if c := bytes.Compare(h[i].cur.EncKey(), h[j].cur.EncKey()); c != 0 {
+	// mvcckey.Compare, so the merged stream is ordered userKey-ascending. The
+	// Iterator's per-userKey collapse and the cursors' early exit on the end
+	// bound both depend on that being true.
+	if c := mvcckey.Compare(h[i].cur.EncKey(), h[j].cur.EncKey()); c != 0 {
 		return c < 0
 	}
 	return h[i].priority < h[j].priority

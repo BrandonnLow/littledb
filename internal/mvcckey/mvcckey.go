@@ -15,7 +15,10 @@
 // timestamp ≤ T sorts at exactly that position.
 package mvcckey
 
-import "encoding/binary"
+import (
+	"bytes"
+	"encoding/binary"
+)
 
 // TimestampSize is the fixed byte length of the timestamp suffix.
 const TimestampSize = 8
@@ -27,6 +30,49 @@ func Encode(userKey []byte, timestamp uint64) []byte {
 	copy(enc, userKey)
 	binary.BigEndian.PutUint64(enc[len(userKey):], ^timestamp)
 	return enc
+}
+
+// Compare orders two encoded keys the way this package's encoding intends:
+// userKey ascending, then timestamp descending within a userKey. It returns
+// -1, 0, or +1 like bytes.Compare.
+//
+// It is NOT bytes.Compare over the whole encoded key, and the difference is
+// load-bearing whenever one userKey is a strict prefix of another. Compare the
+// raw bytes of Encode("cat", ts) and Encode("cats", ts):
+//
+//	Encode("cat",  30) = 63 61 74 ff ff ff ff ff ff ff e1
+//	Encode("cats", 30) = 63 61 74 73 ff ff ff ff ff ff ff e1
+//	                              ^^    ^^
+//
+// At the fourth byte, "cat" has run out of userKey and is already into its
+// timestamp suffix — which begins 0xff for any timestamp below 2^56, and 0xff
+// outranks every byte a printable key is likely to hold. So a raw byte
+// comparison sorts "cat" AFTER "cats", inverting the userKey order the rest of
+// the engine assumes.
+//
+// Point lookups tolerated that (every version of a userKey still clustered
+// contiguously, so SeekGE plus a userKey-match check still landed correctly),
+// but range scans did not: keys came back out of order, and a bounded scan
+// could stop early on an out-of-range userKey while an in-range one still lay
+// ahead of it — silently omitting a live key. Splitting the fixed-width suffix
+// off before comparing removes the ambiguity: the userKey portions are compared
+// against each other and never against a neighbour's timestamp bytes.
+//
+// Comparing the suffixes with bytes.Compare gives descending timestamps for
+// free, since the suffix is the big-endian bitwise NOT of the timestamp.
+//
+// A slice too short to carry a suffix cannot be a well-formed encoded key; such
+// inputs fall back to a whole-slice byte comparison so the ordering stays total
+// rather than panicking.
+func Compare(a, b []byte) int {
+	if len(a) < TimestampSize || len(b) < TimestampSize {
+		return bytes.Compare(a, b)
+	}
+	ca, cb := len(a)-TimestampSize, len(b)-TimestampSize
+	if c := bytes.Compare(a[:ca], b[:cb]); c != 0 {
+		return c
+	}
+	return bytes.Compare(a[ca:], b[cb:])
 }
 
 // Decode splits an encoded key back into userKey and timestamp. The

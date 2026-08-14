@@ -41,7 +41,15 @@ type Memtable struct {
 	frozen bool
 }
 
-func New() *Memtable { return &Memtable{sl: skiplist.New()} }
+// New returns an empty memtable. Its skiplist is ordered by mvcckey.Compare,
+// not by raw bytes: the stored keys are MVCC-encoded, and raw byte order gets
+// the userKey order wrong when one userKey is a strict prefix of another (see
+// mvcckey.Compare). Everything downstream — Iterate's flush order, the merge
+// heaps, and the range scans' early exit on the end bound — assumes userKeys
+// come out ascending, so the ordering has to be encoding-aware here.
+func New() *Memtable {
+	return &Memtable{sl: skiplist.NewWithComparator(mvcckey.Compare)}
+}
 
 // Put writes (userKey, value) at timestamp ts. The (userKey, ts) pair
 // is the unique identity of this version; future reads at snapshots

@@ -34,17 +34,40 @@ func (n *Node) Key() []byte { return n.key }
 // callers must not modify it.
 func (n *Node) Value() []byte { return n.value }
 
-// Skiplist is a sorted map from []byte keys to []byte values.
+// Compare is the ordering function over keys: it returns a negative number,
+// zero, or a positive number as a sorts before, equal to, or after b — the
+// bytes.Compare contract. Two keys are the same entry exactly when it returns
+// zero, so the comparator alone defines both order and identity here.
+type Compare func(a, b []byte) int
+
+// Skiplist is a sorted map from []byte keys to []byte values, ordered by a
+// caller-supplied comparator.
 type Skiplist struct {
-	head   *Node // sentinel; head.next[i] is the first node at level i
-	height int   // number of levels currently in use (1..maxHeight)
-	length int   // number of real entries
+	head   *Node   // sentinel; head.next[i] is the first node at level i
+	cmp    Compare // ordering over keys; never nil
+	height int     // number of levels currently in use (1..maxHeight)
+	length int     // number of real entries
 }
 
-// New returns an empty skiplist.
-func New() *Skiplist {
+// New returns an empty skiplist ordered by raw byte comparison.
+func New() *Skiplist { return NewWithComparator(bytes.Compare) }
+
+// NewWithComparator returns an empty skiplist ordered by cmp. A nil cmp falls
+// back to raw byte comparison.
+//
+// The comparator exists because the memtable's keys are not opaque bytes: they
+// are MVCC-encoded (userKey followed by a fixed-width timestamp suffix), and
+// ordering them by raw bytes gets the userKey order wrong whenever one userKey
+// is a strict prefix of another — see mvcckey.Compare. Keeping the ordering a
+// parameter lets the skiplist stay a plain sorted map that knows nothing about
+// MVCC, while the memtable supplies the encoding-aware ordering.
+func NewWithComparator(cmp Compare) *Skiplist {
+	if cmp == nil {
+		cmp = bytes.Compare
+	}
 	return &Skiplist{
 		head:   &Node{next: make([]*Node, maxHeight)},
+		cmp:    cmp,
 		height: 1,
 	}
 }
@@ -61,7 +84,7 @@ func (s *Skiplist) findPredecessors(key []byte) [maxHeight]*Node {
 	var prev [maxHeight]*Node
 	cur := s.head
 	for i := s.height - 1; i >= 0; i-- {
-		for cur.next[i] != nil && bytes.Compare(cur.next[i].key, key) < 0 {
+		for cur.next[i] != nil && s.cmp(cur.next[i].key, key) < 0 {
 			cur = cur.next[i]
 		}
 		prev[i] = cur
@@ -84,8 +107,10 @@ func randomHeight() int {
 func (s *Skiplist) Put(key, value []byte) {
 	prev := s.findPredecessors(key)
 
-	// If the key already exists at level 0, update in place.
-	if cand := prev[0].next[0]; cand != nil && bytes.Equal(cand.key, key) {
+	// If the key already exists at level 0, update in place. Identity is the
+	// comparator's zero, not bytes.Equal, so the structure stays coherent for
+	// any ordering the caller supplies.
+	if cand := prev[0].next[0]; cand != nil && s.cmp(cand.key, key) == 0 {
 		// Allocate a fresh slice so any borrowed references to the old
 		// value remain valid until they're dropped.
 		cand.value = append([]byte(nil), value...)
@@ -122,13 +147,13 @@ func (s *Skiplist) Put(key, value []byte) {
 func (s *Skiplist) Get(key []byte) (value []byte, ok bool) {
 	cur := s.head
 	for i := s.height - 1; i >= 0; i-- {
-		for cur.next[i] != nil && bytes.Compare(cur.next[i].key, key) < 0 {
+		for cur.next[i] != nil && s.cmp(cur.next[i].key, key) < 0 {
 			cur = cur.next[i]
 		}
 	}
 	// cur is now the largest node with key < target (or head if no such).
 	// The first candidate to inspect is cur.next[0].
-	if cand := cur.next[0]; cand != nil && bytes.Equal(cand.key, key) {
+	if cand := cur.next[0]; cand != nil && s.cmp(cand.key, key) == 0 {
 		return cand.value, true
 	}
 	return nil, false
@@ -138,7 +163,7 @@ func (s *Skiplist) Get(key []byte) (value []byte, ok bool) {
 func (s *Skiplist) Delete(key []byte) bool {
 	prev := s.findPredecessors(key)
 	target := prev[0].next[0]
-	if target == nil || !bytes.Equal(target.key, key) {
+	if target == nil || s.cmp(target.key, key) != 0 {
 		return false
 	}
 	for i := 0; i < len(target.next); i++ {
@@ -171,7 +196,7 @@ func (s *Skiplist) Iterate(fn func(key, value []byte) bool) {
 func (s *Skiplist) SeekGE(target []byte) *Node {
 	cur := s.head
 	for i := s.height - 1; i >= 0; i-- {
-		for cur.next[i] != nil && bytes.Compare(cur.next[i].key, target) < 0 {
+		for cur.next[i] != nil && s.cmp(cur.next[i].key, target) < 0 {
 			cur = cur.next[i]
 		}
 	}

@@ -25,7 +25,9 @@ type mergeHeap []mergeEntry
 
 func (h mergeHeap) Len() int { return len(h) }
 func (h mergeHeap) Less(i, j int) bool {
-	if c := bytes.Compare(h[i].encKey, h[j].encKey); c != 0 {
+	// mvcckey.Compare, so the merged output is emitted in the same order the
+	// sstable.Writer enforces and the per-userKey grouping below expects.
+	if c := mvcckey.Compare(h[i].encKey, h[j].encKey); c != 0 {
 		return c < 0
 	}
 	return h[i].sourceIdx < h[j].sourceIdx

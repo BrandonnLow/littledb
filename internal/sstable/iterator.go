@@ -53,7 +53,7 @@ func (r *Reader) NewIterator(start, end []byte) (*Iterator, error) {
 		startTarget = mvcckey.Encode(start, ^uint64(0))
 		n := len(r.index)
 		hi := sort.Search(n, func(i int) bool {
-			return bytes.Compare(r.index[i].firstKey, startTarget) > 0
+			return mvcckey.Compare(r.index[i].firstKey, startTarget) > 0
 		})
 		if hi > 0 {
 			startBlock = hi - 1
@@ -74,7 +74,7 @@ func (r *Reader) NewIterator(start, end []byte) (*Iterator, error) {
 			it.valid = false
 			return it, it.err
 		}
-		if startTarget != nil && bytes.Compare(enc, startTarget) < 0 {
+		if startTarget != nil && mvcckey.Compare(enc, startTarget) < 0 {
 			continue
 		}
 		if !it.inRange(enc) {

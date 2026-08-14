@@ -85,7 +85,10 @@ func (w *Writer) Add(op record.Op, userKey, value []byte, ts uint64) error {
 	}
 	encKey := mvcckey.Encode(userKey, ts)
 	if w.lastEncKey != nil {
-		switch cmp := bytes.Compare(encKey, w.lastEncKey); {
+		// mvcckey.Compare, not bytes.Compare: the sortedness this enforces is the
+		// same sortedness the reader's binary search relies on, so both ends must
+		// agree on what "sorted" means for an encoded key.
+		switch cmp := mvcckey.Compare(encKey, w.lastEncKey); {
 		case cmp == 0:
 			return ErrDuplicate
 		case cmp < 0:
@@ -343,7 +346,7 @@ func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op reco
 	n := len(r.index)
 
 	hi := sort.Search(n, func(i int) bool {
-		return bytes.Compare(r.index[i].firstKey, target) > 0
+		return mvcckey.Compare(r.index[i].firstKey, target) > 0
 	})
 	startBlock := 0
 	if hi > 0 {
@@ -366,7 +369,7 @@ func (r *Reader) GetAsOf(userKey []byte, snapshot uint64) (value []byte, op reco
 			}
 			offset += int64(decN)
 
-			if bytes.Compare(rec.Key, target) < 0 {
+			if mvcckey.Compare(rec.Key, target) < 0 {
 				continue
 			}
 
@@ -402,7 +405,7 @@ func (r *Reader) NewestVersionTS(userKey []byte) (ts uint64, found bool, err err
 	n := len(r.index)
 
 	hi := sort.Search(n, func(i int) bool {
-		return bytes.Compare(r.index[i].firstKey, target) > 0
+		return mvcckey.Compare(r.index[i].firstKey, target) > 0
 	})
 	startBlock := 0
 	if hi > 0 {
@@ -426,7 +429,7 @@ func (r *Reader) NewestVersionTS(userKey []byte) (ts uint64, found bool, err err
 			}
 			offset += int64(decN)
 
-			if bytes.Compare(rec.Key, target) < 0 {
+			if mvcckey.Compare(rec.Key, target) < 0 {
 				continue
 			}
 			recUserKey, recTS, ok := mvcckey.Decode(rec.Key)
