@@ -60,8 +60,7 @@ injection to confirm it stays linearizable before moving on.
   *consistently* in isolation.
 - **Git / commit conventions:**
   - Commit style: lowercase area-prefix subject (e.g. `membership: ...`, `phase7: ...`),
-    a prose body explaining the *why*, and this footer on every commit:
-    `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+    and a prose body explaining the *why*. No co-author/attribution trailers.
   - The user works **directly on `main`** (linear history — no feature branches).
   - **Commit via WSL**, not Windows git, to avoid CRLF/permission issues.
   - **Multi-line commit messages: write them to `.git/CCMSG` and `git commit -F .git/CCMSG`.**
