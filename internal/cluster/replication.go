@@ -208,21 +208,28 @@ func (n *Node) maybeAdvanceCommitLocked() {
 	}
 }
 
-// maybeCompactLocked compacts the Raft log up to lastApplied once the in-memory
-// suffix reaches SnapshotThreshold. It is no longer bounded by the slowest
-// follower's matchIndex: a peer that falls below the new base is caught up via
-// InstallSnapshot (sendLoop switches to a snapshot when its nextIndex enters the
-// compacted prefix), so discarding entries a lagging follower still needs is
-// safe. Runs on every node — the leader (from the replication path) and
-// followers (from the apply loop) — each compacting its own applied prefix. The
-// in-memory compactTo and the file rewrite happen together under raftMu; on a
-// file error the file is unchanged and memory is left uncompacted, so the two
-// stay mirrored. Must hold raftMu.
+// maybeCompactLocked compacts the Raft log up to the store's durable index once
+// the in-memory suffix reaches SnapshotThreshold. The bound is durability, not
+// just application: the Raft log is the store's only write-ahead log, so an
+// entry that is applied but not yet flushed exists on disk only in raft.log, and
+// discarding it would lose it on a crash. (The apply loop flushes the store when
+// that is what holds compaction back — see needsDurabilityFlushLocked.) It is
+// not bounded by the slowest follower's matchIndex: a peer that falls below the
+// new base is caught up via InstallSnapshot (sendLoop switches to a snapshot when
+// its nextIndex enters the compacted prefix), so discarding entries a lagging
+// follower still needs is safe. Runs on every node — the leader (from the
+// replication path) and followers (from the apply loop) — each compacting its
+// own durable prefix. The in-memory compactTo and the file rewrite happen
+// together under raftMu; on a file error the file is unchanged and memory is
+// left uncompacted, so the two stay mirrored. Must hold raftMu.
 func (n *Node) maybeCompactLocked() {
 	if n.cfg.SnapshotThreshold <= 0 || len(n.log.entries) < n.cfg.SnapshotThreshold {
 		return
 	}
 	safe := n.lastApplied
+	if n.durableIndex < safe {
+		safe = n.durableIndex
+	}
 	if safe <= n.log.baseIndex {
 		return
 	}
@@ -251,6 +258,17 @@ func (n *Node) maybeCompactLocked() {
 		}
 	}
 	n.log.compactTo(safe, newBaseTerm)
+}
+
+// needsDurabilityFlushLocked reports whether the store should be flushed so the
+// log can be compacted: at least SnapshotThreshold applied entries are not yet
+// durable in the store's own files. Measuring the applied-but-not-durable span —
+// rather than the log's length — flushes once per SnapshotThreshold applies,
+// even while a follower works through a long committed backlog (where the log
+// stays long however often we flush). Must hold raftMu.
+func (n *Node) needsDurabilityFlushLocked() bool {
+	return n.cfg.SnapshotThreshold > 0 &&
+		n.lastApplied >= n.durableIndex+uint64(n.cfg.SnapshotThreshold)
 }
 
 // configAsOfLocked returns the configuration in effect at log index idx: the

@@ -1516,3 +1516,212 @@ With single-server add and remove, adopt-on-append configuration in the log, dis
 prevention, the learner catch-up, leadership transfer, and configuration-and-sessions
 durability across compaction and snapshots, **Phase 8 is complete**: littledb changes its
 cluster membership online, without downtime and without losing linearizability.
+
+## Phase 9 — One log: the Raft log is the write-ahead log
+
+Through Phase 8 every committed write was made durable twice. Before an entry
+could commit, each node fsynced it to `raft/raft.log`. Then, when the entry
+applied, `ApplyEntry` appended the same records to the store's data WAL, with one
+fsync per record (each data record, then the `OpCommit` marker). A single `Put`
+cost three fsyncs per node; a three-key transaction cost five. The data WAL held
+nothing the Raft log did not: by design it was the same bytes, written again. This
+is the layering mistake the log-structured storage literature warns about —
+stacking two logs that each make a write durable, where one authoritative log would
+do. Phase 9 removes the duplicate: in a replica, the Raft log is the store's only
+write-ahead log.
+
+### Decision: a replica's store keeps no WAL (`db.Options.ExternalLog`)
+
+The cluster opens every replica's store with `ExternalLog` set
+(`replicatedStoreOptions`). In that mode:
+
+- **`ApplyEntry` writes nothing to disk.** It applies to the memtable and the
+  session table only. The entry is already durable in `raft.log`, and stays there,
+  as its only durable copy, until a flush folds it into an SSTable.
+- **A flush is the only point where applied state becomes durable in the store's
+  own files.** It writes the SSTable, then the session table, then `applied.base`,
+  which now records `(appliedIndex, appliedTS)`. `applied.base` is the commit point.
+  `DurableAppliedIndex()` reports how far that reaches.
+- **Recovery is "last flush plus replay".** On open, the store comes back exactly as
+  of its last flush, and `RecoveredAppliedIndex()` is the index in `applied.base`.
+  The node seeds `commitIndex` and `lastApplied` from it, and re-applies the
+  committed entries above it from its own `raft.log` once a commit index covers
+  them.
+- **Applies are strictly ordered.** `ApplyEntry` and `ApplyControlEntry` accept
+  only `appliedIndex+1`, so a skipped or repeated entry is an error, not silent
+  divergence between the store and `lastApplied`.
+- **The standalone engine keeps its WAL.** The REPL and `Txn.Commit`'s single-node
+  path are unchanged. In `ExternalLog` mode that path is refused, because there is
+  no WAL to make it durable; every commit goes through the replication layer.
+- **A replica dir holding a non-empty data WAL is refused** (`ErrUnexpectedWAL`).
+  Such a dir was written by a WAL-mode store, whose unflushed writes are in no
+  replicated log. This is a clean format cut, consistent with how earlier format
+  changes were handled.
+
+What this retires: the applied-index accounting that Phases 6–8 had to keep in
+lockstep, where every committed Raft entry (data, read-index no-op, deduplicated
+retry, configuration change) had to leave exactly one `OpCommit` in the data WAL so
+that recovery could count them (`walBase + OpCommits`). The applied index is now a
+number the store tracks in memory and persists at a flush. Configuration entries no
+longer consume a commit timestamp at all.
+
+### Compaction is bounded by durability, not application
+
+Before, `maybeCompactLocked` compacted up to `lastApplied`, because applied entries
+were already in the data WAL. Without that WAL, an entry that is applied but not
+flushed exists on disk only in `raft.log`. So compaction now stops at
+`min(lastApplied, durableIndex)`.
+
+Small writes rarely fill a 4 MB memtable, so the apply loop also forces the issue:
+once `SnapshotThreshold` applied entries are not yet durable, it calls
+`FlushApplied()` and then compacts. Two details matter:
+
+- **The trigger measures the applied-but-not-durable span, not the log's length.**
+  A follower working through a long committed backlog keeps a long log however
+  often it flushes. Keyed on log length, it would flush after every single apply.
+  Keyed on the span, it flushes once per `SnapshotThreshold` applies.
+- **The node keeps its own copy of the durable index** (`Node.durableIndex`, under
+  `raftMu`), refreshed outside `raftMu` after every apply, flush and install.
+  `maybeCompactLocked` therefore never calls into the store, and the existing rule
+  that `raftMu` and `db.mu` are never held together still holds.
+
+### The flush's commit point, and why this order
+
+A flush writes, in order, the SSTable, the sessions file, then `applied.base`.
+Recovery trusts `applied.base` alone, never an SSTable footer. A crash anywhere
+before the last step leaves the previous flush's index in force, and the node
+replays from there:
+
+- **Crash after the SSTable:** replay re-applies entries whose data the new SSTable
+  already holds. That is harmless: the same keys at the same timestamps. Reads,
+  scans and compaction all collapse duplicate versions, and the replay rebuilds the
+  session table.
+- **Crash after the SSTable and the sessions file:** the session table is already
+  ahead, so replay deduplicates exactly the sessioned entries of that flush. Their
+  data is in the SSTable, which was written first.
+
+Both alternatives fail:
+
+- **Writing the sessions file first:** a crash before the SSTable makes replay
+  deduplicate entries whose data is durable nowhere.
+- **Trusting the footer, as `max(footer, base)` recovery did:** a crash between the
+  SSTable and the sessions file skips replaying entries whose session updates were
+  never recorded. A client retry of one of them would then apply twice.
+
+`TestRecoveryReplaysFromAppliedBase` rewinds to both crash points and checks that
+replay converges to the clean-run state.
+
+Writing this down exposed a window in the old two-log flush. It removed the WAL, and
+with it the `OpCommit` markers that carried the flushed entries' session state,
+before writing the sessions file. A crash in between forgot those sessions. The new
+order closes it.
+
+`applied.base` records a timestamp as well as an index because the SSTable footers
+record only data timestamps. A read-index no-op consumes a commit timestamp but
+leaves no data behind. Without the persisted timestamp, a node restarted after a
+flush could hand out a timestamp it had already used. The same field fixes an edge
+`BuildSnapshotDB` documented as benign: a snapshot with zero live keys used to reset
+the follower's next timestamp to 1.
+
+### A leader must apply its whole log before preparing (the lost-write hazard)
+
+Before, a restarted node's store held everything it had applied, because its WAL
+replayed on open. Now it holds everything up to its last flush. Up to a memtable's
+worth of committed entries sits only in `raft.log` until a commit index covers them
+again. A node can win an election in that state, because the vote rule (§5.4.1)
+looks at the log, not the state machine. And `PrepareCommit` reads only applied
+state:
+
+- its first-committer-wins check cannot see the unapplied writes, and
+- its commit-timestamp counter is behind the timestamps already in the log.
+
+So an overwrite gets a *lower* timestamp than the versions it replaces and is
+shadowed by them: acknowledged to the client, then lost. This is not hypothetical.
+With the fix disabled, `TestRestartedLeaderDoesNotLoseOverwrite` reads back the old
+value `"v4"` after `"after"` was acknowledged, in 3 runs out of 3. The same hazard
+existed before in a narrow form: a new leader could lag by the one or two entries
+whose commit had not yet reached it. There the new timestamp typically collided with
+an existing one rather than falling below it, and the skiplist's update-in-place let
+the newer write win a blind overwrite. With the store reset to its last flush, the
+window spans everything since that flush. The barrier below closes both.
+
+The fix is Raft §8's rule that a leader commits an entry of its own term before
+serving:
+
+- **`catchUpLocked` in the commit path.** Under `commitMu`, if `lastApplied <
+  lastIndex` the leader commits a no-op (the same `proposeNoopLocked` the read-index
+  barrier uses) and waits until it has applied it. That means everything before it
+  is applied. `PrepareCommit` then sees the full state. In the steady state this is
+  a cheap check that proposes nothing, because every commit already waits for its
+  own apply.
+- **Blind writes catch up before they begin.** `storePut` and `storeDelete` run the
+  catch-up before `Begin`, so the write's read snapshot already includes the
+  entries the leader had merely not applied. Otherwise the commit-time catch-up
+  would surface them as conflicts against a stale snapshot.
+- **A term-start no-op when there is an unapplied tail.** `becomeLeaderLocked`
+  starts the same catch-up immediately. Without it, a cluster restarted with no
+  traffic would leave every store at its last flush indefinitely, since nothing
+  commits in the new term until a client asks. It fires only when the new leader
+  holds unapplied entries. The bootstrap leader and the happy path propose nothing,
+  so their log indices are unchanged; keeping them unchanged was the Phase 6 reason
+  for making the read-index no-op lazy.
+
+### Alternatives considered
+
+- **Persist the commit index** (etcd's `HardState.Commit`), so a restarted node can
+  re-apply its log without waiting for a leader. This costs another durable write as
+  the commit index advances, or a frame-format change to piggyback it. It does not
+  remove the need for the catch-up barrier, because a new leader still holds
+  entries whose commit it never learned. Deferred.
+- **Keep the data WAL but group-commit it.** That reduces the number of fsyncs, but
+  every byte is still written twice and the duplicate layer stays.
+- **Keep the Raft log inside the LSM**, so one engine WAL covers both. This is a
+  much larger change, and the Raft log's access pattern (append, truncate a suffix,
+  drop a prefix by index) is not a key-value workload.
+- **Migrate old replica dirs** by replaying the old WAL, flushing and deleting it.
+  The migration has crash windows of its own, around the old WAL's removal and the
+  footer-based index, and there are no deployed dirs to migrate. A loud refusal is
+  simpler and honest.
+
+### Results and validation
+
+- **Fsyncs per committed entry, per node: one.** That is the `raft.log` append. It
+  was three for a single-key write, five for a three-key transaction, and two for a
+  read-index no-op or a configuration change. Flushes add a handful of small fsyncs
+  once per `SnapshotThreshold` applies.
+- **Measured:** `BenchmarkClusterPut` (3 in-process nodes, `SyncOnWrite`, Apple M5,
+  APFS, where Go's `Sync` is a full `F_FULLFSYNC`) went from about 31.8 ms to about
+  10.7 ms per replicated write, roughly 3× (about 31 to about 94 writes/s). The
+  cluster test package under `-race` dropped from about 70 s to about 45 s on the
+  same machine.
+- **Tests.** New or rewritten:
+  - `TestRaftLogIsTheOnlyLog`: no data WAL exists, and `raft.log` is byte-identical
+    across nodes.
+  - `TestRestartedFollowerReplaysRaftLog`: an empty store converges by replaying
+    its own log, with no snapshot.
+  - `TestClusterFullRestartPreservesData`: converges with no client traffic, via
+    the term-start no-op.
+  - `TestRestartedLeaderDoesNotLoseOverwrite`: the lost-write pin.
+  - `TestClusterFlushBeforeRestart`: a durable prefix plus a replayed suffix.
+  - `TestCompactionStopsAtDurableIndex` and `TestCompactionBoundedByDurableIndex`.
+  - At the db layer: the crash-window replay test, the ordering and mode contract,
+    an empty-memtable flush, and the refusal of a stray WAL.
+
+  The Phase 5–8 soaks (linearizability under partitions and crashes, the
+  exactly-once counter, membership churn with snapshots) pass unchanged against the
+  single-log store. The checker is still the oracle.
+
+### What this supersedes
+
+- **Phase 4, "Durable Raft log and commit-bounded recovery":** recovery is no longer
+  "the data WAL holds exactly the applied entries". It is now "the store holds
+  exactly the last flush; the Raft log holds the rest".
+- **Phase 4, "Log compaction and InstallSnapshot":** compaction stops at the
+  durable index, not `lastApplied`. `InstallSnapshot` is unchanged. The staged
+  store it builds is fully flushed, so its durable index equals the snapshot base.
+- **Phases 6–8, "one `OpCommit` per committed entry":** retired. No-ops,
+  deduplicated retries and configuration entries now only advance the applied
+  index.
+- **Phase 7, "Durability across a flush":** the session table survives through the
+  sessions file plus Raft-log replay, and the flush order above fixes the window the
+  old order left open.

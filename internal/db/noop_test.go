@@ -3,17 +3,15 @@ package db
 import "testing"
 
 // TestPrepareNoopAppliesAndRecovers pins the no-op log entry used by the
-// read-index prerequisite: it must apply as a genuine no-op (advancing the
-// applied index, changing no key) and its lone OpCommit must be counted by
-// recovery, so the reconstructed applied index stays in lockstep with the Raft
-// index across a restart. If recovery miscounted a no-op, a restarted node would
-// re-drive a real entry — the duplicate-apply hazard the applied watermark exists
-// to prevent.
+// read-index and catch-up barriers: it must apply as a genuine no-op (advancing
+// the applied index, changing no key), and — although it leaves no data behind —
+// a flush must record its timestamp, so the commit-timestamp counter never moves
+// backwards across a restart. Recovering only the data's max timestamp (the
+// SSTable footers) would let a restarted leader hand out the no-op's timestamp
+// again.
 func TestPrepareNoopAppliesAndRecovers(t *testing.T) {
 	dir := t.TempDir()
-	opts := DefaultOptions()
-	opts.SyncOnWrite = false
-	opts.DisableBackgroundCompaction = true
+	opts := replicaOpts()
 
 	db, err := OpenWith(dir, opts)
 	if err != nil {
@@ -51,20 +49,26 @@ func TestPrepareNoopAppliesAndRecovers(t *testing.T) {
 	if got, err := db.Get([]byte("k")); err != nil || string(got) != "v" {
 		t.Fatalf("Get(k) after no-op = (%q,%v), want v (no-op must change no key)", got, err)
 	}
+	if err := db.FlushApplied(); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Recovery must count the no-op's OpCommit: applied index survives as 2.
 	db2, err := OpenWith(dir, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db2.Close()
 	if ra := db2.RecoveredAppliedIndex(); ra != 2 {
-		t.Fatalf("recovered applied index = %d, want 2 (no-op OpCommit must be counted)", ra)
+		t.Fatalf("recovered applied index = %d, want 2", ra)
 	}
 	if got, err := db2.Get([]byte("k")); err != nil || string(got) != "v" {
 		t.Fatalf("after restart Get(k) = (%q,%v), want v", got, err)
+	}
+	if next := db2.NextTimestampForTesting(); next <= noopTS {
+		t.Fatalf("nextTimestamp after restart = %d, want > no-op ts %d (only the data's ts %d is in an SSTable)",
+			next, noopTS, writeTS)
 	}
 }

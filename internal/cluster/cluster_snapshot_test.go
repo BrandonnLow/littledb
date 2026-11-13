@@ -190,3 +190,78 @@ func TestLeadershipChangeAfterCompaction(t *testing.T) {
 		}
 	}
 }
+
+// TestCompactionStopsAtDurableIndex pins the compaction bound in isolation. With
+// the Raft log as the store's only write-ahead log, an entry that is applied but
+// not yet flushed exists on disk nowhere but raft.log, so compaction must stop
+// at the store's durable index even when more has been applied.
+func TestCompactionStopsAtDurableIndex(t *testing.T) {
+	l := NewRaftLog()
+	for i := 0; i < 6; i++ {
+		l.append(1, EntryData, []byte(fmt.Sprintf("d%d", i)))
+	}
+	n := &Node{
+		log:          l,
+		cfg:          Config{SnapshotThreshold: 1},
+		lastApplied:  5,
+		durableIndex: 3, // 4 and 5 are applied but live only in the memtable
+	}
+	n.raftMu.Lock()
+	n.maybeCompactLocked()
+	n.raftMu.Unlock()
+	if n.log.baseIndex != 3 {
+		t.Fatalf("compacted to base %d, want 3 (the durable index, not lastApplied 5)", n.log.baseIndex)
+	}
+	if got := n.log.lastIndex(); got != 6 {
+		t.Fatalf("lastIndex = %d after compaction, want 6", got)
+	}
+}
+
+// TestCompactionBoundedByDurableIndex is the cluster-level counterpart. Small
+// writes never fill a 4 MB memtable, so with SnapshotThreshold set the nodes
+// compact only because the apply loop flushes their stores once enough applied
+// entries are not yet durable. On every node the log base must sit at or below
+// the store's durable index, and a restart — every store back exactly at its
+// last flush, everything after it replayed from raft.log — must find every entry
+// it needs and converge.
+func TestCompactionBoundedByDurableIndex(t *testing.T) {
+	const n = 3
+	ds := dirs(t, n)
+	cfg := electionConfig()
+	cfg.SnapshotThreshold = 4
+	opts := snapshotOpts()
+
+	c, err := NewWithTransportConfig(n, ds, opts, NewChannelTransport(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{}
+	for i := 0; i < 11; i++ {
+		k, v := fmt.Sprintf("k%02d", i), fmt.Sprintf("v%02d", i)
+		if err := c.Put([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		want[k] = v
+	}
+	if err := c.Quiesce(2 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		nd := c.Node(i)
+		waitFor(t, 3*time.Second, func() bool { return nd.baseIndexValue() > 0 })
+		base, durable := nd.baseIndexValue(), nd.DB().DurableAppliedIndex()
+		if base > durable {
+			t.Fatalf("node %d compacted to base %d past its durable index %d", i, base, durable)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := NewWithTransportConfig(n, ds, opts, NewChannelTransport(), cfg)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	defer c2.Close()
+	waitFor(t, 5*time.Second, func() bool { return allNodesHave(c2, want) })
+}

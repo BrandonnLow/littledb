@@ -93,17 +93,24 @@ injection to confirm it stays linearizable before moving on.
 
 ## 3. Architecture map — the seams you'll touch
 
-**`internal/db`** (the state machine). Key entry points the cluster drives:
+**`internal/db`** (the state machine). Replicas open it with `Options.ExternalLog`: the
+Raft log is its only write-ahead log (no data WAL; see DESIGN.md Phase 9). Key entry
+points the cluster drives:
 - `PrepareCommit(txn) -> (entry, commitTS, err)` — conflict-check + allocate ts + build
   the encoded entry (data records + `OpCommit`). Also does **session dedup** (returns a
-  nil entry for a duplicate) — under `db.mu`, consistent with the memtable.
-- `ApplyEntry(idx, entry)` — the ONLY path a committed write reaches the data WAL;
-  dedups a duplicate to a no-op. Keeps applied-index accounting in lockstep.
-- `ApplyControlEntry(idx)` — applies a **non-data** entry (config change) as a no-op:
-  writes one bare `OpCommit` to keep the applied-index count in lockstep, changes no key.
-- `PrepareNoop()` — a bare-`OpCommit` entry for the read-index barrier.
+  nil entry for a duplicate) — under `db.mu`, consistent with the memtable. The caller
+  must have applied its whole log first (the cluster's catch-up barrier).
+- `ApplyEntry(idx, entry)` — memtable + session table only, nothing to disk; accepts only
+  `appliedIndex+1`; dedups a duplicate to a no-op that still advances the index.
+- `ApplyControlEntry(idx)` — applies a **non-data** entry (config change) as a no-op that
+  advances the applied index.
+- `PrepareNoop()` — a bare-`OpCommit` entry for the read-index and catch-up barriers.
+- `FlushApplied()` / `DurableAppliedIndex()` — a flush (SSTable → sessions →
+  `applied.base`, the commit point) is the only thing that makes applied state durable
+  in the store; the Raft log may be compacted only up to `DurableAppliedIndex()`.
 - Session table (`map[session]uint64`) updated in `ApplyEntry`; persisted to a `sessions`
-  file at flush; reconstructed on Open. `SetCommitOverride`, `RecoveredAppliedIndex`.
+  file at flush; on Open the store comes back exactly as of its last flush
+  (`RecoveredAppliedIndex`) and the node replays raft.log from there. `SetCommitOverride`.
 
 **`internal/cluster`** (Raft):
 - `Node` — one replica. Holds `config` (current voting set), `baseConfig`, `configPath`,
@@ -111,13 +118,20 @@ injection to confirm it stays linearizable before moving on.
   plus per-peer `nextIndex/matchIndex/respCh/replSignal` maps and one `replicateTo`
   goroutine per peer.
 - `buildNode(...)` — constructs (not starts) a node; used by `New*` AND crash-rebuild.
-  Reconstructs Raft state from disk (log, hard state, applied watermark, **config**).
+  Reconstructs Raft state from disk (log, hard state, the store's last-flush index,
+  **config**); opens the store with `replicatedStoreOptions` (ExternalLog).
 - `proposeAndAwait(term, kind, entry)` — shared core of client commit / read barrier /
   (future) config change: append at `term`, replicate, wait for the leader's own apply.
   Adopts config on append when `kind == EntryConfig`.
 - `commit(txn)` (the commit override), `readBarrier()`, `commitSessioned(...)`.
+  `catchUpLocked(term)` runs first in `commit` (and via `catchUp` in `storePut`/
+  `storeDelete`): a leader whose `lastApplied < lastIndex` commits a no-op and applies
+  its whole log before preparing anything; `becomeLeaderLocked` starts the same no-op
+  when a new leader has an unapplied tail (Raft §8).
 - Apply loop (`applyCommitted`) — routes `EntryData -> ApplyEntry`, `EntryConfig ->
-  ApplyControlEntry`.
+  ApplyControlEntry`; mirrors the store's durable index into `Node.durableIndex` and
+  calls `FlushApplied` once `SnapshotThreshold` applied entries are not yet durable.
+  `maybeCompactLocked` compacts only up to `min(lastApplied, durableIndex)`.
 - Quorum from config: `majority()`, `votingPeers()`, `maybeAdvanceCommitLocked()` all
   derive from `config` (nil `config` falls back to `peers` for bare-Node tests).
 - Config machinery in **`config.go`**: `encodeConfig/decodeConfig`, `readBaseConfigFile/

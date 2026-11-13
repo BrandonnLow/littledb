@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,7 +13,13 @@ import (
 
 const walFile = "littledb.log"
 
-func TestClusterFollowerWALByteIdentical(t *testing.T) {
+// TestRaftLogIsTheOnlyLog pins the single-log design: a replica's store keeps no
+// data WAL, so a committed write is made durable exactly once — by the raft.log
+// append before it commits — and nothing applied since the last flush is durable
+// anywhere else (DurableAppliedIndex stays 0 with no flush). Every node logs the
+// same entries in the same order, so with a stable leader the one log is
+// byte-for-byte identical across nodes.
+func TestRaftLogIsTheOnlyLog(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
 	c, err := NewWithTransportConfig(n, ds, testOpts(), NewChannelTransport(), stableConfig())
@@ -29,67 +36,80 @@ func TestClusterFollowerWALByteIdentical(t *testing.T) {
 	tx := c.Begin()
 	tx.Put([]byte("a"), []byte("1"))
 	tx.Put([]byte("b"), []byte("2"))
-	tx.Commit()
-	c.Delete([]byte("a"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete([]byte("a")); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Quiesce(time.Second); err != nil {
 		t.Fatal(err)
 	}
 
-	// Each node writes data+OpCommit per txn to its data WAL when it APPLIES the
-	// entry (leader after quorum, followers on leaderCommit). Every node applies
-	// the same committed entries in the same order, so with no flush the whole
-	// data WAL must be byte-for-byte identical across nodes.
-	leaderLog, err := os.ReadFile(filepath.Join(ds[int(c.Leader())], walFile))
+	leaderLog, err := os.ReadFile(filepath.Join(ds[int(c.Leader())], "raft", raftLogFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(leaderLog) == 0 {
-		t.Fatal("leader WAL is empty")
-	}
 	for i := 0; i < n; i++ {
-		log, err := os.ReadFile(filepath.Join(ds[i], walFile))
+		if _, err := os.Stat(filepath.Join(ds[i], walFile)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("node %d has a data WAL (stat err=%v); the Raft log should be its only log", i, err)
+		}
+		if got := c.Node(i).DB().DurableAppliedIndex(); got != 0 {
+			t.Errorf("node %d DurableAppliedIndex = %d, want 0 (nothing flushed: raft.log is the only durable copy)", i, got)
+		}
+		log, err := os.ReadFile(filepath.Join(ds[i], "raft", raftLogFileName))
 		if err != nil {
 			t.Fatalf("node %d: %v", i, err)
 		}
 		if !bytes.Equal(log, leaderLog) {
-			t.Errorf("node %d WAL differs from leader (%d vs %d bytes)", i, len(log), len(leaderLog))
+			t.Errorf("node %d raft.log differs from leader's (%d vs %d bytes)", i, len(log), len(leaderLog))
 		}
 	}
 }
 
-func TestClusterNodeRecoversFromDisk(t *testing.T) {
+// TestRestartedFollowerReplaysRaftLog crashes and restarts a follower whose store
+// never flushed. Its store comes back empty (recovered applied index 0) — there
+// is no data WAL to replay — yet it must converge to every committed key, by
+// re-applying its own raft.log once the leader's next heartbeat tells it the
+// commit index. No InstallSnapshot is involved: the follower's own log suffices.
+func TestRestartedFollowerReplaysRaftLog(t *testing.T) {
 	const n = 3
 	ds := dirs(t, n)
-	c, err := NewWithTransportConfig(n, ds, db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true}, NewChannelTransport(), stableConfig())
+	opts := db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true}
+	cfg := stableConfig() // node 0 stays leader; the restart needs no election
+	c, err := NewWithTransportConfig(n, ds, opts, NewChannelTransport(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer c.Close()
 
-	for _, kv := range []struct{ k, v string }{{"a", "1"}, {"b", "2"}, {"c", "3"}} {
-		if err := c.Put([]byte(kv.k), []byte(kv.v)); err != nil {
+	want := map[string]string{"a": "1", "b": "2", "c": "3"}
+	for k, v := range want {
+		if err := c.Put([]byte(k), []byte(v)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := c.Quiesce(time.Second); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Close(); err != nil {
+
+	const follower = 1
+	if err := crashRestart(c, follower, opts, cfg); err != nil {
 		t.Fatal(err)
 	}
-
-	// Reopen each node's directory as a plain DB and confirm the replicated
-	// state survived: each follower replayed the entries its WAL received.
-	for i := 0; i < n; i++ {
-		d, err := db.Open(ds[i])
-		if err != nil {
-			t.Fatalf("reopen node %d: %v", i, err)
-		}
-		for _, kv := range []struct{ k, v string }{{"a", "1"}, {"b", "2"}, {"c", "3"}} {
-			got, err := d.Get([]byte(kv.k))
-			if err != nil || string(got) != kv.v {
-				t.Errorf("node %d after reopen: %s=(%q,%v), want %q", i, kv.k, got, err, kv.v)
+	nd := c.Node(follower)
+	if got := nd.DB().RecoveredAppliedIndex(); got != 0 {
+		t.Fatalf("restarted follower recovered applied index %d, want 0 (nothing was flushed)", got)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		for k, v := range want {
+			if got, err := nd.DB().Get([]byte(k)); err != nil || string(got) != v {
+				return false
 			}
 		}
-		d.Close()
+		return true
+	})
+	if got := nd.InstallsForTesting(); got != 0 {
+		t.Fatalf("restarted follower needed %d snapshot installs, want 0 (its own raft.log has the entries)", got)
 	}
 }

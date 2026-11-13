@@ -78,12 +78,13 @@ func TestCompactionFoldsConfig(t *testing.T) {
 
 	base := map[NodeID]bool{0: true, 1: true, 2: true, 3: true}
 	n := &Node{
-		log:         l,
-		baseConfig:  copyConfig(base),
-		config:      map[NodeID]bool{0: true, 1: true},
-		configPath:  configPath,
-		cfg:         Config{SnapshotThreshold: 1}, // compact whenever asked
-		lastApplied: 4,                            // discard through index 4 (the {0,1} entry)
+		log:          l,
+		baseConfig:   copyConfig(base),
+		config:       map[NodeID]bool{0: true, 1: true},
+		configPath:   configPath,
+		cfg:          Config{SnapshotThreshold: 1}, // compact whenever asked
+		lastApplied:  4,                            // discard through index 4 (the {0,1} entry)
+		durableIndex: 4,                            // ...which the store has flushed
 	}
 	n.raftMu.Lock()
 	n.maybeCompactLocked()
@@ -113,17 +114,21 @@ func TestCompactionNoConfigLeavesBase(t *testing.T) {
 
 	base := map[NodeID]bool{0: true, 1: true, 2: true}
 	n := &Node{
-		log:         l,
-		baseConfig:  copyConfig(base),
-		config:      copyConfig(base),
-		configPath:  configPath,
-		cfg:         Config{SnapshotThreshold: 1},
-		lastApplied: 2,
+		log:          l,
+		baseConfig:   copyConfig(base),
+		config:       copyConfig(base),
+		configPath:   configPath,
+		cfg:          Config{SnapshotThreshold: 1},
+		lastApplied:  2,
+		durableIndex: 2,
 	}
 	n.raftMu.Lock()
 	n.maybeCompactLocked()
 	n.raftMu.Unlock()
 
+	if n.log.baseIndex != 2 {
+		t.Fatalf("log baseIndex = %d, want 2 (the compaction under test did not run)", n.log.baseIndex)
+	}
 	if !configEqual(n.baseConfig, base) {
 		t.Fatalf("baseConfig changed without a compacted config entry: %v", n.baseConfig)
 	}

@@ -86,9 +86,12 @@ type Config struct {
 	ElectionMin time.Duration
 	ElectionMax time.Duration
 	Heartbeat   time.Duration
-	// SnapshotThreshold is the in-memory Raft-log entry count above which the
-	// leader compacts (leader-only, bounded by the slowest follower's
-	// matchIndex). <= 0 disables compaction.
+	// SnapshotThreshold drives log compaction on every node. Once this many
+	// applied entries are not yet durable in the store's own files, the node
+	// flushes its store (making them durable), and once the in-memory log holds
+	// this many entries it compacts up to the store's durable index. The Raft log
+	// is the store's only write-ahead log, so it can never be compacted past what
+	// the store has flushed. <= 0 disables both.
 	SnapshotThreshold int
 }
 
@@ -130,7 +133,7 @@ type Node struct {
 	wg    sync.WaitGroup
 
 	// Raft state, guarded by raftMu. raftMu and the store's db.mu are never
-	// held simultaneously: applies and WAL appends happen outside raftMu.
+	// held simultaneously: applies and store flushes happen outside raftMu.
 	raftMu      sync.Mutex
 	role        Role
 	currentTerm uint64
@@ -163,6 +166,14 @@ type Node struct {
 	commitIndex uint64
 	lastApplied uint64
 	appliedCond *sync.Cond // broadcast when lastApplied advances or we step down
+
+	// durableIndex mirrors the store's DurableAppliedIndex: the highest applied
+	// entry whose effects the store has flushed to its own files. The Raft log is
+	// the store's only write-ahead log, so entries above durableIndex exist on
+	// disk nowhere but raft.log, and compaction must stop here. Copied from the
+	// store (outside raftMu) whenever it can change — after an apply, a flush, or
+	// an install — so maybeCompactLocked never has to call into the store.
+	durableIndex uint64
 
 	// lastLeaderContact is the wall-clock time of the last AppendEntries /
 	// InstallSnapshot accepted from a current-term leader. It drives disruption
@@ -370,8 +381,8 @@ func (n *Node) handleAppendEntries(m Message) {
 	// append/truncate fsync eagerly, so an entry is durable before the commit
 	// index can advance over it and apply it. Truncation only removes UNCOMMITTED
 	// (unapplied) entries: §5.4.1's up-to-date vote rule keeps every committed
-	// entry in every future leader's log, so it never loses a conflict; the data
-	// WAL is untouched, holding only applied entries that never truncate.
+	// entry in every future leader's log, so it never loses a conflict — which
+	// matters doubly now that this log is the store's only write-ahead log.
 	configTouched := false // a config entry was appended or truncated -> re-derive
 	for i, e := range m.Entries {
 		idx := m.PrevLogIndex + uint64(i) + 1
@@ -470,8 +481,9 @@ func (n *Node) applyCommitted() {
 
 		// A config entry carries no transaction: the Raft layer already adopted it
 		// on append, so applying it is a control no-op at the state machine — it
-		// writes a bare marker to keep the applied-index accounting (one per Raft
-		// entry) in lockstep, and changes no key. A data entry applies normally.
+		// only advances the store's applied index. A data entry applies normally.
+		// Either way the store writes nothing to disk: raft.log, already fsynced,
+		// is the durable copy.
 		var err error
 		if kind == EntryConfig {
 			err = n.store.ApplyControlEntry(idx)
@@ -482,25 +494,46 @@ func (n *Node) applyCommitted() {
 			n.storeMu.RUnlock()
 			panic(fmt.Sprintf("cluster: node %d apply entry %d: %v", n.id, idx, err))
 		}
+		// An apply that fills the memtable flushes it, advancing the durable index.
+		durable := n.store.DurableAppliedIndex()
 
 		n.raftMu.Lock()
 		n.lastApplied = idx
+		n.durableIndex = durable
 		n.appliedCond.Broadcast()
+		needFlush := n.needsDurabilityFlushLocked()
 		// Followers self-compact once their applied suffix is long enough; safe
 		// now that a far-behind peer is caught up via InstallSnapshot rather than
 		// AppendEntries. The leader compacts on the replication path too; this
 		// call is harmless there (it recomputes the same safe point).
 		n.maybeCompactLocked()
 		n.raftMu.Unlock()
+
+		if needFlush {
+			// Compaction is blocked on durability: flush the store so the applied
+			// prefix lives in SSTables, then compact the log up to it. Outside
+			// raftMu (the flush takes db.mu), under the storeMu read lock we hold.
+			if err := n.store.FlushApplied(); err != nil {
+				n.storeMu.RUnlock()
+				// As with an apply failure: in-memory state may no longer match what
+				// is durable, and a restart re-applies from raft.log correctly.
+				panic(fmt.Sprintf("cluster: node %d flush store at applied index %d: %v", n.id, idx, err))
+			}
+			durable = n.store.DurableAppliedIndex()
+			n.raftMu.Lock()
+			n.durableIndex = durable
+			n.maybeCompactLocked()
+			n.raftMu.Unlock()
+		}
 		n.storeMu.RUnlock()
 	}
 }
 
 // commit is the leader's commitOverride (installed on every node, so a write
 // to a non-leader fails cleanly rather than taking the single-node path). It
-// prepares the txn, then replicates and applies the entry via proposeAndAwait.
-// It returns ErrNotLeader if this node is not the leader or stepped down before
-// the entry committed.
+// brings the leader's state machine level with its log, prepares the txn, then
+// replicates and applies the entry via proposeAndAwait. It returns ErrNotLeader
+// if this node is not the leader or stepped down before the entry committed.
 func (n *Node) commit(t *db.Txn) error {
 	n.commitMu.Lock()
 	defer n.commitMu.Unlock()
@@ -512,6 +545,15 @@ func (n *Node) commit(t *db.Txn) error {
 	}
 	term := n.currentTerm
 	n.raftMu.Unlock()
+
+	// PrepareCommit checks conflicts against, and allocates the commit timestamp
+	// from, APPLIED state. Every entry already in our log will be ordered before
+	// this one, so all of them must be applied first — or a conflict with one could
+	// be missed, and the new write could get a timestamp below one already
+	// committed and be shadowed by it (a lost write).
+	if err := n.catchUpLocked(term); err != nil {
+		return err
+	}
 
 	n.storeMu.RLock()
 	entry, _, err := n.store.PrepareCommit(t)
@@ -551,6 +593,14 @@ func (n *Node) readBarrier() error {
 	term := n.currentTerm
 	n.raftMu.Unlock()
 
+	return n.proposeNoopLocked(term)
+}
+
+// proposeNoopLocked drives a no-op entry, created in `term`, through the
+// quorum-commit path and waits until this leader has applied it. Applying it
+// means every entry before it is applied too, so it is both the read-index
+// barrier and the catch-up barrier. Caller holds commitMu.
+func (n *Node) proposeNoopLocked(term uint64) error {
 	n.storeMu.RLock()
 	entry, _, err := n.store.PrepareNoop()
 	n.storeMu.RUnlock()
@@ -558,8 +608,8 @@ func (n *Node) readBarrier() error {
 		return err
 	}
 	// A no-op that "maybe committed" is irrelevant — it changes nothing — but it
-	// means we lost leadership before confirming, so the read did not clear the
-	// barrier here. Report ErrNotLeader so the caller cleanly redirects.
+	// means we lost leadership before confirming, so the barrier was not cleared
+	// here. Report ErrNotLeader so the caller cleanly redirects.
 	if err := n.proposeAndAwait(term, EntryData, entry); err != nil {
 		if errors.Is(err, ErrMaybeCommitted) {
 			return ErrNotLeader
@@ -567,6 +617,67 @@ func (n *Node) readBarrier() error {
 		return err
 	}
 	return nil
+}
+
+// catchUpLocked makes this leader's state machine level with its own log before
+// it prepares anything against it. A newly elected leader may hold entries it has
+// not applied: entries a previous leader committed that we had not yet been told
+// about, and — because the Raft log is the store's only write-ahead log — after a
+// restart, every entry since the store's last flush. Raft's rule (§5.4.2) is that
+// such prior-term entries commit only beneath an entry of the leader's own term,
+// so if we lag we commit a no-op (Raft §8) and wait until it, and therefore
+// everything before it, is applied. When we are already level — the steady
+// state, since every commit waits for its own apply — this is a cheap check that
+// proposes nothing. Caller holds commitMu (so nothing else appends on this leader
+// meanwhile).
+func (n *Node) catchUpLocked(term uint64) error {
+	n.raftMu.Lock()
+	if n.role != Leader || n.currentTerm != term {
+		n.raftMu.Unlock()
+		return ErrNotLeader
+	}
+	lagging := n.lastApplied < n.log.lastIndex()
+	n.raftMu.Unlock()
+	if !lagging {
+		return nil
+	}
+	return n.proposeNoopLocked(term)
+}
+
+// catchUp is catchUpLocked for callers that do not hold commitMu. A blind write
+// (storePut/storeDelete) runs it before beginning its transaction, so the
+// transaction's read snapshot already includes every entry the leader had merely
+// not applied yet — otherwise the commit-time catch-up would surface those
+// entries as conflicts with a snapshot taken before them. A non-leader is not an
+// error here: the write itself reports ErrNotLeader.
+func (n *Node) catchUp() error {
+	n.commitMu.Lock()
+	defer n.commitMu.Unlock()
+	n.raftMu.Lock()
+	if n.role != Leader {
+		n.raftMu.Unlock()
+		return nil
+	}
+	term := n.currentTerm
+	n.raftMu.Unlock()
+	return n.catchUpLocked(term)
+}
+
+// commitTermStartNoop runs the catch-up barrier as soon as this node becomes
+// leader of `term` with an unapplied tail (see becomeLeaderLocked), rather than
+// waiting for the first client request. Without it, a cluster that restarts with
+// no new traffic would leave every node's state machine at its last flush, since
+// a restarted node re-applies its log only once a leader commits in its own
+// term. Errors are dropped: if we lost leadership, the next leader does the same.
+func (n *Node) commitTermStartNoop(term uint64) {
+	select {
+	case <-n.quit:
+		return
+	default:
+	}
+	n.commitMu.Lock()
+	defer n.commitMu.Unlock()
+	_ = n.catchUpLocked(term)
 }
 
 // proposeAndAwait appends entry (created in `term`) to the leader's log,
@@ -987,6 +1098,15 @@ func NewWithTransportConfig(n int, dirs []string, opts db.Options, tr Transport,
 	return c, nil
 }
 
+// replicatedStoreOptions returns opts configured for a replica's store: the Raft
+// log is its write-ahead log (db.Options.ExternalLog), so the store keeps no data
+// WAL of its own. Every committed write is then made durable exactly once — by
+// the raft.log append that precedes its commit — instead of again by the store.
+func replicatedStoreOptions(opts db.Options) db.Options {
+	opts.ExternalLog = true
+	return opts
+}
+
 // fullConfig returns the dense voting membership {0, 1, ..., n-1} — the bootstrap
 // configuration of a founding n-node cluster.
 func fullConfig(n int) map[NodeID]bool {
@@ -1040,6 +1160,9 @@ func buildNode(id NodeID, peers []NodeID, bootstrapConfig map[NodeID]bool, dir s
 		return nil, fmt.Errorf("cluster: complete pending install node %d: %w", id, err)
 	}
 
+	// The Raft log is the store's write-ahead log: the store keeps none of its
+	// own. nd.opts carries this too, so a reopen after an install matches.
+	opts = replicatedStoreOptions(opts)
 	store, err := db.OpenWith(dir, opts)
 	if err != nil {
 		return nil, fmt.Errorf("cluster: open node %d: %w", id, err)
@@ -1075,12 +1198,15 @@ func buildNode(id NodeID, peers []NodeID, bootstrapConfig map[NodeID]bool, dir s
 	for _, pe := range persisted {
 		rlog.append(pe.term, pe.kind, pe.data)
 	}
+	// The store comes back exactly as of its last flush; the committed entries
+	// after that are re-applied from this log once the commit index covers them
+	// (a leader of the new term commits a no-op to make that happen promptly).
 	recovered := store.RecoveredAppliedIndex()
-	// Everything at-or-below baseIndex was applied and made durable in the data WAL
-	// before we compacted past it, so recovery must reconstruct an applied index at
-	// least baseIndex. A lower value means the compacted prefix outran durable
-	// applied state — corruption; refuse to start rather than silently apply into a
-	// compacted region.
+	// Compaction never passes the store's durable index, so the log still holds
+	// every entry above `recovered`. A recovered index below the log's base means
+	// the compacted prefix outran durable applied state — entries the store needs
+	// are gone from both. Corruption: refuse to start rather than silently skip
+	// them.
 	if recovered < logFile.baseIndex {
 		logFile.close()
 		stateFile.close()
@@ -1111,31 +1237,32 @@ func buildNode(id NodeID, peers []NodeID, bootstrapConfig map[NodeID]bool, dir s
 		}
 	}
 	nd := &Node{
-		id:          id,
-		store:       store,
-		transport:   tr,
-		peers:       peers,
-		config:      config,
-		baseConfig:  baseConfig,
-		configPath:  configPath,
-		cfg:         cfg,
-		dir:         dir,
-		raftDir:     raftDir,
-		opts:        opts,
-		inbox:       tr.Inbox(id),
-		quit:        make(chan struct{}),
-		log:         rlog,
-		logFile:     logFile,
-		stateFile:   stateFile,
-		commitIndex: recovered,
-		lastApplied: recovered,
-		role:        Follower,
-		currentTerm: 1,
-		votedFor:    noVote,
-		nextIndex:   make(map[NodeID]uint64, len(peers)),
-		matchIndex:  make(map[NodeID]uint64, len(peers)),
-		respCh:      make(map[NodeID]chan Message, len(peers)),
-		replSignal:  make(map[NodeID]chan struct{}, len(peers)),
+		id:           id,
+		store:        store,
+		transport:    tr,
+		peers:        peers,
+		config:       config,
+		baseConfig:   baseConfig,
+		configPath:   configPath,
+		cfg:          cfg,
+		dir:          dir,
+		raftDir:      raftDir,
+		opts:         opts,
+		inbox:        tr.Inbox(id),
+		quit:         make(chan struct{}),
+		log:          rlog,
+		logFile:      logFile,
+		stateFile:    stateFile,
+		commitIndex:  recovered,
+		lastApplied:  recovered,
+		durableIndex: recovered,
+		role:         Follower,
+		currentTerm:  1,
+		votedFor:     noVote,
+		nextIndex:    make(map[NodeID]uint64, len(peers)),
+		matchIndex:   make(map[NodeID]uint64, len(peers)),
+		respCh:       make(map[NodeID]chan Message, len(peers)),
+		replSignal:   make(map[NodeID]chan struct{}, len(peers)),
 	}
 	for _, p := range peers {
 		nd.nextIndex[p] = 1
@@ -1159,9 +1286,10 @@ func buildNode(id NodeID, peers []NodeID, bootstrapConfig map[NodeID]bool, dir s
 		// kept only when the saved term wins or ties; if the log term strictly wins
 		// we are moving to a higher term than the saved vote belongs to, so that
 		// vote is stale and resets. Absent state reads as (0, noVote), so this same
-		// rule is the legacy fallback. commitIndex/lastApplied come from the applied
-		// watermark, so committed entries are not re-applied and uncommitted tails
-		// wait.
+		// rule is the legacy fallback. commitIndex/lastApplied come from the store's
+		// durable index: committed entries above it are re-applied from this log
+		// once a leader's commit index covers them, and uncommitted tails wait (or
+		// are truncated by that leader).
 		logTerm := rlog.lastTerm()
 		if logTerm > hard.currentTerm {
 			nd.currentTerm = logTerm
@@ -1367,14 +1495,21 @@ func (c *Cluster) Config() []NodeID {
 
 // storePut/storeDelete/storeGet/storeBegin reach the node's store under storeMu
 // (shared), so an in-flight InstallSnapshot swap (exclusive) never tears a read
-// or write across the store replacement.
+// or write across the store replacement. The blind writes catch up first (see
+// catchUp), so they never conflict with an entry the leader had not applied yet.
 func (n *Node) storePut(key, value []byte) error {
+	if err := n.catchUp(); err != nil {
+		return err
+	}
 	n.storeMu.RLock()
 	defer n.storeMu.RUnlock()
 	return n.store.Put(key, value)
 }
 
 func (n *Node) storeDelete(key []byte) error {
+	if err := n.catchUp(); err != nil {
+		return err
+	}
 	n.storeMu.RLock()
 	defer n.storeMu.RUnlock()
 	return n.store.Delete(key)

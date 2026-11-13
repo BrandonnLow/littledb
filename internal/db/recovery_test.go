@@ -1,12 +1,9 @@
 package db
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/BrandonnLow/littledb/internal/record"
 )
 
 // TestAppliedWatermarkSurvivesFlush guards the recovery seed of appliedTS.
@@ -50,75 +47,143 @@ func TestAppliedWatermarkSurvivesFlush(t *testing.T) {
 	}
 }
 
-// TestRecoveryAppliedIndexSurvivesLostBase pins the crash-window invariant for
-// the applied watermark: after a flush stamps appliedIndex=K into the SSTable
-// footer, a lost-or-torn applied.base must not under-count lastApplied, because
-// recovery takes max(footer, base+walCommits). The flush ordering guarantees a
-// missing base co-occurs with an empty post-flush WAL, so this is exactly the
-// recoverable window — max() resolves to the footer (K). The complementary
-// base-present-with-post-flush-commits path is covered by the cluster's
-// TestClusterFlushBeforeRestart.
-func TestRecoveryAppliedIndexSurvivesLostBase(t *testing.T) {
+// TestRecoveryReplaysFromAppliedBase pins the ExternalLog flush's crash contract
+// (flushExternalLocked). A flush writes the SSTable, then the sessions file, then
+// applied.base — the commit point. A crash after the SSTable (and perhaps the
+// sessions file) landed but before applied.base did must recover to the PREVIOUS
+// flush, leaving the caller to replay its log from there. That replay re-applies
+// entries whose data is already in the new SSTable and, in the second case,
+// whose sessions are already in the new sessions file; both must converge to
+// exactly the state of a clean run: same values, same session table, a
+// session-deduped retry still deduped, and the same state again after the next
+// flush and restart.
+func TestRecoveryReplaysFromAppliedBase(t *testing.T) {
 	cases := []struct {
-		name   string
-		damage func(t *testing.T, basePath string)
+		name         string
+		sessionsLost bool // crash before the sessions file was replaced too
 	}{
-		{"base-deleted", func(t *testing.T, p string) {
-			if err := os.Remove(p); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"base-truncated", func(t *testing.T, p string) {
-			if err := os.Truncate(p, 3); err != nil { // <8 bytes => treated as absent
-				t.Fatal(err)
-			}
-		}},
+		{"crash-after-sstable", true},
+		{"crash-after-sstable-and-sessions", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			opts := Options{SyncOnWrite: true, DisableBackgroundCompaction: true}
+			opts := replicaOpts()
+			sess := []byte("client")
 
 			d, err := OpenWith(dir, opts)
 			if err != nil {
 				t.Fatal(err)
 			}
-			const k = 5
-			for i := 1; i <= k; i++ {
-				key := []byte(fmt.Sprintf("key%02d", i))
-				val := []byte(fmt.Sprintf("val%02d", i))
-				entry := append(
-					record.Encode(&record.Record{Op: record.OpPut, Timestamp: uint64(i), Key: key, Value: val}),
-					record.Encode(&record.Record{Op: record.OpCommit, Timestamp: uint64(i)})...)
-				if err := d.ApplyEntry(uint64(i), entry); err != nil {
-					t.Fatalf("ApplyEntry %d: %v", i, err)
+			apply := func(idx uint64, entry []byte) {
+				t.Helper()
+				if err := d.ApplyEntry(idx, entry); err != nil {
+					t.Fatalf("ApplyEntry %d: %v", idx, err)
 				}
 			}
-			// Flush: footer stamps appliedIndex=k, applied.base written, WAL reset.
-			if err := d.FlushForTesting(); err != nil {
+			// First flush covers 1..3 — the state the crash falls back to.
+			apply(1, prepareEntry(t, d, nil, 0, map[string]string{"k1": "a"}))
+			apply(2, prepareEntry(t, d, sess, 1, map[string]string{"k2": "b"}))
+			apply(3, prepareEntry(t, d, nil, 0, map[string]string{"k1": "c"}))
+			if err := d.FlushApplied(); err != nil {
+				t.Fatal(err)
+			}
+			oldBase := readFile(t, filepath.Join(dir, appliedBaseFilename))
+			oldSessions := readFile(t, filepath.Join(dir, sessionsFilename))
+
+			// Second flush covers 4..6 and is the one the crash interrupts.
+			tail := [][]byte{
+				prepareEntry(t, d, sess, 2, map[string]string{"k2": "d"}),
+				nil, // placeholder: prepared after 4 is applied (see below)
+				nil,
+			}
+			apply(4, tail[0])
+			tail[1] = prepareEntry(t, d, nil, 0, nil, "k1")
+			apply(5, tail[1])
+			tail[2] = prepareEntry(t, d, sess, 3, map[string]string{"k3": "e"})
+			apply(6, tail[2])
+			if err := d.FlushApplied(); err != nil {
 				t.Fatal(err)
 			}
 			if err := d.Close(); err != nil {
 				t.Fatal(err)
 			}
 
-			tc.damage(t, filepath.Join(dir, appliedBaseFilename))
+			// Rewind to the crash point: the new SSTable stays; applied.base (and in
+			// the first case the sessions file) is still the first flush's.
+			writeFile(t, filepath.Join(dir, appliedBaseFilename), oldBase)
+			if tc.sessionsLost {
+				writeFile(t, filepath.Join(dir, sessionsFilename), oldSessions)
+			}
 
-			d2, err := OpenWith(dir, opts)
+			d, err = OpenWith(dir, opts)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer d2.Close()
-			if got := d2.RecoveredAppliedIndex(); got != k {
-				t.Errorf("RecoveredAppliedIndex = %d, want %d (footer must cover a lost applied.base)", got, k)
+			if got := d.RecoveredAppliedIndex(); got != 3 {
+				t.Fatalf("RecoveredAppliedIndex = %d, want 3 (applied.base, not the newer SSTable footer)", got)
 			}
-			for i := 1; i <= k; i++ {
-				key := []byte(fmt.Sprintf("key%02d", i))
-				want := fmt.Sprintf("val%02d", i)
-				if got, err := d2.Get(key); err != nil || string(got) != want {
-					t.Errorf("Get(%s) = (%q,%v), want %s", key, got, err, want)
+			for i, e := range tail {
+				apply(uint64(4+i), e) // the caller's replay of its log
+			}
+
+			check := func(label string) {
+				t.Helper()
+				if _, err := d.Get([]byte("k1")); err != ErrKeyNotFound {
+					t.Errorf("%s: k1 err = %v, want ErrKeyNotFound (deleted at 5)", label, err)
+				}
+				for k, want := range map[string]string{"k2": "d", "k3": "e"} {
+					if got, err := d.Get([]byte(k)); err != nil || string(got) != want {
+						t.Errorf("%s: %s = (%q,%v), want %q", label, k, got, err, want)
+					}
+				}
+				if got := d.SessionLastSeq(sess); got != 3 {
+					t.Errorf("%s: SessionLastSeq = %d, want 3", label, got)
+				}
+				// A retry of seq 2 (applied at 4, inside the replayed window) is deduped.
+				tx := d.Begin()
+				tx.SetSession(sess, 2)
+				if err := tx.Put([]byte("k2"), []byte("stale-retry")); err != nil {
+					t.Fatal(err)
+				}
+				if e, _, err := d.PrepareCommit(tx); err != nil || e != nil {
+					t.Errorf("%s: retry of seq 2: entry=%v err=%v, want deduped", label, e, err)
 				}
 			}
+			check("after replay")
+
+			// The duplicated versions collapse, and the next flush + restart agrees.
+			if err := d.FlushApplied(); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.Close(); err != nil {
+				t.Fatal(err)
+			}
+			d, err = OpenWith(dir, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			if got := d.RecoveredAppliedIndex(); got != 6 {
+				t.Fatalf("RecoveredAppliedIndex after re-flush = %d, want 6", got)
+			}
+			check("after re-flush and restart")
 		})
+	}
+}
+
+func readFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func writeFile(t *testing.T, path string, b []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

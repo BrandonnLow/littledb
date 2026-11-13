@@ -113,6 +113,12 @@ func (t *Txn) Commit() error {
 	if override != nil {
 		return override(t)
 	}
+	if t.db.opts.ExternalLog {
+		// No data WAL to make the commit durable: an ExternalLog store commits
+		// only through its replication layer.
+		t.finished = true
+		return errNoCommitPath
+	}
 
 	// Single-node path: conflict-check, allocate, log, and apply, all under
 	// the write lock.
@@ -199,9 +205,15 @@ func (t *Txn) Commit() error {
 // PrepareCommit performs the leader-side preparation of a replicated commit:
 // first-committer-wins conflict detection, commit-timestamp allocation, and
 // building the encoded entry (data records + OpCommit). It does NOT touch the
-// data WAL or the memtable — the replication layer persists the entry to its
-// Raft log file for replication, and ApplyEntry writes the data WAL and applies
-// to the memtable once the entry is committed. The txn is marked finished.
+// memtable — the replication layer persists the entry to its Raft log file (the
+// store's only log) for replication, and ApplyEntry applies it to the memtable
+// once it is committed. The txn is marked finished.
+//
+// The caller must have applied every entry already in its log first: the
+// conflict check reads only applied state, and the commit timestamp is drawn
+// from a counter that only applied entries advance, so preparing against a
+// lagging store could miss a conflict or hand out a timestamp below one already
+// committed (the cluster's catch-up barrier guarantees this).
 //
 // Returns (nil, 0, nil) for an empty txn, ErrConflict on a write-write
 // conflict (without allocating a timestamp), or errClosed if the DB is closed.
@@ -274,11 +286,11 @@ func (db *DB) PrepareCommit(t *Txn) (entry []byte, commitTS uint64, err error) {
 
 // PrepareNoop allocates a fresh commit timestamp and returns the encoding of a
 // standalone OpCommit marker with no data records — a no-op log entry. Applied
-// via ApplyEntry it appends one OpCommit to the data WAL (so the recovered
-// applied index stays in lockstep with the Raft index) and mutates no key. Its
-// purpose is Raft's read-index prerequisite: a newly elected leader commits an
-// entry in its OWN term so its commit index is trustworthy, without having to
-// wait for a client write. Like PrepareCommit it touches neither the WAL nor the
+// via ApplyEntry it advances the applied index and mutates no key. Its purpose
+// is Raft's term-start prerequisite: a newly elected leader commits an entry in
+// its OWN term so its commit index is trustworthy (the read-index barrier) and
+// so the prior-term tail of its log commits and is applied before it prepares a
+// transaction (the catch-up barrier). Like PrepareCommit it does not touch the
 // memtable here — the replication layer logs the entry and ApplyEntry applies it
 // once committed.
 func (db *DB) PrepareNoop() (entry []byte, commitTS uint64, err error) {

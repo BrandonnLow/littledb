@@ -18,14 +18,14 @@ import (
 // — deletes are absent from the stream, so an in-place merge would leave stale
 // live versions of keys deleted before the snapshot.
 //
-// The install is crash-atomic via a durable marker. ApplyEntry is not idempotent
-// on re-apply (it double-appends to the data WAL, which inflates the recovered
-// applied index and silently skips a real entry on the next restart), so the
-// node must never come up in a state where applied entries get re-driven. The
-// marker gates trust in the live data dir: while it is present, the dir may be
-// mid-swap and completion (re-)runs idempotently from the staged dir. Completion
-// MUST run on Open before the recovered-vs-base guard, since a legitimate
-// mid-install crash leaves recovered < base until the swap lands.
+// The install is crash-atomic via a durable marker. The node must never come up
+// over a half-swapped data dir — a mix of old and snapshot files whose applied
+// index matches neither the old log nor the snapshot base, from which replaying
+// raft.log would re-drive or skip entries. The marker gates trust in the live
+// data dir: while it is present, the dir may be mid-swap and completion (re-)runs
+// idempotently from the staged dir. Completion MUST run on Open before the
+// recovered-vs-base guard, since a legitimate mid-install crash leaves recovered
+// < base until the swap lands.
 
 const (
 	installMarkerName  = "install.marker"
@@ -492,6 +492,9 @@ func (n *Node) completeInstall(lastIncludedIndex, lastIncludedTerm uint64) error
 	}
 	n.commitIndex = lastIncludedIndex
 	n.lastApplied = lastIncludedIndex
+	// The staged store was built fully flushed (SSTable + applied.base), so the
+	// snapshot is durable through its base — matching the reset log's base.
+	n.durableIndex = lastIncludedIndex
 	n.installing = false
 	n.appliedCond.Broadcast()
 	// Give the just-installed follower a fresh election window: a long install

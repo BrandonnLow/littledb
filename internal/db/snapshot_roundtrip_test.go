@@ -30,7 +30,7 @@ func collectSnapshot(t *testing.T, src *DB) (kvs []KV, lastIncludedIndex, snapsh
 
 func TestSnapshotScanBuildRoundTrip(t *testing.T) {
 	srcDir := t.TempDir()
-	src, err := OpenWith(srcDir, Options{SyncOnWrite: false, DisableBackgroundCompaction: true})
+	src, err := OpenWith(srcDir, replicaOpts())
 	if err != nil {
 		t.Fatalf("open src: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestSnapshotScanBuildRoundTrip(t *testing.T) {
 	if err := BuildSnapshotDB(stagedDir, kvs, nil, lii, ts); err != nil {
 		t.Fatalf("BuildSnapshotDB: %v", err)
 	}
-	dst, err := OpenWith(stagedDir, Options{SyncOnWrite: false, DisableBackgroundCompaction: true})
+	dst, err := OpenWith(stagedDir, replicaOpts())
 	if err != nil {
 		t.Fatalf("open staged: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestSnapshotCarriesSessions(t *testing.T) {
 	if err := BuildSnapshotDB(stagedDir, kvs, sessions, 5, 9); err != nil {
 		t.Fatalf("BuildSnapshotDB: %v", err)
 	}
-	dst, err := OpenWith(stagedDir, Options{SyncOnWrite: false, DisableBackgroundCompaction: true})
+	dst, err := OpenWith(stagedDir, replicaOpts())
 	if err != nil {
 		t.Fatalf("open staged: %v", err)
 	}
@@ -137,13 +137,19 @@ func TestBuildSnapshotDBEmpty(t *testing.T) {
 	if entries, _ := os.ReadDir(stagedDir); len(entries) == 0 {
 		t.Fatalf("staged dir empty, expected applied.base")
 	}
-	dst, err := OpenWith(stagedDir, Options{SyncOnWrite: false, DisableBackgroundCompaction: true})
+	dst, err := OpenWith(stagedDir, replicaOpts())
 	if err != nil {
 		t.Fatalf("open staged: %v", err)
 	}
 	defer dst.Close()
 	if got := dst.RecoveredAppliedIndex(); got != 42 {
 		t.Fatalf("empty snapshot RecoveredAppliedIndex = %d, want 42", got)
+	}
+	// applied.base carries the snapshot timestamp, so even with no SSTable to
+	// carry it the next timestamp is past the leader's: a follower elected right
+	// after installing can never re-issue a timestamp the cluster already used.
+	if got := dst.NextTimestampForTesting(); got != 100 {
+		t.Fatalf("empty snapshot nextTimestamp = %d, want 100 (snapshotTS 99 + 1)", got)
 	}
 }
 

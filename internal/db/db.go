@@ -29,8 +29,18 @@ const (
 var (
 	ErrKeyNotFound = errors.New("db: key not found")
 	ErrConflict    = errors.New("db: transaction conflict")
-	errClosed      = errors.New("db: closed")
-	sstableNameRE  = regexp.MustCompile(`^(\d{6})\.sst$`)
+
+	// ErrUnexpectedWAL is returned by OpenWith in ExternalLog mode when the
+	// directory holds a non-empty data WAL. Such a dir was written by a WAL-mode
+	// store (standalone, or a replica from before the Raft log became the only
+	// log); its unflushed writes live in that WAL and in no replicated log, so
+	// opening it as a replica would silently drop them. Refuse instead.
+	ErrUnexpectedWAL = errors.New("db: data WAL present in an ExternalLog store")
+
+	errClosed         = errors.New("db: closed")
+	errNotExternalLog = errors.New("db: replicated apply requires Options.ExternalLog")
+	errNoCommitPath   = errors.New("db: ExternalLog store has no commit override; commits must go through the replication layer")
+	sstableNameRE     = regexp.MustCompile(`^(\d{6})\.sst$`)
 )
 
 type Options struct {
@@ -38,6 +48,18 @@ type Options struct {
 	MemtableSizeMax             int64
 	CompactionTrigger           int
 	DisableBackgroundCompaction bool
+
+	// ExternalLog makes the caller's replicated log (the Raft log) this store's
+	// write-ahead log. The store keeps no data WAL: ApplyEntry writes only the
+	// memtable, and applied state becomes durable in the store's own files only
+	// at a flush (SSTable, then sessions, then applied.base — the commit point).
+	// In exchange the caller must (1) retain every log entry above
+	// DurableAppliedIndex(), and (2) after Open, replay its committed entries
+	// from RecoveredAppliedIndex()+1. The single-node commit path is disabled;
+	// every commit goes through the installed commit override. Set by the
+	// cluster for every replica; a standalone store leaves it false and keeps
+	// its WAL.
+	ExternalLog bool
 }
 
 func DefaultOptions() Options {
@@ -62,16 +84,23 @@ type DB struct {
 	nextTimestamp uint64
 
 	// appliedIndex is the highest Raft log index whose entry has been applied
-	// to this DB (memtable + SSTables). The cluster passes it to ApplyEntry; the
-	// DB stamps it into each SSTable footer at flush and into the post-flush WAL
-	// base, so a restart can reconstruct lastApplied across a flush (the LSM
-	// otherwise forgets log indices). Zero outside a replication cluster.
+	// to this DB (memtable + SSTables). The cluster passes it to ApplyEntry,
+	// which accepts only appliedIndex+1, so the two never drift. Zero outside a
+	// replication cluster (ExternalLog unset).
 	appliedIndex uint64
 
-	// recoveredApplied is the applied Raft index reconstructed at Open:
-	// max(highest SSTable footer appliedIndex, walBase + replayed OpCommit
-	// count). The cluster reads it via RecoveredAppliedIndex to seed
-	// commitIndex/lastApplied on restart.
+	// durableIndex is the highest applied index whose effects are durable in
+	// this DB's own files: everything at or below it is in SSTables, with the
+	// session table and applied.base recorded to match. It advances only at a
+	// flush. Entries in (durableIndex, appliedIndex] exist only in the memtable
+	// and in the caller's log, which is why the caller may compact its log only
+	// up to here (DurableAppliedIndex).
+	durableIndex uint64
+
+	// recoveredApplied is the durable applied index found at Open (the index
+	// recorded in applied.base by the last flush). The cluster seeds
+	// commitIndex/lastApplied from it and re-applies its log from the next
+	// index (RecoveredAppliedIndex).
 	recoveredApplied uint64
 
 	// appliedTS is the highest commit timestamp actually applied to the
@@ -86,8 +115,9 @@ type DB struct {
 	// sessions maps a client session id to the highest per-session sequence
 	// number applied, for exactly-once dedup. Updated in ApplyEntry together with
 	// the memtable (same db.mu critical section), so PrepareCommit's dedup check
-	// and its conflict check see a consistent view. Reconstructed at Open from the
-	// sessions file plus the WAL's OpCommit markers. Not expired yet (v1).
+	// and its conflict check see a consistent view. Loaded at Open from the
+	// sessions file written by the last flush; the caller's replay of its log
+	// rebuilds everything after that. Not expired yet (v1).
 	sessions map[string]uint64
 
 	closed bool
@@ -126,7 +156,6 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 	var ssts []*sstable.Reader
 	var sstIDsRev []int
 	var maxTS uint64
-	var maxFooterApplied uint64
 	for i := len(sstIDs) - 1; i >= 0; i-- {
 		id := sstIDs[i]
 		path := filepath.Join(dir, sstableFilename(id))
@@ -142,50 +171,114 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		if r.MaxTimestamp() > maxTS {
 			maxTS = r.MaxTimestamp()
 		}
-		if r.AppliedIndex() > maxFooterApplied {
-			maxFooterApplied = r.AppliedIndex()
-		}
 	}
-
-	w, err := wal.OpenWith(dir, wal.Options{SyncOnWrite: opts.SyncOnWrite})
-	if err != nil {
+	closeSSTables := func() {
 		for _, r := range ssts {
 			r.Close()
 		}
-		return nil, err
 	}
 
-	mt := memtable.New()
+	var (
+		w        *wal.WAL
+		mt       = memtable.New()
+		sessions = map[string]uint64{}
+		applied  uint64
+	)
+	if opts.ExternalLog {
+		// The caller's log is the WAL, so there is nothing to replay here: the
+		// memtable starts empty and the caller re-applies its committed entries
+		// above the durable index. What the last flush made durable is the
+		// SSTables plus the two files it wrote alongside them.
+		if err := checkNoDataWAL(dir); err != nil {
+			closeSSTables()
+			return nil, err
+		}
+		base, err := readAppliedBase(dir)
+		if err != nil {
+			closeSSTables()
+			return nil, err
+		}
+		// applied.base, not the SSTable footers, decides the recovered index: it
+		// is written last at a flush, so it is the flush's commit point (see
+		// flushExternalLocked for why a footer must not be trusted on its own).
+		applied = base.index
+		// Its timestamp covers entries that leave no data behind (read-index
+		// no-ops), which no SSTable footer records, so the next commit timestamp
+		// after a restart can never fall below one already handed out.
+		if base.ts > maxTS {
+			maxTS = base.ts
+		}
+		if sessions, err = readSessionsFile(dir); err != nil {
+			closeSSTables()
+			return nil, err
+		}
+	} else {
+		if w, err = wal.OpenWith(dir, wal.Options{SyncOnWrite: opts.SyncOnWrite}); err != nil {
+			closeSSTables()
+			return nil, err
+		}
+		if err := replayWAL(w, mt, &maxTS); err != nil {
+			w.Close()
+			closeSSTables()
+			return nil, fmt.Errorf("db: replay wal: %w", err)
+		}
+	}
+
+	nextID := 1
+	if len(sstIDs) > 0 {
+		nextID = sstIDs[len(sstIDs)-1] + 1
+	}
+
+	db := &DB{
+		dir:           dir,
+		opts:          opts,
+		wal:           w,
+		memtable:      mt,
+		sstables:      ssts,
+		sstableIDs:    sstIDsRev,
+		nextID:        nextID,
+		nextTimestamp: maxTS + 1,
+		// appliedTS is maxTS: the SSTable footers plus, in WAL mode, the replayed
+		// WAL (after apply-all recovery everything committed is applied) or, in
+		// ExternalLog mode, the timestamp applied.base recorded. An uncommitted
+		// WAL tail (discarded on a torn commit) can push maxTS past the true
+		// watermark, but harmlessly — nothing is committed in that gap and the
+		// next commit allocates a still-higher ts, so no conflict is missed or
+		// spuriously raised.
+		appliedTS:        maxTS,
+		appliedIndex:     applied,
+		durableIndex:     applied,
+		recoveredApplied: applied,
+		sessions:         sessions,
+		activeTxns:       make(map[*Txn]struct{}),
+		compactCh:        make(chan struct{}, 1),
+		compactDoneCh:    make(chan struct{}),
+	}
+
+	if !opts.DisableBackgroundCompaction {
+		go db.compactLoop()
+		db.signalCompact()
+	} else {
+		close(db.compactDoneCh)
+	}
+
+	return db, nil
+}
+
+// replayWAL rebuilds a WAL-mode store's memtable from its data WAL. Records are
+// buffered by transaction and applied only when the transaction's OpCommit
+// marker arrives, so a torn or never-committed tail is discarded (the
+// atomicity contract). maxTS is raised to the highest timestamp seen.
+func replayWAL(w *wal.WAL, mt *memtable.Memtable, maxTS *uint64) error {
 	var buffer []*record.Record
-	var walOpCommits uint64
-	// Seed the dedup table from the last flush's snapshot, then let the WAL replay
-	// layer post-flush OpCommits on top (max wins). Together they reconstruct the
-	// full table across a WAL-truncating flush, mirroring applied.base.
-	sessions, err := readSessionsFile(dir)
-	if err != nil {
-		w.Close()
-		for _, r := range ssts {
-			r.Close()
-		}
-		return nil, err
-	}
-	err = w.Scan(func(offset int64, rec *record.Record) error {
-		if rec.Timestamp > maxTS {
-			maxTS = rec.Timestamp
+	return w.Scan(func(offset int64, rec *record.Record) error {
+		if rec.Timestamp > *maxTS {
+			*maxTS = rec.Timestamp
 		}
 		switch rec.Op {
 		case record.OpPut, record.OpDelete:
 			buffer = append(buffer, rec)
 		case record.OpCommit:
-			walOpCommits++
-			// A sessioned commit carries (session, seq) on its marker; rebuild the
-			// dedup table from it. Duplicates were written as bare markers with no
-			// data, so simply applying the buffered data (below) never double-applies.
-			if len(rec.Key) > 0 {
-				if s := decodeSeq(rec.Value); s > sessions[string(rec.Key)] {
-					sessions[string(rec.Key)] = s
-				}
-			}
 			for _, br := range buffer {
 				if br.Timestamp != rec.Timestamp {
 					return fmt.Errorf("db: replay: ts mismatch (data %d vs commit %d)",
@@ -208,71 +301,22 @@ func OpenWith(dir string, opts Options) (*DB, error) {
 		}
 		return nil
 	})
+}
 
+// checkNoDataWAL refuses to open an ExternalLog store over a non-empty data
+// WAL (see ErrUnexpectedWAL). An empty one holds nothing and is ignored.
+func checkNoDataWAL(dir string) error {
+	info, err := os.Stat(filepath.Join(dir, walFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
-		w.Close()
-		for _, r := range ssts {
-			r.Close()
-		}
-		return nil, fmt.Errorf("db: replay wal: %w", err)
+		return fmt.Errorf("db: stat data wal: %w", err)
 	}
-
-	nextID := 1
-	if len(sstIDs) > 0 {
-		nextID = sstIDs[len(sstIDs)-1] + 1
+	if info.Size() > 0 {
+		return fmt.Errorf("%w: %s (%d bytes)", ErrUnexpectedWAL, filepath.Join(dir, walFilename), info.Size())
 	}
-
-	// Reconstruct the applied Raft index across the flush boundary. walBase is
-	// the appliedIndex folded into SSTables at the last flush; the current WAL
-	// holds walOpCommits applied entries on top of it. The max() with the
-	// footer watermark survives the flush<->WAL-removal crash window, where the
-	// just-flushed entries sit in both the SSTable and the not-yet-removed WAL
-	// and both expressions resolve to the same index.
-	walBase, err := readAppliedBase(dir)
-	if err != nil {
-		w.Close()
-		for _, r := range ssts {
-			r.Close()
-		}
-		return nil, err
-	}
-	recoveredApplied := walBase + walOpCommits
-	if maxFooterApplied > recoveredApplied {
-		recoveredApplied = maxFooterApplied
-	}
-
-	db := &DB{
-		dir:           dir,
-		opts:          opts,
-		wal:           w,
-		memtable:      mt,
-		sstables:      ssts,
-		sstableIDs:    sstIDsRev,
-		nextID:        nextID,
-		nextTimestamp: maxTS + 1,
-		// appliedTS is maxTS, not just the highest WAL commit: maxTS folds in
-		// the SSTable footers too, and after apply-all recovery everything
-		// committed is applied. An uncommitted WAL tail (discarded on a torn
-		// commit) can push maxTS past the true watermark, but harmlessly —
-		// nothing is committed in that gap and the next commit allocates a
-		// still-higher ts, so no conflict is missed or spuriously raised.
-		appliedTS:        maxTS,
-		appliedIndex:     recoveredApplied,
-		recoveredApplied: recoveredApplied,
-		sessions:         sessions,
-		activeTxns:       make(map[*Txn]struct{}),
-		compactCh:        make(chan struct{}, 1),
-		compactDoneCh:    make(chan struct{}),
-	}
-
-	if !opts.DisableBackgroundCompaction {
-		go db.compactLoop()
-		db.signalCompact()
-	} else {
-		close(db.compactDoneCh)
-	}
-
-	return db, nil
+	return nil
 }
 
 func (db *DB) Put(key, value []byte) error {
@@ -356,43 +400,21 @@ func (db *DB) getAsOfSnapshot(
 }
 
 func (db *DB) flushLocked() error {
+	if db.opts.ExternalLog {
+		return db.flushExternalLocked()
+	}
 	if db.memtable.Len() == 0 {
 		return nil
 	}
 
-	db.memtable.Freeze()
-	db.frozen = db.memtable
-	db.memtable = memtable.New()
-
-	id := db.nextID
-	path := filepath.Join(db.dir, sstableFilename(id))
-
-	w, err := sstable.NewWriter(path, db.frozen.Len(), db.appliedIndex)
+	r, id, err := db.writeMemtableLocked()
 	if err != nil {
 		return err
 	}
 
-	var iterErr error
-	db.frozen.Iterate(func(userKey, value []byte, op memtable.Op, ts uint64) bool {
-		if err := w.Add(record.Op(op), userKey, value, ts); err != nil {
-			iterErr = err
-			return false
-		}
-		return true
-	})
-	if iterErr != nil {
-		w.Abort()
-		return iterErr
-	}
-	if err := w.Finish(); err != nil {
-		return err
-	}
-
-	r, err := sstable.OpenReader(path)
-	if err != nil {
-		return err
-	}
-
+	// WAL mode: the SSTable now holds everything the WAL did, so start a fresh
+	// WAL. Holding db.mu for the whole flush means no commit can append between
+	// the close and the reopen.
 	if err := db.wal.Close(); err != nil {
 		r.Close()
 		return err
@@ -407,30 +429,101 @@ func (db *DB) flushLocked() error {
 		r.Close()
 		return err
 	}
-
 	db.wal = newWAL
+	db.installSSTableLocked(r, id)
+	return nil
+}
+
+// flushExternalLocked is the ExternalLog flush — the only point at which applied
+// state becomes durable in this store's own files. Until it completes, the
+// caller's log is the sole durable copy of every entry applied since the
+// previous flush. It writes, in order:
+//
+//  1. the memtable as an SSTable (skipped if no data was applied — e.g. only
+//     read-index no-ops or membership changes),
+//  2. the session dedup table,
+//  3. applied.base — (appliedIndex, appliedTS) — the commit point.
+//
+// Recovery trusts applied.base alone, never an SSTable footer, and the caller
+// replays its log from the index recorded there. A crash before step 3 therefore
+// leaves the previous flush's index in force and the caller re-applies entries
+// whose data may already sit in the new SSTable or whose sessions may already
+// sit in the new sessions file. Both are harmless. Re-applying data writes the
+// same keys at the same timestamps; reads, scans and compaction all collapse
+// duplicate versions. And a sessions file that is already ahead dedups exactly
+// the sessioned entries of this flush, whose data step 1 has made durable.
+// Writing the sessions file before the SSTable would NOT be safe (dedup would
+// skip data that is nowhere durable), and trusting a footer written in step 1
+// would skip replaying entries whose sessions step 2 never recorded — hence this
+// order and this commit point.
+func (db *DB) flushExternalLocked() error {
+	if db.memtable.Len() == 0 && db.durableIndex == db.appliedIndex {
+		return nil // nothing applied since the last flush
+	}
+	if db.memtable.Len() > 0 {
+		r, id, err := db.writeMemtableLocked()
+		if err != nil {
+			return err
+		}
+		db.installSSTableLocked(r, id)
+	}
+	if err := writeSessionsFile(db.dir, db.sessions); err != nil {
+		return err
+	}
+	if err := writeAppliedBase(db.dir, db.appliedIndex, db.appliedTS); err != nil {
+		return err
+	}
+	db.durableIndex = db.appliedIndex
+	return nil
+}
+
+// writeMemtableLocked freezes the active memtable and writes it out as the next
+// SSTable (stamped with the applied index), returning the opened reader and its
+// id. db.frozen keeps the data visible to readers until installSSTableLocked
+// swaps the reader in. Must hold db.mu (write).
+func (db *DB) writeMemtableLocked() (*sstable.Reader, int, error) {
+	db.memtable.Freeze()
+	db.frozen = db.memtable
+	db.memtable = memtable.New()
+
+	id := db.nextID
+	path := filepath.Join(db.dir, sstableFilename(id))
+
+	w, err := sstable.NewWriter(path, db.frozen.Len(), db.appliedIndex)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var iterErr error
+	db.frozen.Iterate(func(userKey, value []byte, op memtable.Op, ts uint64) bool {
+		if err := w.Add(record.Op(op), userKey, value, ts); err != nil {
+			iterErr = err
+			return false
+		}
+		return true
+	})
+	if iterErr != nil {
+		w.Abort()
+		return nil, 0, iterErr
+	}
+	if err := w.Finish(); err != nil {
+		return nil, 0, err
+	}
+
+	r, err := sstable.OpenReader(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	return r, id, nil
+}
+
+// installSSTableLocked makes a just-written SSTable the newest layer and drops
+// the frozen memtable it replaces. Must hold db.mu (write).
+func (db *DB) installSSTableLocked(r *sstable.Reader, id int) {
 	db.sstables = append([]*sstable.Reader{r}, db.sstables...)
 	db.sstableIDs = append([]int{id}, db.sstableIDs...)
 	db.frozen = nil
 	db.nextID++
-
-	// Record the new WAL's base index AFTER the new WAL exists. Ordering
-	// (SSTable -> remove old WAL -> new WAL -> base) keeps recovery's
-	// max(footer, base+walCount) correct in every crash window. writeAppliedBase
-	// fsyncs the file and the directory: the base must be durable before any
-	// post-flush commit can append to the new WAL, or recovery under-counts and
-	// re-applies (see writeAppliedBase). This runs under db.mu before flushLocked
-	// returns, so no apply can interleave before the base is on disk.
-	if err := writeAppliedBase(db.dir, db.appliedIndex); err != nil {
-		return err
-	}
-	// Persist the session dedup table too: the truncated WAL no longer carries its
-	// pre-flush OpCommits, so without this a restart would forget those sessions.
-	// Durable before flushLocked returns, so no post-flush commit races it.
-	if err := writeSessionsFile(db.dir, db.sessions); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (db *DB) signalCompact() {
@@ -458,8 +551,13 @@ func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	var firstErr error
-	if err := db.wal.Close(); err != nil && firstErr == nil {
-		firstErr = err
+	// No flush on close in ExternalLog mode: a clean shutdown and a crash
+	// recover the same way (replay the caller's log above the durable index),
+	// so tests that close a node exercise the crash path.
+	if db.wal != nil {
+		if err := db.wal.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	for _, r := range db.sstables {
 		if err := r.Close(); err != nil && firstErr == nil {
@@ -519,9 +617,43 @@ func (db *DB) LastAppliedTS() uint64 {
 	return db.nextTimestamp - 1
 }
 
-// RecoveredAppliedIndex returns the applied Raft index reconstructed at Open.
-// The cluster seeds commitIndex/lastApplied with it on restart.
+// RecoveredAppliedIndex returns the durable applied Raft index found at Open —
+// the index the last flush recorded in applied.base. In ExternalLog mode the
+// store holds exactly the state as of that index, and the caller seeds
+// commitIndex/lastApplied with it and re-applies its committed log entries from
+// the next index.
 func (db *DB) RecoveredAppliedIndex() uint64 { return db.recoveredApplied }
+
+// DurableAppliedIndex returns the highest applied Raft index whose effects are
+// durable in this store's own files. In ExternalLog mode it advances only at a
+// flush; entries applied after it live only in the memtable and in the caller's
+// log, so the caller must not discard its log above this index.
+func (db *DB) DurableAppliedIndex() uint64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.durableIndex
+}
+
+// FlushApplied makes everything applied so far durable in the store's own
+// files — flushing the memtable to an SSTable if it holds data, then recording
+// the applied index (see flushExternalLocked) — so DurableAppliedIndex catches
+// up to the applied index and the caller can compact its log that far. It is a
+// no-op if nothing was applied since the last flush. ExternalLog mode only.
+func (db *DB) FlushApplied() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return errClosed
+	}
+	if !db.opts.ExternalLog {
+		return errNotExternalLog
+	}
+	if err := db.flushLocked(); err != nil {
+		return err
+	}
+	db.signalCompact()
+	return nil
+}
 
 // SessionLastSeq returns the highest sequence number applied for a session (0 if
 // none), for inspection and tests.
@@ -561,34 +693,47 @@ func decodeSeq(b []byte) uint64 {
 	return binary.LittleEndian.Uint64(b)
 }
 
-// readAppliedBase reads the post-flush WAL base index (the appliedIndex folded
-// into SSTables at the last flush). Absent file means no flush yet: base 0.
-func readAppliedBase(dir string) (uint64, error) {
-	buf, err := os.ReadFile(filepath.Join(dir, appliedBaseFilename))
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("db: read applied base: %w", err)
-	}
-	if len(buf) < 8 {
-		return 0, nil // torn write; treat as absent (max() falls back to footer)
-	}
-	return binary.LittleEndian.Uint64(buf), nil
+// appliedBase is the content of applied.base: the applied Raft index made
+// durable by the last flush, and the highest commit timestamp applied as of it.
+type appliedBase struct {
+	index uint64
+	ts    uint64
 }
 
-// writeAppliedBase records the new WAL's base index after a flush, durably:
-// write a temp file, fsync it, rename it over the real name, then fsync the
-// directory so the rename survives a crash. Durability is required, not
-// best-effort: once a post-flush commit lands in the new WAL, recovery computes
-// walBase + walOpCommits, so a lost base resolves BELOW the footer, max() picks
-// the footer, and recovery UNDER-counts lastApplied — re-applying entries the
-// data WAL already holds (the duplicate-apply bug). flushLocked calls this
-// before returning, so the base is durable before any later apply can append to
-// the new WAL.
-func writeAppliedBase(dir string, base uint64) error {
-	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[:], base)
+// readAppliedBase reads applied.base. An absent file means no flush yet (zero
+// base). The format is index(8) | ts(8), little-endian; an 8-byte file (written
+// before the timestamp was recorded) yields ts 0, and a file shorter than 8
+// bytes is treated as absent. The atomic rename in writeAppliedBase means a torn
+// file should never be observed.
+func readAppliedBase(dir string) (appliedBase, error) {
+	buf, err := os.ReadFile(filepath.Join(dir, appliedBaseFilename))
+	if errors.Is(err, os.ErrNotExist) {
+		return appliedBase{}, nil
+	}
+	if err != nil {
+		return appliedBase{}, fmt.Errorf("db: read applied base: %w", err)
+	}
+	if len(buf) < 8 {
+		return appliedBase{}, nil
+	}
+	b := appliedBase{index: binary.LittleEndian.Uint64(buf)}
+	if len(buf) >= 16 {
+		b.ts = binary.LittleEndian.Uint64(buf[8:])
+	}
+	return b, nil
+}
+
+// writeAppliedBase durably records (index, ts) as the last flush's commit
+// point: write a temp file, fsync it, rename it over the real name, then fsync
+// the directory so the rename survives a crash. The visible file is therefore
+// always a complete old or new value. It must be the LAST file a flush writes
+// (see flushExternalLocked): recovery resumes replay from the index recorded
+// here, so it may only advance once the SSTable and sessions file it vouches for
+// are durable.
+func writeAppliedBase(dir string, index, ts uint64) error {
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[0:], index)
+	binary.LittleEndian.PutUint64(buf[8:], ts)
 	tmp := filepath.Join(dir, appliedBaseFilename+".tmp")
 	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -629,8 +774,9 @@ func syncDir(dir string) error {
 // readSessionsFile loads the persisted session dedup table (map session->lastSeq)
 // written at the last flush. A missing file yields an empty table (no flush yet, or
 // no sessions). A torn/short file is treated as absent: the atomic rename
-// guarantees a complete file otherwise, and the WAL replay reconstructs post-flush
-// state on top regardless. Format: count(8) then count records of keyLen(4)|key|seq(8).
+// guarantees a complete file otherwise, and the caller's log replay rebuilds
+// post-flush state on top regardless. Format: count(8) then count records of
+// keyLen(4)|key|seq(8).
 func readSessionsFile(dir string) (map[string]uint64, error) {
 	out := map[string]uint64{}
 	buf, err := os.ReadFile(filepath.Join(dir, sessionsFilename))
@@ -647,7 +793,7 @@ func readSessionsFile(dir string) (map[string]uint64, error) {
 	off := 8
 	for i := uint64(0); i < n; i++ {
 		if off+4 > len(buf) {
-			return map[string]uint64{}, nil // torn: discard, WAL replay recovers post-flush
+			return map[string]uint64{}, nil // torn: discard; log replay recovers post-flush
 		}
 		klen := int(binary.LittleEndian.Uint32(buf[off:]))
 		off += 4
@@ -662,11 +808,12 @@ func readSessionsFile(dir string) (map[string]uint64, error) {
 	return out, nil
 }
 
-// writeSessionsFile durably records the session dedup table after a flush, with
-// the same crash-atomic temp -> fsync -> rename -> fsync-dir dance writeAppliedBase
-// uses. Durability is required, not best-effort: a flush truncates the WAL, so the
-// OpCommits that carried pre-flush session state are gone; if this file were lost,
-// a restart would forget those sessions and a post-restart retry could double-apply.
+// writeSessionsFile durably records the session dedup table at a flush, with the
+// same crash-atomic temp -> fsync -> rename -> fsync-dir dance writeAppliedBase
+// uses. Durability is required, not best-effort: once applied.base advances, the
+// caller may discard the log entries that carried those sessions, so if this file
+// were lost a restart would forget them and a post-restart retry could
+// double-apply.
 func writeSessionsFile(dir string, sessions map[string]uint64) error {
 	buf := make([]byte, 8, 8+len(sessions)*24)
 	binary.LittleEndian.PutUint64(buf, uint64(len(sessions)))
@@ -705,18 +852,25 @@ func writeSessionsFile(dir string, sessions map[string]uint64) error {
 	return nil
 }
 
-// ApplyEntry durably records a committed entry's records to the WAL (identical
-// framing to a single-node commit, so node WALs stay byte-identical) and
-// applies them to the memtable, marking this DB applied through Raft index idx.
+// ApplyEntry applies the committed Raft entry at index idx to the memtable and
+// the session table, marking this DB applied through idx. It writes nothing to
+// disk: the Raft log already holds the entry durably and remains its only
+// durable copy until a flush folds it into an SSTable (DurableAppliedIndex), so
+// after a crash the caller simply applies it again. Entries must arrive in log
+// order — idx must be exactly the applied index + 1 — so a gap or a re-apply is
+// an error rather than silent divergence. ExternalLog mode only.
+//
 // The entry must be a valid txn: data records (OpPut/OpDelete) terminated by an
-// OpCommit marker, all sharing one timestamp. Driven by the commit index, this
-// is the only place a replicated write reaches the data WAL — so the WAL holds
-// only committed state and recovery is commit-bounded by construction.
+// OpCommit marker, all sharing one timestamp. A bare OpCommit is a no-op (the
+// read-index barrier's entry): it advances the applied index and changes no key.
 func (db *DB) ApplyEntry(idx uint64, entry []byte) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
 		return errClosed
+	}
+	if err := db.checkApplyIndexLocked(idx); err != nil {
+		return err
 	}
 
 	var recs []*record.Record
@@ -750,28 +904,15 @@ func (db *DB) ApplyEntry(idx uint64, entry []byte) error {
 	// Exactly-once dedup. A sessioned commit carries (session, seq) on its marker.
 	// If this seq is already applied for the session, the entry is a duplicate
 	// retry (e.g. the leader proposed it before applying the original): apply it as
-	// a no-op — write only the marker to the WAL, keeping the one-OpCommit-per-entry
-	// applied-index accounting in lockstep, and touch neither the memtable nor the
-	// session table. This runs under db.mu, the same lock PrepareCommit checks the
-	// table under, so the dedup and conflict views never disagree.
+	// a no-op that still advances the applied index, touching neither the memtable
+	// nor the session table. This runs under db.mu, the same lock PrepareCommit
+	// checks the table under, so the dedup and conflict views never disagree.
 	session := string(commitRec.Key)
 	var seq uint64
 	if session != "" {
 		seq = decodeSeq(commitRec.Value)
 	}
-	if session != "" && seq <= db.sessions[session] {
-		if _, err := db.wal.Append(commitRec); err != nil {
-			return fmt.Errorf("db: apply entry: wal append (dedup marker): %w", err)
-		}
-	} else {
-		// New commit: durably append every record (data + marker) to the WAL before
-		// touching the memtable, exactly as a single-node commit does, so a
-		// follower's WAL is byte-identical to the leader's.
-		for _, rec := range recs {
-			if _, err := db.wal.Append(rec); err != nil {
-				return fmt.Errorf("db: apply entry: wal append: %w", err)
-			}
-		}
+	if session == "" || seq > db.sessions[session] {
 		for _, rec := range recs[:len(recs)-1] {
 			switch rec.Op {
 			case record.OpPut:
@@ -795,9 +936,7 @@ func (db *DB) ApplyEntry(idx uint64, entry []byte) error {
 	if commitTS > db.appliedTS {
 		db.appliedTS = commitTS
 	}
-	if idx > db.appliedIndex {
-		db.appliedIndex = idx
-	}
+	db.appliedIndex = idx
 
 	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
 		if err := db.flushLocked(); err != nil {
@@ -809,33 +948,32 @@ func (db *DB) ApplyEntry(idx uint64, entry []byte) error {
 }
 
 // ApplyControlEntry applies a non-data Raft entry (e.g. a membership change) as a
-// no-op at the state machine: it writes one bare OpCommit to the WAL — keeping the
-// applied-index accounting (one OpCommit per applied Raft entry) in lockstep, so a
-// restart reconstructs the right index — and advances the applied index, but
-// changes no key. The control payload itself (the new configuration) is
-// interpreted by the Raft layer, not here.
+// no-op at the state machine: it advances the applied index and changes no key.
+// The control payload itself (the new configuration) is interpreted by the Raft
+// layer, not here. Same ordering rule and mode requirement as ApplyEntry.
 func (db *DB) ApplyControlEntry(idx uint64) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
 		return errClosed
 	}
-	commitTS := db.nextTimestamp
-	db.nextTimestamp++
-	if _, err := db.wal.Append(&record.Record{Op: record.OpCommit, Timestamp: commitTS}); err != nil {
-		return fmt.Errorf("db: apply control entry: wal append: %w", err)
+	if err := db.checkApplyIndexLocked(idx); err != nil {
+		return err
 	}
-	if commitTS > db.appliedTS {
-		db.appliedTS = commitTS
+	db.appliedIndex = idx
+	return nil
+}
+
+// checkApplyIndexLocked enforces the replicated-apply contract: the store is in
+// ExternalLog mode and idx is the very next index. Under it, the store's applied
+// index and the caller's lastApplied move in lockstep, so recovery can resume
+// replay exactly where the durable state ends. Must hold db.mu.
+func (db *DB) checkApplyIndexLocked(idx uint64) error {
+	if !db.opts.ExternalLog {
+		return errNotExternalLog
 	}
-	if idx > db.appliedIndex {
-		db.appliedIndex = idx
-	}
-	if db.memtable.ApproximateSize() >= db.opts.MemtableSizeMax {
-		if err := db.flushLocked(); err != nil {
-			return fmt.Errorf("db: apply control entry: flush: %w", err)
-		}
-		db.signalCompact()
+	if idx != db.appliedIndex+1 {
+		return fmt.Errorf("db: apply index %d out of order (applied through %d)", idx, db.appliedIndex)
 	}
 	return nil
 }

@@ -104,6 +104,16 @@ func (n *Node) becomeLeaderLocked() {
 		n.matchIndex[p] = 0
 	}
 	n.signalReplicators() // immediate heartbeat: assert leadership now
+	// Holding entries we have not applied (a prior-term tail, or — after a
+	// restart — everything since the store's last flush)? Commit a no-op in our
+	// own term right away (Raft §8) so that tail commits and every replica
+	// applies it now, not at the first client request. A fresh leader with
+	// nothing unapplied (e.g. the bootstrap leader) proposes nothing, which
+	// leaves log indices unchanged on the happy path. Runs off raftMu: it needs
+	// commitMu, which is outer.
+	if n.lastApplied < last {
+		go n.commitTermStartNoop(n.currentTerm)
+	}
 }
 
 // persistHardStateLocked durably records (currentTerm, votedFor). A nil

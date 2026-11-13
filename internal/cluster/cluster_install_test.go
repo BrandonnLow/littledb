@@ -89,8 +89,9 @@ func TestCompleteInstallIfPendingSwapsAndResets(t *testing.T) {
 	}
 	lf2.close()
 
-	// Data dir now holds the snapshot, not the stale data.
-	newDB, err := db.OpenWith(dir, db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true})
+	// Data dir now holds the snapshot, not the stale data (opened as buildNode
+	// opens a replica's store).
+	newDB, err := db.OpenWith(dir, replicatedStoreOptions(db.Options{SyncOnWrite: true, DisableBackgroundCompaction: true}))
 	if err != nil {
 		t.Fatal(err)
 	}
